@@ -1,0 +1,9 @@
+Console sign-in URL
+https://438209018053.signin.aws.amazon.com/console
+
+
+User name
+ecodia-ses-sender
+
+Password
+kypOY4S-
