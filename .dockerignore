@@ -1,0 +1,14 @@
+﻿__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+.git
+.gitignore
+.vscode
+.idea
+dist/
+build/
+node_modules/
+tests/
+*.md
