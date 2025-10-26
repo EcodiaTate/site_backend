@@ -148,7 +148,7 @@ def get_youth_stats(user_id: str, s: Session = Depends(session_dep)):
     OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
     WITH u,
          sum(coalesce(t.eco,0)) AS total_eco,
-         sum(CASE WHEN t.source = "mission" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
+         sum(CASE WHEN t.source = "sidequest" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
          sum(CASE WHEN t.source = "eyba"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eyba,
          max(t.at) AS last_earn_at
 
@@ -194,7 +194,7 @@ def list_youth_stats(
       OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
       WITH u,
            sum(coalesce(t.eco,0)) AS total_eco,
-           sum(CASE WHEN t.source = "mission" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
+           sum(CASE WHEN t.source = "sidequest" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
            sum(CASE WHEN t.source = "eyba"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eyba,
            max(t.at) AS last_earn_at
       OPTIONAL MATCH (u)-[:SUBMITTED]->(s:Submission {state:"approved"})
@@ -263,7 +263,7 @@ def overview(s: Session = Depends(session_dep)):
           RETURN count(DISTINCT uu) AS active_youth_30d
         }
 
-        // total approved missions
+        // total approved sidequests
         CALL {
           WITH 1 AS _
           OPTIONAL MATCH (:User)-[:SUBMITTED]->(ss:Submission {state:'approved'})
@@ -384,7 +384,7 @@ def youth_timeseries(
             WHERE tt.at >= datetime($start) AND tt.at < datetime($end)
             WITH minted, count(DISTINCT u) AS active_youth
 
-            // total approved missions this month
+            // total approved sidequests this month
             OPTIONAL MATCH (:User)-[:SUBMITTED]->(s:Submission {state:'approved'})
             WHERE s.at >= datetime($start) AND s.at < datetime($end)
             RETURN minted AS minted,
@@ -396,9 +396,9 @@ def youth_timeseries(
 
         minted = int(rec["minted"]) if rec and rec["minted"] is not None else 0
         active = int(rec["active_youth"]) if rec and rec["active_youth"] is not None else 0
-        missions = int(rec["missions_completed"]) if rec and rec["missions_completed"] is not None else 0
+        sidequests = int(rec["missions_completed"]) if rec and rec["missions_completed"] is not None else 0
 
-        points.append(Point(month=ym, minted_eco=minted, active_youth=active, missions_completed=missions))
+        points.append(Point(month=ym, minted_eco=minted, active_youth=active, missions_completed=sidequests))
 
     return TimeSeriesOut(from_month=from_month, to_month=to_month, points=points)
 
@@ -415,7 +415,7 @@ def get_my_youth_stats(
     OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
     WITH u,
          sum(coalesce(t.eco,0)) AS total_eco,
-         sum(CASE WHEN t.source = "mission" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
+         sum(CASE WHEN t.source = "sidequest" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
          sum(CASE WHEN t.source = "eyba"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eyba,
          max(t.at) AS last_earn_at
 

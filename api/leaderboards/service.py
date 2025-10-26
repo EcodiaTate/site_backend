@@ -245,7 +245,7 @@ def top_business_eco(
     }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Youth Actions leaderboard (missions)
+# Youth Actions leaderboard (sidequests)
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_youth_actions(
