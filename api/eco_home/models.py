@@ -2,7 +2,7 @@ from typing import Literal, Optional, Dict, Any, List
 from pydantic import BaseModel, Field
 from datetime import datetime
 
-ItemType = Literal["wallet","missions","rewards","map","calendar","friends","badges","inbox","settings","now"]
+ItemType = Literal["wallet","sidequests","rewards","map","calendar","friends","badges","inbox","settings","now"]
 
 class HomeItem(BaseModel):
     id: str

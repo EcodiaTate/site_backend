@@ -140,7 +140,7 @@ def leaderboard_youth_actions(
     session: Session = Depends(session_dep),
 ):
     """
-    Youth mission completions (approved submissions) leaderboard.
+    Youth sidequest completions (approved submissions) leaderboard.
     - period: total | weekly | monthly
     - type: eco_action | sidequest | all (default all)
     """
