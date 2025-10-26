@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import date, datetime, timedelta
 from uuid import uuid4
@@ -19,9 +20,11 @@ try:
 except Exception:  # pragma: no cover
     _eval_badges = None
 
+
 # -------- utils --------
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
+
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371_000.0
@@ -30,17 +33,20 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
     return 2 * R * asin(sqrt(a))
 
+
 def _within_radius(geo: Optional[Dict[str, Any]], u_lat: Optional[float], u_lon: Optional[float]) -> bool:
     if not geo or u_lat is None or u_lon is None:
         return True
     d = _haversine_m(geo["lat"], geo["lon"], u_lat, u_lon)
     return d <= (geo.get("radius_m") or 0)
 
+
 # ---------- Legacy mapping ----------
 def _public_kind_from_legacy(legacy_type: Optional[str], legacy_sub_type: Optional[str]) -> str:
     if (legacy_type or "").lower() == "sidequest" and (legacy_sub_type or "").lower() == "eco_action":
         return "eco_action"
     return "core"
+
 
 def _to_sidequest_out(d: Dict[str, Any]) -> SidequestOut:
     outward_kind = d.get("kind") or _public_kind_from_legacy(d.get("type"), d.get("sub_type"))
@@ -73,6 +79,7 @@ def _to_sidequest_out(d: Dict[str, Any]) -> SidequestOut:
         legacy_sub_type=d.get("sub_type"),
     )
 
+
 def _to_submission_out(d: Dict[str, Any]) -> SubmissionOut:
     return SubmissionOut(
         id=d["id"],
@@ -89,6 +96,7 @@ def _to_submission_out(d: Dict[str, Any]) -> SubmissionOut:
         team_id=d.get("team_id"),
     )
 
+
 # -------- flatten helpers (write-side) --------
 def _flatten_from_create(m: SidequestCreate) -> Dict[str, Any]:
     pills = m.pills.model_dump() if m.pills else {}
@@ -100,6 +108,7 @@ def _flatten_from_create(m: SidequestCreate) -> Dict[str, Any]:
     return {
         "kind": m.kind,
         "title": m.title,
+        "title_key": _title_key(m.title),   # <— add
         "subtitle": m.subtitle,
         "description_md": m.description_md,
         "tags": m.tags,
@@ -147,9 +156,12 @@ def _flatten_from_create(m: SidequestCreate) -> Dict[str, Any]:
         "team_bonus_eco": team.get("team_bonus_eco"),
     }
 
+
 def _flatten_from_update(u: SidequestUpdate) -> Dict[str, Any]:
     out: Dict[str, Any] = {}
-    if u.title is not None: out["title"] = u.title
+    if u.title is not None:
+        out["title"] = u.title
+        out["title_key"] = _title_key(u.title)
     if u.subtitle is not None: out["subtitle"] = u.subtitle
     if u.description_md is not None: out["description_md"] = u.description_md
     if u.tags is not None: out["tags"] = u.tags
@@ -209,6 +221,7 @@ def _flatten_from_update(u: SidequestUpdate) -> Dict[str, Any]:
         out["team_bonus_eco"] = tm.get("team_bonus_eco")
     return out
 
+
 # -------- sidequests --------
 def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
     mid = uuid4().hex
@@ -229,8 +242,11 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
             sq.max_completions_per_user  = $max_completions_per_user,
             sq.cooldown_days             = $cooldown_days,
             sq.verification_methods      = $verification_methods,
-            sq.start_at                  = $start_at,
-            sq.end_at                    = $end_at,
+
+            // time window (coerce to datetime or NULL)
+            sq.start_at                  = CASE WHEN $start_at IS NULL OR $start_at = '' THEN NULL ELSE datetime($start_at) END,
+            sq.end_at                    = CASE WHEN $end_at   IS NULL OR $end_at   = '' THEN NULL ELSE datetime($end_at)   END,
+
             sq.status                    = $status,
             sq.hero_image                = $hero_image,
             sq.card_accent               = $card_accent,
@@ -255,13 +271,19 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
             sq.streak_bonus_eco_per_step = $streak_bonus_eco_per_step,
             sq.streak_max_steps          = $streak_max_steps,
 
-            // flattened rotation
+            // flattened rotation (dates coerced)
             sq.rot_is_weekly_slot        = $rot_is_weekly_slot,
             sq.rot_iso_year              = $rot_iso_year,
             sq.rot_iso_week              = $rot_iso_week,
             sq.rot_slot_index            = $rot_slot_index,
-            sq.rot_starts_on             = $rot_starts_on,
-            sq.rot_ends_on               = $rot_ends_on,
+            sq.rot_starts_on             = CASE
+                                              WHEN $rot_starts_on IS NULL OR $rot_starts_on = '' THEN NULL
+                                              ELSE date($rot_starts_on)
+                                            END,
+            sq.rot_ends_on               = CASE
+                                              WHEN $rot_ends_on IS NULL OR $rot_ends_on = '' THEN NULL
+                                              ELSE date($rot_ends_on)
+                                            END,
 
             // flattened chain
             sq.chain_id                  = $chain_id,
@@ -316,27 +338,13 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
               iso_year: sq.rot_iso_year,
               iso_week: sq.rot_iso_week,
               slot_index: sq.rot_slot_index,
-              starts_on: sq.rot_starts_on,
-              ends_on: sq.rot_ends_on
+              starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
+              ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
             }
           END,
-          chain: CASE
-            WHEN sq.chain_id IS NULL THEN NULL
-            ELSE {
-              chain_id: sq.chain_id,
-              chain_order: sq.chain_order,
-              requires_prev_approved: coalesce(sq.chain_requires_prev, true)
-            }
-          END,
-          team: CASE
-            WHEN sq.team_allowed IS NULL THEN NULL
-            ELSE {
-              allowed: sq.team_allowed,
-              min_size: sq.team_min_size,
-              max_size: sq.team_max_size,
-              team_bonus_eco: coalesce(sq.team_bonus_eco,0)
-            }
-          END,
+          // override top-level temporal fields as ISO strings for Pydantic
+          start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
+          end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
           created_at: toString(sq.created_at),
           updated_at: toString(sq.updated_at)
         } AS sq
@@ -345,14 +353,46 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
     ).single()
     return _to_sidequest_out(dict(rec["sq"]))
 
+
 def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) -> SidequestOut:
     now = _now_iso()
     fields = _flatten_from_update(u)
-    set_lines = [f"sq.{k} = ${k}" for k in fields.keys()]
-    if set_lines:
-        set_lines.append("sq.updated_at = $now")
-    else:
-        set_lines = ["sq.updated_at = $now"]
+
+    # Build SET lines, with special handling to coerce rotation/start_end dates
+    set_lines: List[str] = []
+    params: Dict[str, Any] = {"id": sidequest_id, "now": now}
+
+    for k, v in fields.items():
+        if k == "rot_starts_on":
+            set_lines.append(
+                "sq.rot_starts_on = CASE WHEN $rot_starts_on IS NULL OR $rot_starts_on = '' "
+                "THEN NULL ELSE date($rot_starts_on) END"
+            )
+            params["rot_starts_on"] = v
+        elif k == "rot_ends_on":
+            set_lines.append(
+                "sq.rot_ends_on = CASE WHEN $rot_ends_on IS NULL OR $rot_ends_on = '' "
+                "THEN NULL ELSE date($rot_ends_on) END"
+            )
+            params["rot_ends_on"] = v
+        elif k == "start_at":
+            set_lines.append(
+                "sq.start_at = CASE WHEN $start_at IS NULL OR $start_at = '' "
+                "THEN NULL ELSE datetime($start_at) END"
+            )
+            params["start_at"] = v
+        elif k == "end_at":
+            set_lines.append(
+                "sq.end_at = CASE WHEN $end_at IS NULL OR $end_at = '' "
+                "THEN NULL ELSE datetime($end_at) END"
+            )
+            params["end_at"] = v
+        else:
+            set_lines.append(f"sq.{k} = ${k}")
+            params[k] = v
+
+    set_lines.append("sq.updated_at = $now")
+
     q = f"""
     MATCH (sq:Sidequest {{id:$id}})
     SET {", ".join(set_lines)}
@@ -398,34 +438,20 @@ def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) ->
           iso_year: sq.rot_iso_year,
           iso_week: sq.rot_iso_week,
           slot_index: sq.rot_slot_index,
-          starts_on: sq.rot_starts_on,
-          ends_on: sq.rot_ends_on
+          starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
+          ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
         }}
       END,
-      chain: CASE
-        WHEN sq.chain_id IS NULL THEN NULL
-        ELSE {{
-          chain_id: sq.chain_id,
-          chain_order: sq.chain_order,
-          requires_prev_approved: coalesce(sq.chain_requires_prev, true)
-        }}
-      END,
-      team: CASE
-        WHEN sq.team_allowed IS NULL THEN NULL
-        ELSE {{
-          allowed: sq.team_allowed,
-          min_size: sq.team_min_size,
-          max_size: sq.team_max_size,
-          team_bonus_eco: coalesce(sq.team_bonus_eco,0)
-        }}
-      END,
+      // override top-level temporal fields as ISO strings for Pydantic
+      start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
+      end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
       created_at: toString(sq.created_at),
       updated_at: toString(sq.updated_at)
     }} AS sq
     """
-    params = {"id": sidequest_id, "now": now, **fields}
     rec = session.run(q, params).single()
     return _to_sidequest_out(dict(rec["sq"]))
+
 
 def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
     rec = session.run(
@@ -473,27 +499,13 @@ def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
               iso_year: sq.rot_iso_year,
               iso_week: sq.rot_iso_week,
               slot_index: sq.rot_slot_index,
-              starts_on: sq.rot_starts_on,
-              ends_on: sq.rot_ends_on
+              starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
+              ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
             }
           END,
-          chain: CASE
-            WHEN sq.chain_id IS NULL THEN NULL
-            ELSE {
-              chain_id: sq.chain_id,
-              chain_order: sq.chain_order,
-              requires_prev_approved: coalesce(sq.chain_requires_prev, true)
-            }
-          END,
-          team: CASE
-            WHEN sq.team_allowed IS NULL THEN NULL
-            ELSE {
-              allowed: sq.team_allowed,
-              min_size: sq.team_min_size,
-              max_size: sq.team_max_size,
-              team_bonus_eco: coalesce(sq.team_bonus_eco,0)
-            }
-          END,
+          // override top-level temporal fields as ISO strings for Pydantic
+          start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
+          end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
           created_at: toString(sq.created_at),
           updated_at: toString(sq.updated_at)
         } AS sq
@@ -503,6 +515,7 @@ def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
     if not rec:
         raise ValueError(f"Sidequest not found: {sidequest_id}")
     return _to_sidequest_out(dict(rec["sq"]))
+
 
 def list_sidequests(
     session: Session,
@@ -583,36 +596,24 @@ def list_sidequests(
               iso_year: sq.rot_iso_year,
               iso_week: sq.rot_iso_week,
               slot_index: sq.rot_slot_index,
-              starts_on: sq.rot_starts_on,
-              ends_on: sq.rot_ends_on
+              starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
+              ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
             }}
           END,
-          chain: CASE
-            WHEN sq.chain_id IS NULL THEN NULL
-            ELSE {{
-              chain_id: sq.chain_id,
-              chain_order: sq.chain_order,
-              requires_prev_approved: coalesce(sq.chain_requires_prev, true)
-            }}
-          END,
-          team: CASE
-            WHEN sq.team_allowed IS NULL THEN NULL
-            ELSE {{
-              allowed: sq.team_allowed,
-              min_size: sq.team_min_size,
-              max_size: sq.team_max_size,
-              team_bonus_eco: coalesce(sq.team_bonus_eco,0)
-            }}
-          END,
+          // override top-level temporal fields as ISO strings for Pydantic
+          start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
+          end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
           created_at: toString(sq.created_at),
           updated_at: toString(sq.updated_at)
         }} AS sq
     """, params)
     return [_to_sidequest_out(dict(r["sq"])) for r in recs]
 
+
 # -------- submissions & rewards --------
 def create_submission(session: Session, user_id: str, s: SubmissionCreate, media_meta: Optional[Dict[str, Any]]) -> SubmissionOut:
-    from .service import get_sidequest  # self import safe in same module
+    # self import safe in same module
+    from .service import get_sidequest  # type: ignore
     m = get_sidequest(session, s.sidequest_id)
     auto_checks: Dict[str, bool] = {}
 
@@ -674,6 +675,7 @@ def create_submission(session: Session, user_id: str, s: SubmissionCreate, media
 
     return _to_submission_out(dict(rec["sub"]))
 
+
 def moderate_submission(session: Session, submission_id: str, moderator_id: str, decision: ModerationDecision) -> SubmissionOut:
     now = _now_iso()
     rec = session.run("""
@@ -702,6 +704,7 @@ def moderate_submission(session: Session, submission_id: str, moderator_id: str,
             pass
 
     return _to_submission_out(sub)
+
 
 def _award_on_approval(session: Session, submission_id: str) -> None:
     rec = session.run("""
@@ -747,8 +750,7 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
                 LIMIT 1
             """, {"uid": uid}).single()
             if prev:
-                from datetime import date as _date
-                ty, tw, _ = _date.today().isocalendar()
+                ty, tw, _ = date.today().isocalendar()
                 if (prev["y"], prev["w"] + 1) == (ty, tw):
                     bonus = streak_bonus
         elif streak_period == "daily":
@@ -757,8 +759,7 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
                 RETURN max(date(datetime(s.created_at))) AS d
             """, {"uid": uid}).single()
             if prev and prev["d"]:
-                from datetime import date as _date
-                if prev["d"] == _date.today() - timedelta(days=1):
+                if prev["d"] == date.today() - timedelta(days=1):
                     bonus = streak_bonus
 
     eco_total = int(eco) + int(bonus)
@@ -789,14 +790,12 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
             SET tb.team_id = $team_id, tb.eco = 0, tb.at = datetime($now)
             MERGE (t)-[:TEAM_BONUS]->(tb)
         """, {"tid": tid, "tbid": tbid, "team_id": sub_team, "now": now})
-        
-        # utils.py (or near get_user_progress)
-from datetime import datetime, timedelta
-from neo4j import Session
-from .schema import UserProgressOut
 
+
+# -------- progress & rotation --------
 def parse_iso_utc(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
 
 def get_user_progress(session: Session, user_id: str) -> UserProgressOut:
     # recent approvals (last 30)
@@ -857,9 +856,9 @@ def get_user_progress(session: Session, user_id: str) -> UserProgressOut:
     eligible_weekly = (ewr and ewr["ids"]) or []
 
     # next streak reset (end of current ISO week, Sunday 23:59:59 UTC)
-    today = datetime.utcnow().date()
-    wd = today.isoweekday()  # 1=Mon .. 7=Sun
-    week_start = today - timedelta(days=wd - 1)
+    today_d = datetime.utcnow().date()
+    wd = today_d.isoweekday()  # 1=Mon .. 7=Sun
+    week_start = today_d - timedelta(days=wd - 1)
     next_reset = datetime.combine(week_start + timedelta(days=7), datetime.min.time()) - timedelta(seconds=1)
 
     return UserProgressOut(
@@ -870,19 +869,18 @@ def get_user_progress(session: Session, user_id: str) -> UserProgressOut:
         eligible_weekly_ids=list(eligible_weekly),
     )
 
+
 def rotate_weekly_sidequests(session: Session, payload: RotationRequest) -> RotationResult:
     """
     Activates all eligible weekly sidequests (or up to max_slots) for the given ISO window.
     We do not archive; we only stamp rotation fields and status='active'.
     """
-    # find eligible weekly templates (kind='weekly' and rot_is_weekly_slot=true or null)
-    # prefer ones not already in this iso year/week
     params = {
         "y": payload.iso_year,
         "w": payload.iso_week,
         "start": payload.starts_on.isoformat(),
         "end": payload.ends_on.isoformat(),
-        "limit": payload.max_slots or 999999,
+        "limit": payload.max_slots or 999_999,
         "now": _now_iso(),
     }
     recs = session.run("""
@@ -912,6 +910,7 @@ def rotate_weekly_sidequests(session: Session, payload: RotationRequest) -> Rota
         activated_ids=list(activated),
         window=payload,
     )
+
 
 # -------- bulk upsert (sidequests) --------
 def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -943,3 +942,9 @@ def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str,
             errors.append(f"row {idx}: {type(e).__name__}: {e}")
 
     return {"created": created, "updated": updated, "errors": errors}
+
+def _title_key(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    # lower + trim + collapse all internal whitespace to single spaces
+    return " ".join(s.strip().lower().split())

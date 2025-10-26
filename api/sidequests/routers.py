@@ -329,3 +329,277 @@ async def r_bulk_upsert_csv(
         result["errors"] = (result.get("errors") or []) + conversion_errors
 
     return BulkUpsertResult(**result)
+# ---------------- CSV Bulk Upload (full-schema, tolerant) ----------------
+from typing import Optional, Any, Dict, List
+from fastapi import HTTPException, UploadFile, File
+import csv, io, json
+
+# ---------- parsing helpers ----------
+def _parse_bool(v: Optional[str]) -> Optional[bool]:
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in {"1","true","yes","y","t"}:
+        return True
+    if s in {"0","false","no","n","f"}:
+        return False
+    return None
+
+def _parse_int(v: Optional[str]) -> Optional[int]:
+    if v is None or str(v).strip() == "":
+        return None
+    try:
+        return int(str(v).strip())
+    except Exception:
+        return None
+
+def _parse_float(v: Optional[str]) -> Optional[float]:
+    if v is None or str(v).strip() == "":
+        return None
+    try:
+        return float(str(v).strip())
+    except Exception:
+        return None
+
+def _parse_list(v: Optional[str]) -> Optional[List[str]]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    # Accept comma or pipe separators
+    parts = [p.strip() for p in s.replace("|", ",").split(",")]
+    return [p for p in parts if p]
+
+def _maybe_json(v: Optional[str]) -> Optional[dict]:
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        obj = json.loads(s)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+def _clean_nested(d: Dict[str, Any]) -> Dict[str, Any]:
+    """Drop keys that are None/''/[]/{} so we can decide if the group is actually present."""
+    return {k: v for k, v in d.items() if v not in (None, "", [], {})}
+
+# Normalizers for schema enums / literals
+_DIFFICULTY_MAP = {
+    "1":"easy", "easy":"easy", "e":"easy",
+    "2":"moderate", "moderate":"moderate", "med":"moderate", "m":"moderate",
+    "3":"hard", "hard":"hard", "h":"hard",
+}
+_IMPACT_MAP = {
+    "1":"low", "low":"low", "l":"low",
+    "2":"medium", "medium":"medium", "med":"medium", "m":"medium",
+    "3":"high", "high":"high", "h":"high",
+}
+_PERIOD_MAP = {"daily":"daily","d":"daily","weekly":"weekly","w":"weekly"}
+
+def _norm_difficulty(v: Optional[str]) -> Optional[str]:
+    if v is None or str(v).strip() == "":
+        return None
+    s = str(v).strip().lower()
+    return _DIFFICULTY_MAP.get(s, s)  # if your model strictly enforces the enum, this keeps valid values
+
+def _norm_impact(v: Optional[str]) -> Optional[str]:
+    if v is None or str(v).strip() == "":
+        return None
+    s = str(v).strip().lower()
+    return _IMPACT_MAP.get(s, s)
+
+def _norm_period(v: Optional[str]) -> Optional[str]:
+    if v is None or str(v).strip() == "":
+        return None
+    s = str(v).strip().lower()
+    return _PERIOD_MAP.get(s, s)
+
+def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
+    """
+    Convert one CSV row into a SidequestCreate/Update-compatible dict.
+
+    Supports either:
+      - Prefixed columns like "pills.difficulty", "geo.lat", etc.
+      - Or full JSON in a single column e.g. "pills", "geo", etc.
+
+    Lists: "tags", "verification_methods" accept comma/pipe separated values.
+    Empty nested groups are ignored (not included in the output), so validation won't fire.
+    """
+    out: Dict[str, Any] = {}
+
+    # --- top-level simple fields ---
+    out["id"] = (row.get("id") or "").strip() or None
+    out["kind"] = (row.get("kind") or "").strip() or None
+    out["title"] = (row.get("title") or "").strip() or None
+    out["subtitle"] = (row.get("subtitle") or "").strip() or None
+    out["description_md"] = row.get("description_md") or None
+    out["reward_eco"] = _parse_int(row.get("reward_eco"))
+    out["xp_reward"] = _parse_int(row.get("xp_reward"))
+    out["max_completions_per_user"] = _parse_int(row.get("max_completions_per_user"))
+    out["cooldown_days"] = _parse_int(row.get("cooldown_days"))
+    out["start_at"] = (row.get("start_at") or "").strip() or None   # ISO string
+    out["end_at"] = (row.get("end_at") or "").strip() or None       # ISO string
+    out["status"] = (row.get("status") or "").strip() or None
+    out["hero_image"] = (row.get("hero_image") or "").strip() or None
+    out["card_accent"] = (row.get("card_accent") or "").strip() or None
+
+    tags = _parse_list(row.get("tags"))
+    if tags is not None:
+        out["tags"] = tags
+
+    vms = _parse_list(row.get("verification_methods"))
+    if vms is not None:
+        out["verification_methods"] = vms
+
+    # --- nested helpers ---
+    def prefixed(ns: str) -> Dict[str, str]:
+        p = f"{ns}."
+        return {k[len(p):]: v for k, v in row.items() if k.startswith(p) and v is not None}
+
+    # pills
+    pills_raw = _maybe_json(row.get("pills")) or {}
+    pills_raw |= prefixed("pills")
+    pills_norm = {
+        "difficulty": _norm_difficulty(pills_raw.get("difficulty")),
+        "impact": _norm_impact(pills_raw.get("impact")),
+        "time_estimate_min": _parse_int(pills_raw.get("time_estimate_min")),
+        "materials": _parse_list(pills_raw.get("materials")),
+        "facts": _parse_list(pills_raw.get("facts")),
+    }
+    pills_final = _clean_nested(pills_norm)
+    if pills_final:
+        out["pills"] = pills_final
+
+    # geo
+    geo_raw = _maybe_json(row.get("geo")) or {}
+    geo_raw |= prefixed("geo")
+    geo_norm = {
+        "lat": _parse_float(geo_raw.get("lat")),
+        "lon": _parse_float(geo_raw.get("lon")),
+        "radius_m": _parse_int(geo_raw.get("radius_m")),
+        "locality": (geo_raw.get("locality") or "").strip() or None,
+    }
+    geo_final = _clean_nested(geo_norm)
+    if geo_final:
+        out["geo"] = geo_final
+
+    # streak
+    streak_raw = _maybe_json(row.get("streak")) or {}
+    streak_raw |= prefixed("streak")
+    streak_norm = {
+        "name": (streak_raw.get("name") or "").strip() or None,
+        "period": _norm_period(streak_raw.get("period")),
+        "bonus_eco_per_step": _parse_int(streak_raw.get("bonus_eco_per_step")),
+        "max_steps": _parse_int(streak_raw.get("max_steps")),
+    }
+    streak_final = _clean_nested(streak_norm)
+    if streak_final:
+        out["streak"] = streak_final
+
+    # rotation
+    rotation_raw = _maybe_json(row.get("rotation")) or {}
+    rotation_raw |= prefixed("rotation")
+    rotation_norm = {
+        "is_weekly_slot": _parse_bool(rotation_raw.get("is_weekly_slot")),
+        "iso_year": _parse_int(rotation_raw.get("iso_year")),
+        "iso_week": _parse_int(rotation_raw.get("iso_week")),
+        "slot_index": _parse_int(rotation_raw.get("slot_index")),
+        "starts_on": (rotation_raw.get("starts_on") or "").strip() or None,  # YYYY-MM-DD
+        "ends_on": (rotation_raw.get("ends_on") or "").strip() or None,      # YYYY-MM-DD
+    }
+    rotation_final = _clean_nested(rotation_norm)
+    if rotation_final:
+        out["rotation"] = rotation_final
+
+    # chain
+    chain_raw = _maybe_json(row.get("chain")) or {}
+    chain_raw |= prefixed("chain")
+    chain_norm = {
+        "chain_id": (chain_raw.get("chain_id") or "").strip() or None,
+        "chain_order": _parse_int(chain_raw.get("chain_order")),
+        "requires_prev_approved": _parse_bool(chain_raw.get("requires_prev_approved")),
+    }
+    chain_final = _clean_nested(chain_norm)
+    if chain_final:
+        out["chain"] = chain_final
+
+    # team
+    team_raw = _maybe_json(row.get("team")) or {}
+    team_raw |= prefixed("team")
+    team_norm = {
+        "allowed": _parse_bool(team_raw.get("allowed")),
+        "min_size": _parse_int(team_raw.get("min_size")),
+        "max_size": _parse_int(team_raw.get("max_size")),
+        "team_bonus_eco": _parse_int(team_raw.get("team_bonus_eco")),
+    }
+    team_final = _clean_nested(team_norm)
+    if team_final:
+        out["team"] = team_final
+
+    # prune top-level empties
+    return {k: v for k, v in out.items() if v is not None}
+
+
+@router.post("/bulk/csv", response_model=BulkUpsertResult)
+async def r_bulk_upsert_csv(
+    file: UploadFile = File(...),
+    session: Session = Depends(session_dep),
+    admin_email: str = Depends(require_admin),
+):
+    """
+    CSV bulk upsert for Sidequests.
+
+    Accepts columns:
+      - Top-level: id, kind, title, subtitle, description_md, reward_eco, xp_reward,
+                   max_completions_per_user, cooldown_days, tags, verification_methods,
+                   start_at, end_at, status, hero_image, card_accent
+      - Nested via prefixes or JSON:
+          pills.*      (difficulty, impact, time_estimate_min, materials, facts)
+          geo.*        (lat, lon, radius_m, locality)
+          streak.*     (name, period, bonus_eco_per_step, max_steps)
+          rotation.*   (is_weekly_slot, iso_year, iso_week, slot_index, starts_on, ends_on)
+          chain.*      (chain_id, chain_order, requires_prev_approved)
+          team.*       (allowed, min_size, max_size, team_bonus_eco)
+
+    Lists accept comma or pipe separators. Booleans accept 1/0, true/false, yes/no.
+    If 'id' is present → update; else → create.
+    """
+    try:
+        raw = await file.read()
+        text = raw.decode("utf-8-sig")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Cannot read CSV: {e}")
+
+    try:
+        reader = csv.DictReader(io.StringIO(text))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid CSV: {e}")
+
+    rows: List[Dict[str, Any]] = []
+    for i, row in enumerate(reader, start=2):  # start=2 to account for header line=1
+        try:
+            payload = _row_to_sidequest_dict(row)
+            rows.append(payload)
+        except Exception as e:
+            # Keep going, report in errors
+            rows.append({"__row_error__": f"line {i}: {type(e).__name__}: {e}"})
+
+    # Separate valid rows vs converter errors
+    valid_payloads: List[Dict[str, Any]] = []
+    conversion_errors: List[str] = []
+    for payload in rows:
+        if "__row_error__" in payload:
+            conversion_errors.append(payload["__row_error__"])
+        else:
+            valid_payloads.append(payload)
+
+    # Use existing JSON bulk upsert
+    result = bulk_upsert(session, valid_payloads)
+    if conversion_errors:
+        result["errors"] = (result.get("errors") or []) + conversion_errors
+
+    return BulkUpsertResult(**result)
