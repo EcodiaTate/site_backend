@@ -8,7 +8,6 @@ from .me import router as me_router
 from .refresh import router as refresh_router
 
 router = APIRouter()
-
 router.include_router(logout_router)
 router.include_router(sso_router)
 router.include_router(set_role_router)
