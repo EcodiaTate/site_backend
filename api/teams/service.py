@@ -17,13 +17,20 @@ from neo4j import Session
 # Requires APOC (already referenced elsewhere).
 
 def _team_shape() -> str:
-    # include optional extended fields + lists/maps safely
-    return """t{
-      .*, created_at: toString(t.created_at),
+    # Rebuild socials map from flattened properties: socials_*
+    return """
+    t{
+      .*, 
+      created_at: toString(t.created_at),
       tags: coalesce(t.tags, []),
-      socials: coalesce(t.socials, {}),
-      join_questions: coalesce(t.join_questions, [])
-    } AS t"""
+      join_questions: coalesce(t.join_questions, []),
+      socials: apoc.map.fromPairs(
+        [k IN [x IN keys(t) WHERE x STARTS WITH 'socials_'] |
+          [substring(k, 9), t[k]]
+        ]
+      )
+    } AS t
+    """
 
 def _member_row() -> str:
     return """{id:m.id, role: r.role, joined_at: toString(r.joined_at)}"""
@@ -49,30 +56,45 @@ def create_team(session: Session, uid: str, name: str, slug: str, visibility: st
     _ensure_slug_unique(session, slug)
     tid = uuid4().hex
     rec = session.run("""
-      WITH apoc.text.random(6,'A-Za-z0-9') AS code
-      MATCH (u:User {id:$uid})
-      CREATE (t:Team {
-        id:$tid, name:$name, slug:$slug, created_at:datetime(),
-        join_code:code, visibility:$vis, avatar_url:$ava, bio:$bio, max_members:$maxm,
-        banner_url:$ban, theme_color:$theme, timezone:$tz, lat:$lat, lng:$lng,
-        tags: coalesce($tags, []), rules_md:$rules, socials: coalesce($socials, {}),
-        allow_auto_join_public: $auto_pub, require_approval_private: $req_priv,
-        join_questions: coalesce($join_qs, [])
-      })
-      MERGE (u)-[:OWNS]->(t)
-      MERGE (u)-[:MEMBER_OF {role:'owner', joined_at:datetime()}]->(t)
-      RETURN """+_team_shape(),
-      {
-        "uid": uid, "tid": tid, "name": name, "slug": slug,
-        "vis": visibility, "ava": avatar_url, "bio": bio, "maxm": int(max_members),
-        "ban": banner_url, "theme": theme_color, "tz": timezone, "lat": lat, "lng": lng,
-        "tags": tags, "rules": rules_md, "socials": socials,
-        "auto_pub": bool(allow_auto_join_public), "req_priv": bool(require_approval_private),
-        "join_qs": join_questions
-      }
-    ).single()
-    return dict(rec["t"])
+    WITH apoc.text.random(6,'A-Za-z0-9') AS code
+    MATCH (u:User {id:$uid})
+    CREATE (t:Team {
+      id:$tid, name:$name, slug:$slug, created_at:datetime(),
+      join_code:code, visibility:$vis, avatar_url:$ava, bio:$bio, max_members:$maxm,
+      banner_url:$ban, theme_color:$theme, timezone:$tz, lat:$lat, lng:$lng,
+      tags: coalesce($tags, []), rules_md:$rules,
+      allow_auto_join_public: $auto_pub, require_approval_private: $req_priv,
+      join_questions: coalesce($join_qs, [])
+    })
+    MERGE (u)-[:OWNS]->(t)
+    MERGE (u)-[:MEMBER_OF {role:'owner', joined_at:datetime()}]->(t)
 
+    // Flatten socials_* only if there are keys
+    WITH t, $socials AS socials
+    CALL apoc.do.when(
+      socials IS NULL OR size(keys(socials)) = 0,
+      'RETURN t AS t',
+      '
+        SET t += apoc.map.fromPairs(
+          [k IN keys(socials) | ["socials_" + k, socials[k]]]
+        )
+        RETURN t AS t
+      ',
+      {t:t, socials:socials}
+    ) YIELD value
+    WITH value.t AS t
+    RETURN """+_team_shape(),
+    {
+      "uid": uid, "tid": tid, "name": name, "slug": slug,
+      "vis": visibility, "ava": avatar_url, "bio": bio, "maxm": int(max_members),
+      "ban": banner_url, "theme": theme_color, "tz": timezone, "lat": lat, "lng": lng,
+      "tags": tags, "rules": rules_md, "socials": socials,
+      "auto_pub": bool(allow_auto_join_public), "req_priv": bool(require_approval_private),
+      "join_qs": join_questions
+    }
+  ).single()
+
+    return dict(rec["t"])
 def update_team(session: Session, uid: str, tid: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     # ensure admin/owner
     auth = session.run("""
@@ -80,32 +102,63 @@ def update_team(session: Session, uid: str, tid: str, payload: Dict[str, Any]) -
       WHERE r.role IN ['owner','admin']
       RETURN t
     """, uid=uid, tid=tid).single()
-    if not auth: raise PermissionError("not_allowed")
+    if not auth:
+        raise PermissionError("not_allowed")
 
     sets = []
     params: Dict[str, Any] = {"tid": tid}
+
     for k in [
         "name","slug","visibility","avatar_url","bio","max_members",
         "banner_url","theme_color","timezone","lat","lng","rules_md",
         "allow_auto_join_public","require_approval_private"
     ]:
         if k in payload and payload[k] is not None:
-            if k == "slug": _ensure_slug_unique(session, payload[k])
-            params[k] = payload[k]; sets.append(f"t.{k} = ${k}")
-    # lists/maps need coalesce
-    if "tags" in payload and payload["tags"] is not None:
-        params["tags"] = payload["tags"]; sets.append("t.tags = coalesce($tags, [])")
-    if "socials" in payload and payload["socials"] is not None:
-        params["socials"] = payload["socials"]; sets.append("t.socials = coalesce($socials, {})")
-    if "join_questions" in payload and payload["join_questions"] is not None:
-        params["join_qs"] = payload["join_questions"]; sets.append("t.join_questions = coalesce($join_qs, [])")
+            if k == "slug":
+                _ensure_slug_unique(session, payload[k])
+            params[k] = payload[k]
+            sets.append(f"t.{k} = ${k}")
 
-    if not sets: sets.append("t.id = t.id")
-    rec = session.run(f"""
+    if "tags" in payload and payload["tags"] is not None:
+        params["tags"] = payload["tags"]
+        sets.append("t.tags = coalesce($tags, [])")
+    if "join_questions" in payload and payload["join_questions"] is not None:
+        params["join_qs"] = payload["join_questions"]
+        sets.append("t.join_questions = coalesce($join_qs, [])")
+
+    base_set = ", ".join(sets) if sets else "t.id = t.id"
+
+    socials_stmt = ""
+    if "socials" in payload:
+        params["socials"] = payload["socials"]
+        socials_stmt = """
+          // wipe previous socials_* keys
+          WITH t
+          FOREACH (k IN [x IN keys(t) WHERE x STARTS WITH 'socials_'] | SET t[k] = NULL)
+          WITH t, $socials AS socials
+          CALL apoc.do.when(
+            socials IS NULL OR size(keys(socials)) = 0,
+            'RETURN t AS t',
+            '
+              SET t += apoc.map.fromPairs(
+                [k IN keys(socials) | ["socials_" + k, socials[k]]]
+              )
+              RETURN t AS t
+            ',
+            {t:t, socials:socials}
+          ) YIELD value
+          WITH value.t AS t
+        """
+
+    cypher = f"""
       MATCH (t:Team {{id:$tid}})
-      SET {", ".join(sets)}
-      RETURN """+_team_shape(), params).single()
+      SET {base_set}
+      {socials_stmt}
+      RETURN """ + _team_shape()
+
+    rec = session.run(cypher, params).single()
     return dict(rec["t"])
+
 
 def regenerate_code(session: Session, uid: str, tid: str) -> Dict[str, Any]:
     auth = session.run("""
@@ -162,14 +215,18 @@ def _invite_link_shape() -> str:
                created_by:by.id, uses:coalesce(il.uses,0),
                max_uses:il.max_uses, expires_at: CASE WHEN il.expires_at IS NULL THEN NULL ELSE toString(il.expires_at) END}"""
 
+# site_backend/api/teams/service.py  (or your actual path)
+
 def create_invite_link(session: Session, admin_uid: str, tid: str,
                        max_uses: Optional[int], expires_days: Optional[int]) -> Dict[str, Any]:
     # owner/admin only
     auth = session.run("""
-      MATCH (:User {id:$admin})-[r:MEMBER_OF]->(t:Team {id:$tid})
+      MATCH (:User {id:$admin_uid})-[r:MEMBER_OF]->(t:Team {id:$tid})
       WHERE r.role IN ['owner','admin'] RETURN t
     """, admin_uid=admin_uid, tid=tid).single()
-    if not auth: raise PermissionError("not_allowed")
+    if not auth:
+        raise PermissionError("not_allowed")
+
     rec = session.run("""
       MATCH (t:Team {id:$tid}), (by:User {id:$admin})
       WITH t, by, apoc.text.random(8,'A-Za-z0-9') AS code
@@ -178,22 +235,32 @@ def create_invite_link(session: Session, admin_uid: str, tid: str,
                              expires_at: CASE WHEN $exp_days IS NULL THEN NULL ELSE datetime() + duration({days:$exp_days}) END})
       MERGE (by)-[:CREATED]->(il)
       MERGE (il)-[:FOR_TEAM]->(t)
-      RETURN """+_invite_link_shape()+""" AS link
+      RETURN {code:il.code, team_id:t.id, created_at:toString(il.created_at),
+              created_by:by.id, uses:coalesce(il.uses,0),
+              max_uses:il.max_uses,
+              expires_at: CASE WHEN il.expires_at IS NULL THEN NULL ELSE toString(il.expires_at) END} AS link
     """, {"tid": tid, "admin": admin_uid, "max_uses": max_uses, "exp_days": expires_days}).single()
     return dict(rec["link"])
 
+
 def list_invite_links(session: Session, admin_uid: str, tid: str) -> List[Dict[str,Any]]:
     auth = session.run("""
-      MATCH (:User {id:$admin})-[r:MEMBER_OF]->(t:Team {id:$tid})
+      MATCH (:User {id:$admin_uid})-[r:MEMBER_OF]->(t:Team {id:$tid})
       WHERE r.role IN ['owner','admin'] RETURN t
     """, admin_uid=admin_uid, tid=tid).single()
-    if not auth: raise PermissionError("not_allowed")
+    if not auth:
+        raise PermissionError("not_allowed")
+
     rows = session.run("""
       MATCH (t:Team {id:$tid})<-[:FOR_TEAM]-(il:InviteLink)<-[:CREATED]-(by:User)
-      RETURN """+_invite_link_shape()+""" AS link
+      RETURN {code:il.code, team_id:t.id, created_at:toString(il.created_at),
+              created_by:by.id, uses:coalesce(il.uses,0),
+              max_uses:il.max_uses,
+              expires_at: CASE WHEN il.expires_at IS NULL THEN NULL ELSE toString(il.expires_at) END} AS link
       ORDER BY il.created_at DESC
     """, {"tid": tid}).data()
     return [dict(r["link"]) for r in rows]
+
 
 def delete_invite_link(session: Session, admin_uid: str, code: str) -> Dict[str,Any]:
     rec = session.run("""
@@ -468,41 +535,54 @@ def team_stats(session: Session, tid: str) -> Dict[str, Any]:
     return {"team_id": tid, "members_count": members, "eco_total": int(totals),
             "eco_week": int(week), "eco_month": int(month),
             "submissions_approved": int(approvals)}
-
 def team_feed(session: Session, tid: str, limit: int = 30) -> List[Dict[str, Any]]:
-    # UNION submissions + joins + announcements + milestones
     rows = session.run("""
+      // Branch 1: approved submissions
       CALL {
         MATCH (sub:Submission {state:'approved'}) WHERE sub.team_id = $tid
         OPTIONAL MATCH (u:User)-[:SUBMITTED]->(sub)
-        RETURN { id: sub.id, at: toString(sub.created_at), type:'submission_approved',
-                 title: coalesce(sub.caption,'Sidequest approved'), eco_delta: 0,
-                 by_user_id: u.id, submission_id: sub.id } AS item
-        ORDER BY sub.created_at DESC LIMIT $lim
+        RETURN { id: sub.id,
+                 at: toString(sub.created_at),
+                 type:'submission_approved',
+                 title: coalesce(sub.caption,'Sidequest approved'),
+                 eco_delta: 0,
+                 by_user_id: u.id,
+                 submission_id: sub.id } AS item
+        ORDER BY sub.created_at DESC
+        LIMIT $lim
       }
+      RETURN item
       UNION ALL
+      // Branch 2: member joins
       CALL {
-        MATCH (f:TeamFeed {type:'member_joined'})-[:FOR_TEAM]->(t:Team {id:$tid})
+        MATCH (f:TeamFeed {type:'member_joined'})-[:FOR_TEAM]->(:Team {id:$tid})
         RETURN f{.*, at:toString(f.at)} AS item
-        ORDER BY f.at DESC LIMIT $lim
+        ORDER BY f.at DESC
+        LIMIT $lim
       }
+      RETURN item
       UNION ALL
+      // Branch 3: announcements
       CALL {
-        MATCH (f:TeamFeed {type:'announcement_posted'})-[:FOR_TEAM]->(t:Team {id:$tid})
+        MATCH (f:TeamFeed {type:'announcement_posted'})-[:FOR_TEAM]->(:Team {id:$tid})
         RETURN f{.*, at:toString(f.at)} AS item
-        ORDER BY f.at DESC LIMIT $lim
+        ORDER BY f.at DESC
+        LIMIT $lim
       }
+      RETURN item
       UNION ALL
+      // Branch 4: milestones
       CALL {
-        MATCH (f:TeamFeed {type:'milestone_reached'})-[:FOR_TEAM]->(t:Team {id:$tid})
+        MATCH (f:TeamFeed {type:'milestone_reached'})-[:FOR_TEAM]->(:Team {id:$tid})
         RETURN f{.*, at:toString(f.at)} AS item
-        ORDER BY f.at DESC LIMIT $lim
+        ORDER BY f.at DESC
+        LIMIT $lim
       }
       RETURN item
       ORDER BY item.at DESC
       LIMIT $lim
     """, {"tid": tid, "lim": limit}).data()
-    # ensure all dicts
+
     return [dict(r["item"]) for r in rows]
 
 def teams_leaderboard(session: Session, period: str = "monthly", limit: int = 50) -> Dict[str, Any]:
@@ -563,3 +643,4 @@ def members_leaderboard(session: Session, tid: str, period: str = "monthly", lim
         last = e
         out.append({"user_id": r["uid"], "user_name": r["uname"], "eco": e, "rank": rank})
     return {"team_id": tid, "period": period, "rows": out}
+

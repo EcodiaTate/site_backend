@@ -1,4 +1,3 @@
-# site_backend/api/leaderboards/leaderboards.py
 from __future__ import annotations
 from typing import List, Optional
 import os
@@ -25,7 +24,9 @@ class LBYouthEcoRow(BaseModel):
 
 class LBBusinessEcoRow(BaseModel):
     business_id: str
-    name: str
+    display_name: str
+    # kept for backward-compat (may be None if not present)
+    name: Optional[str] = None
     eco: int = 0
 
 class LBYouthActionsRow(BaseModel):
@@ -112,7 +113,6 @@ def leaderboard_youth_eco(
     session: Session = Depends(session_dep),
 ):
     """Youth ECO leaderboard (sum of settled EcoTx earned in period)."""
-    # Normal path uses the injected session; on routing error only, retry direct bolt
     return _with_direct_bolt_retry(
         top_youth_eco, session, period=period, limit=limit, offset=offset, me_user_id=me_user_id
     )

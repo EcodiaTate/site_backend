@@ -2,7 +2,7 @@ from __future__ import annotations
 from uuid import uuid4
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, EmailStr, Field
 from argon2 import PasswordHasher
 from neo4j import Session
@@ -20,24 +20,81 @@ JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_ALGO = "HS256"
 ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "tate@ecodia.au").lower()
 
-def _now_ms() -> int:
-    return int(time.time() * 1000)
+# Access/Refresh config (HS256; upgradeable to RS256 later)
+ACCESS_JWT_SECRET = os.getenv("ACCESS_JWT_SECRET", JWT_SECRET)
+ACCESS_JWT_ALGO   = os.getenv("ACCESS_JWT_ALGO", "HS256")
+ACCESS_JWT_TTL_S  = int(os.getenv("ACCESS_JWT_TTL_S", "900"))    # 15m
+ACCESS_JWT_ISS    = os.getenv("ACCESS_JWT_ISS", None)
+ACCESS_JWT_AUD    = os.getenv("ACCESS_JWT_AUD", None)
 
-def _mint_admin_token(email: str) -> str:
-    now = int(time.time())
-    exp = now + 60 * 60 * 12  # 12h
-    payload = {"sub": email, "scope": "admin", "iat": now, "exp": exp, "aud": "admin"}
-    token = jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-    return token
+REFRESH_JWT_SECRET  = os.getenv("REFRESH_JWT_SECRET", JWT_SECRET)
+REFRESH_JWT_ALGO    = os.getenv("REFRESH_JWT_ALGO", "HS256")
+REFRESH_TTL_DAYS    = int(os.getenv("REFRESH_TTL_DAYS", "90"))
+REFRESH_COOKIE_NAME = os.getenv("REFRESH_COOKIE_NAME", "refresh_token")
 
-# ------------------ Shared role defaults ------------------
-ROLE_DEFAULT_CAPS: dict[str, dict[str, int]] = {
-    "youth": {"max_redemptions_per_week": 5},
-    "business": {"max_active_offers": 3},
-    "creative": {"max_active_collabs": 3},
-    "partner": {"max_workspaces": 2},
+# ------------------ Role default capabilities ------------------
+ROLE_DEFAULT_CAPS: dict[str, dict[str, Any]] = {
+    "youth": {
+        "max_redemptions_per_week": 5,
+        "streak_bonus_enabled": True,
+        "max_active_sidequests": 7,
+    },
+    "business": {
+        "max_active_offers": 3,
+        "can_issue_qr": True,
+        "analytics_enabled": True,
+    },
+    "creative": {
+        "max_active_collabs": 3,
+        "portfolio_required": False,
+    },
+    "partner": {
+        "max_workspaces": 2,
+        "can_host_events": True,
+    },
     "public": {},
 }
+
+def _now_s() -> int:
+    return int(time.time())
+
+def _mint_access(uid: str, email: Optional[str] = None) -> tuple[str, int]:
+    now = _now_s()
+    exp = now + ACCESS_JWT_TTL_S
+    payload = {
+        "sub": uid,
+        "iat": now,
+        "exp": exp,
+    }
+    if email: payload["email"] = email
+    if ACCESS_JWT_ISS: payload["iss"] = ACCESS_JWT_ISS
+    if ACCESS_JWT_AUD: payload["aud"] = ACCESS_JWT_AUD
+    token = jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO)
+    return token, exp
+
+def _mint_refresh(uid: str) -> str:
+    now = _now_s()
+    exp = now + REFRESH_TTL_DAYS * 24 * 3600
+    payload = {
+        "sub": uid,
+        "iat": now,
+        "exp": exp,
+        "typ": "refresh",
+    }
+    return jwt.encode(payload, REFRESH_JWT_SECRET, algorithm=REFRESH_JWT_ALGO)
+
+def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
+    """
+    Parse caps from DB (stringified JSON or map). If missing/empty,
+    fall back to ROLE_DEFAULT_CAPS[role].
+    """
+    try:
+        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
+    except Exception:
+        caps = {}
+    if not caps:
+        caps = ROLE_DEFAULT_CAPS.get(role, {})
+    return caps
 
 # ------------------ Schemas ------------------
 class YouthJoinIn(BaseModel):
@@ -78,16 +135,6 @@ class UserOut(BaseModel):
     role: str
     caps: dict[str, Any]
     profile: dict[str, Any] = {}
-
-# ------------------ Helpers ------------------
-def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
-    try:
-        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
-    except Exception:
-        caps = {}
-    if not caps:
-        caps = ROLE_DEFAULT_CAPS.get(role, {})
-    return caps
 
 # ------------------ Joins ------------------
 @router.post("/join/youth", response_model=UserOut)
@@ -296,7 +343,7 @@ def join_public(p: PublicJoinIn, s: Session = Depends(session_dep)):
 
 # ------------------ Login ------------------
 @router.post("/login")
-def login(p: LoginIn, s: Session = Depends(session_dep)):
+def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
     cypher = """
     MATCH (u:User {email:$email})
     OPTIONAL MATCH (u)-[:HAS_PROFILE]->(yp:YouthProfile)
@@ -334,11 +381,39 @@ def login(p: LoginIn, s: Session = Depends(session_dep)):
 
     caps = _safe_caps(u.get("caps_json") or "{}", role)
 
-    resp = {"id": u["id"], "email": u["email"], "role": role, "caps": caps, "profile": profile}
+    # --- Mint tokens ---
+    access, exp = _mint_access(u["id"], u["email"])
+    refresh = _mint_refresh(u["id"])
 
+    # --- Set refresh cookie (HttpOnly) ---
+    # NOTE: set secure=True in production behind HTTPS
+    response.set_cookie(
+        key=os.getenv("REFRESH_COOKIE_NAME", REFRESH_COOKIE_NAME),
+        value=refresh,
+        path="/",
+        httponly=True,
+        secure=False,
+        samesite="lax",
+        max_age=REFRESH_TTL_DAYS * 24 * 3600,
+    )
+
+    resp = {
+        "id": u["id"],
+        "email": u["email"],
+        "role": role,
+        "caps": caps,
+        "profile": profile,
+        # Frontend expects these today:
+        "user_token": u["id"],  # legacy convenience; slated for deprecation
+        # Canonical access token for FE:
+        "token": access,
+        "exp": exp,
+    }
+
+    # Preserve your existing admin token behavior
     if ADMIN_EMAIL and u["email"].lower() == ADMIN_EMAIL:
-        resp["admin_token"] = _mint_admin_token(u["email"])
-
-    resp["user_token"] = u["id"]  # optional convenience
+        now = _now_s()
+        admin_payload = {"sub": u["email"], "scope": "admin", "iat": now, "exp": now + 60*60*12, "aud": "admin"}
+        resp["admin_token"] = jwt.encode(admin_payload, JWT_SECRET, algorithm=JWT_ALGO)
 
     return resp
