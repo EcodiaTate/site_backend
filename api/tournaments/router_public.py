@@ -1,7 +1,9 @@
 from __future__ import annotations
 from typing import List, Optional
-from fastapi import APIRouter, Depends, Query, Body
+
+from fastapi import APIRouter, Depends, Query, Body, HTTPException
 from neo4j import Session
+
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 from site_backend.core.admin_guard import require_admin
@@ -12,7 +14,8 @@ from .schema import (
 )
 from .service import (
     list_tournaments, create_tournament, update_tournament,
-    enroll, withdraw, enrollment, standings, leaderboard
+    enroll, withdraw, enrollment, standings, leaderboard,
+    get_tournament,  # ✅ hydrated with prizes + computed flags
 )
 
 router = APIRouter(prefix="/tournaments", tags=["tournaments"])
@@ -27,11 +30,21 @@ def r_list_tournaments(
 ):
     return list_tournaments(session, status=status, visibility=visibility, division=division)
 
+@router.get("/{tid}", response_model=Tournament)
+def r_get_tournament(
+    tid: str,
+    session: Session = Depends(session_dep),
+):
+    try:
+        return get_tournament(session, tid)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="not_found")
+
 @router.post("/{tid}/enroll", response_model=TournamentEnrollResult)
 def r_enroll(
     tid: str,
     scope: str = Query(pattern="^(team|solo)$"),
-    team_id: str | None = None,
+    team_id: Optional[str] = Query(default=None),
     session: Session = Depends(session_dep),
     uid: str = Depends(current_user_id),
 ):
@@ -41,7 +54,7 @@ def r_enroll(
 def r_withdraw(
     tid: str,
     scope: str = Query(pattern="^(team|solo)$"),
-    team_id: str | None = None,
+    team_id: Optional[str] = Query(default=None),
     session: Session = Depends(session_dep),
     uid: str = Depends(current_user_id),
 ):
@@ -64,7 +77,7 @@ def r_leaderboard(
 ):
     return leaderboard(session, tid, metric)
 
-# ---------- Admin (optional but handy) ----------
+# ---------- Admin ----------
 @router.post("", response_model=Tournament)
 def r_create_tournament(
     payload: TournamentCreate,
@@ -72,8 +85,6 @@ def r_create_tournament(
     admin: str = Depends(require_admin),
 ):
     return create_tournament(session, payload.model_dump())
-
-from fastapi import Body  # already imported in your file
 
 @router.patch("/{tid}", response_model=Tournament)
 def r_update_tournament(

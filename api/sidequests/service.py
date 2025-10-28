@@ -1,6 +1,7 @@
+# site_backend/api/sidequests/service.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 from math import radians, sin, cos, asin, sqrt
@@ -48,8 +49,18 @@ def _public_kind_from_legacy(legacy_type: Optional[str], legacy_sub_type: Option
     return "core"
 
 
+def _title_key(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    # lower + trim + collapse all internal whitespace to single spaces
+    return " ".join(s.strip().lower().split())
+
+
+# -------- helpers → SidequestOut --------
 def _to_sidequest_out(d: Dict[str, Any]) -> SidequestOut:
     outward_kind = d.get("kind") or _public_kind_from_legacy(d.get("type"), d.get("sub_type"))
+    # NOTE: These fields assume your Pydantic model SidequestOut includes them.
+    # If not yet present, add: chain_slug: Optional[str], chain_index: Optional[int], chain_length: Optional[int]
     return SidequestOut(
         id=d["id"],
         kind=outward_kind,
@@ -66,6 +77,9 @@ def _to_sidequest_out(d: Dict[str, Any]) -> SidequestOut:
         streak=d.get("streak"),
         rotation=d.get("rotation"),
         chain=d.get("chain"),
+        chain_index=d.get("chain_index"),
+        chain_length=d.get("chain_length"),
+        chain_slug=d.get("chain_slug"),
         team=d.get("team"),
         verification_methods=d.get("verification_methods") or ["photo_upload"],
         start_at=d.get("start_at"),
@@ -95,6 +109,116 @@ def _to_submission_out(d: Dict[str, Any]) -> SubmissionOut:
         instagram_url=d.get("instagram_url"),
         team_id=d.get("team_id"),
     )
+
+
+# -------- list all (picker/feed) --------
+def list_sidequests_all(
+    session: Session,
+    *,
+    kind: Optional[str],
+    status: Optional[str],
+    q: Optional[str],
+    tag: Optional[str],
+    locality: Optional[str],
+    cap: int = 5000,  # hard safety cap; tune as needed
+) -> List[SidequestOut]:
+    where = []
+    params: Dict[str, Any] = {"cap": cap}
+
+    if kind:
+        where.append("sq.kind = $kind"); params["kind"] = kind
+    else:
+        where.append("sq.kind IS NOT NULL")
+
+    if status:
+        where.append("sq.status = $status"); params["status"] = status
+    if q:
+        where.append("(toLower(sq.title) CONTAINS toLower($q) OR toLower(sq.description_md) CONTAINS toLower($q))")
+        params["q"] = q
+    if tag:
+        where.append("$tag IN coalesce(sq.tags, [])"); params["tag"] = tag
+    if locality:
+        where.append("toLower(coalesce(sq.geo_locality,'')) = toLower($locality)"); params["locality"] = locality
+
+    where_clause = "WHERE " + " AND ".join(where) if where else ""
+    recs = session.run(f"""
+        MATCH (sq:Sidequest)
+        {where_clause}
+        // compute chain length for this sq
+        OPTIONAL MATCH (sib:Sidequest {{chain_id: sq.chain_id}})
+        WITH sq, count(sib) AS _chain_len
+        ORDER BY coalesce(toString(sq.updated_at), toString(sq.created_at)) DESC
+        LIMIT $cap
+        RETURN sq{{
+          .*,
+          pills: CASE
+            WHEN sq.pills_difficulty IS NULL
+              AND sq.pills_impact IS NULL
+              AND sq.pills_time_estimate_min IS NULL
+              AND sq.pills_materials IS NULL
+              AND sq.pills_facts IS NULL
+            THEN NULL
+            ELSE {{
+              difficulty: sq.pills_difficulty,
+              impact: sq.pills_impact,
+              time_estimate_min: sq.pills_time_estimate_min,
+              materials: sq.pills_materials,
+              facts: sq.pills_facts
+            }}
+          END,
+          geo: CASE
+            WHEN sq.geo_lat IS NULL OR sq.geo_lon IS NULL THEN NULL
+            ELSE {{
+              lat: sq.geo_lat,
+              lon: sq.geo_lon,
+              radius_m: coalesce(sq.geo_radius_m, 0),
+              locality: sq.geo_locality
+            }}
+          END,
+          streak: CASE
+            WHEN sq.streak_name IS NULL THEN NULL
+            ELSE {{
+              name: sq.streak_name,
+              period: sq.streak_period,
+              bonus_eco_per_step: coalesce(sq.streak_bonus_eco_per_step,0),
+              max_steps: sq.streak_max_steps
+            }}
+          END,
+          rotation: CASE
+            WHEN sq.rot_is_weekly_slot IS NULL THEN NULL
+            ELSE {{
+              is_weekly_slot: sq.rot_is_weekly_slot,
+              iso_year: sq.rot_iso_year,
+              iso_week: sq.rot_iso_week,
+              slot_index: sq.rot_slot_index,
+              starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
+              ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
+            }}
+          END,
+          // NEW: normalized chain object + client hints
+          chain: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE {{
+              id: sq.chain_id,
+              order: sq.chain_order,
+              requires_prev_approved: coalesce(sq.chain_requires_prev, false)
+            }}
+          END,
+          chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
+          chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
+            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
+          END,
+          // override top-level temporal fields as ISO strings for Pydantic
+          start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
+          end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
+          created_at: toString(sq.created_at),
+          updated_at: toString(sq.updated_at)
+        }} AS sq
+    """, params)
+    return [_to_sidequest_out(dict(r["sq"])) for r in recs]
 
 
 # -------- flatten helpers (write-side) --------
@@ -222,7 +346,7 @@ def _flatten_from_update(u: SidequestUpdate) -> Dict[str, Any]:
     return out
 
 
-# -------- sidequests --------
+# -------- sidequests CRUD --------
 def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
     mid = uuid4().hex
     now = _now_iso()
@@ -234,6 +358,7 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
         SET
             sq.kind                      = $kind,
             sq.title                     = $title,
+            sq.title_key                 = $title_key,
             sq.subtitle                  = $subtitle,
             sq.description_md            = $description_md,
             sq.tags                      = $tags,
@@ -296,6 +421,11 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
             sq.team_max_size             = $team_max_size,
             sq.team_bonus_eco            = $team_bonus_eco
 
+        // compute chain len for projection
+        WITH sq
+        OPTIONAL MATCH (sib:Sidequest {chain_id: sq.chain_id})
+        WITH sq, count(sib) AS _chain_len
+
         RETURN sq{
           .*,
           pills: CASE
@@ -341,6 +471,22 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
               starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
               ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
             }
+          END,
+          // NEW: chain projection + hints
+          chain: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE {
+              id: sq.chain_id,
+              order: sq.chain_order,
+              requires_prev_approved: coalesce(sq.chain_requires_prev, false)
+            }
+          END,
+          chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
+          chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
+            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
           END,
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -396,6 +542,10 @@ def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) ->
     q = f"""
     MATCH (sq:Sidequest {{id:$id}})
     SET {", ".join(set_lines)}
+    // compute chain len for projection
+    WITH sq
+    OPTIONAL MATCH (sib:Sidequest {{chain_id: sq.chain_id}})
+    WITH sq, count(sib) AS _chain_len
     RETURN sq{{
       .*,
       pills: CASE
@@ -442,6 +592,22 @@ def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) ->
           ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
         }}
       END,
+      // NEW: chain projection + hints
+      chain: CASE
+        WHEN sq.chain_id IS NULL THEN NULL
+        ELSE {{
+          id: sq.chain_id,
+          order: sq.chain_order,
+          requires_prev_approved: coalesce(sq.chain_requires_prev, false)
+        }}
+      END,
+      chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
+      chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
+      chain_slug: CASE
+        WHEN sq.chain_id IS NULL THEN NULL
+        WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
+        ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
+      END,
       // override top-level temporal fields as ISO strings for Pydantic
       start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
       end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
@@ -457,6 +623,8 @@ def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
     rec = session.run(
         """
         MATCH (sq:Sidequest {id:$id})
+        OPTIONAL MATCH (sib:Sidequest {chain_id: sq.chain_id})
+        WITH sq, count(sib) AS _chain_len
         RETURN sq{
           .*,
           pills: CASE
@@ -502,6 +670,22 @@ def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
               starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
               ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
             }
+          END,
+          // NEW: chain projection + hints
+          chain: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE {
+              id: sq.chain_id,
+              order: sq.chain_order,
+              requires_prev_approved: coalesce(sq.chain_requires_prev, false)
+            }
+          END,
+          chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
+          chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
+            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
           END,
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -551,7 +735,8 @@ def list_sidequests(
     recs = session.run(f"""
         MATCH (sq:Sidequest)
         {where_clause}
-        WITH sq
+        OPTIONAL MATCH (sib:Sidequest {{chain_id: sq.chain_id}})
+        WITH sq, count(sib) AS _chain_len
         ORDER BY coalesce(toString(sq.updated_at), toString(sq.created_at)) DESC
         SKIP $skip LIMIT $limit
         RETURN sq{{
@@ -599,6 +784,22 @@ def list_sidequests(
               starts_on: CASE WHEN sq.rot_starts_on IS NULL THEN NULL ELSE toString(sq.rot_starts_on) END,
               ends_on:   CASE WHEN sq.rot_ends_on   IS NULL THEN NULL ELSE toString(sq.rot_ends_on)   END
             }}
+          END,
+          // NEW: chain projection + hints
+          chain: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE {{
+              id: sq.chain_id,
+              order: sq.chain_order,
+              requires_prev_approved: coalesce(sq.chain_requires_prev, false)
+            }}
+          END,
+          chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
+          chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
+            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
           END,
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -943,8 +1144,79 @@ def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str,
 
     return {"created": created, "updated": updated, "errors": errors}
 
-def _title_key(s: Optional[str]) -> Optional[str]:
-    if not s:
-        return None
-    # lower + trim + collapse all internal whitespace to single spaces
-    return " ".join(s.strip().lower().split())
+
+# -------- Chain Context (user-aware) --------
+class ChainStepOut(TypedDict, total=False):
+    id: str
+    title: str
+    href: str
+    done: bool
+    locked: bool
+    order: int
+
+class ChainContextOut(TypedDict, total=False):
+    chain_id: str
+    slug: str
+    steps: List[ChainStepOut]
+    current_index: int
+
+
+def get_chain_context(
+    session: Session,
+    *,
+    chain_id: str,
+    user_id: Optional[str] = None,
+    current_sidequest_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    rec = session.run("""
+        // gather ordered steps for chain
+        MATCH (sq:Sidequest {chain_id:$cid})
+        WITH sq
+        ORDER BY coalesce(sq.chain_order, 0) ASC, toString(coalesce(sq.updated_at, sq.created_at)) ASC
+        WITH collect(sq) AS steps
+        // which of these steps has the user approved?
+        OPTIONAL MATCH (:User {id:$uid})-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(dsq:Sidequest)
+        WHERE $uid IS NOT NULL AND dsq.chain_id = $cid
+        WITH steps, collect(dsq.id) AS done_ids
+        // derive slug from first step's title_key/title (kept for later if you add a chain page)
+        WITH steps, done_ids,
+             CASE
+               WHEN size(steps) = 0 THEN 'chain'
+               ELSE coalesce(steps[0].title_key, toLower(steps[0].title))
+             END AS base_slug
+        WITH steps, done_ids, replace(base_slug, ' ', '-') AS slug
+        WITH steps, done_ids, slug,
+             [i IN range(0, size(steps)-1) |
+               {
+                 id:      steps[i].id,
+                 title:   steps[i].title,
+                 // IMPORTANT: use existing detail route now
+                 href:    '/sidequests/' + steps[i].id,
+                 order:   coalesce(steps[i].chain_order, i),
+                 done:    steps[i].id IN done_ids,
+                 locked:  coalesce(steps[i].chain_requires_prev, false)
+                          AND (i > 0 AND NOT (steps[i-1].id IN done_ids))
+               }
+             ] AS mapped
+        RETURN slug, mapped AS steps
+    """, {"cid": chain_id, "uid": user_id}).single()
+
+    if not rec:
+        return {"chain_id": chain_id, "slug": "chain", "steps": [], "current_index": 0}
+
+    steps = [dict(s) for s in rec["steps"]]
+    slug = rec["slug"] or "chain"
+
+    idx = 0
+    if current_sidequest_id:
+        for i, s in enumerate(steps):
+            if s["id"] == current_sidequest_id:
+                idx = i
+                break
+
+    return {
+        "chain_id": chain_id,
+        "slug": slug,
+        "steps": steps,
+        "current_index": idx,
+    }

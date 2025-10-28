@@ -1,4 +1,3 @@
-# site_backend/api/leaderboards/service.py
 from __future__ import annotations
 from typing import List, Optional, Literal, Dict, Any
 from datetime import datetime, timedelta, timezone
@@ -18,7 +17,8 @@ def _since_ms(period: Period) -> Optional[int]:
     d0 = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
     return int(d0.timestamp() * 1000)
 
-def _display_name_expr() -> str:
+def _display_name_expr_user() -> str:
+    # Canonical user display name
     return (
         "coalesce("
         "  u.display_name, "
@@ -26,6 +26,16 @@ def _display_name_expr() -> str:
         "  u.given_name, "
         "  (CASE WHEN u.email IS NOT NULL THEN split(u.email,'@')[0] END), "
         "  right(u.id, 6)"
+        ")"
+    )
+
+def _display_name_expr_business() -> str:
+    # Canonical business display name
+    return (
+        "coalesce("
+        "  b.display_name, "
+        "  b.name, "
+        "  right(b.id, 6)"
         ")"
     )
 
@@ -56,7 +66,7 @@ def top_youth_eco(
           RETURN u, coalesce(sum(toInteger(t.amount)),0) AS eco
         }}
         WITH u, toInteger(eco) AS eco
-        WITH u, eco, {_display_name_expr()} AS display_name, u.avatar_url AS avatar_url
+        WITH u, eco, {_display_name_expr_user()} AS display_name, u.avatar_url AS avatar_url
         RETURN u.id AS user_id, display_name, eco, avatar_url
         ORDER BY eco DESC, user_id ASC
         SKIP $offset LIMIT $limit
@@ -67,7 +77,7 @@ def top_youth_eco(
     items = [
         {
             "user_id": r["user_id"],
-            "display_name": r.get("display_name") or r["user_id"][-6:],
+            "display_name": (r.get("display_name") or r["user_id"][-6:]),
             "eco": int(r.get("eco", 0) or 0),
             "avatar_url": r.get("avatar_url"),
         } for r in rows
@@ -104,7 +114,7 @@ def top_youth_eco(
               WHERE coalesce(t.status,'settled')='settled'
                 AND ($since IS NULL OR t.createdAt >= $since)
             WITH u, toInteger(coalesce(sum(toInteger(t.amount)),0)) AS my_eco
-            WITH u, my_eco, {_display_name_expr()} AS display_name, u.avatar_url AS avatar_url
+            WITH u, my_eco, {_display_name_expr_user()} AS display_name, u.avatar_url AS avatar_url
 
             // strictly higher than me in same period
             CALL {{
@@ -126,7 +136,7 @@ def top_youth_eco(
                 "id": my_row["user_id"],
                 "value": int(my_row["value"] or 0),
                 "rank": int(my_row["rank"] or 1),
-                "display_name": my_row.get("display_name"),
+                "display_name": my_row.get("display_name") or str(my_row["user_id"])[-6:],
                 "avatar_url": my_row.get("avatar_url"),
             }
 
@@ -158,15 +168,18 @@ def top_business_eco(
     since = _since_ms(period)
 
     rows = s.run(
-        """
+        f"""
         MATCH (b:BusinessProfile)
         WHERE b.id IS NOT NULL
         OPTIONAL MATCH (b)-[:TRIGGERED]->(t:EcoTx)
           WHERE coalesce(t.status,'settled')='settled'
             AND ($since IS NULL OR t.createdAt >= $since)
+        WITH b, toInteger(coalesce(sum(toInteger(t.amount)),0)) AS eco
+        WITH b, eco, {_display_name_expr_business()} AS display_name
         RETURN b.id AS business_id,
-               coalesce(b.name,'(Unnamed Business)') AS name,
-               toInteger(coalesce(sum(toInteger(t.amount)),0)) AS eco
+               display_name,
+               coalesce(b.name,'(Unnamed Business)') AS legacy_name,
+               toInteger(eco) AS eco
         ORDER BY eco DESC, business_id ASC
         SKIP $offset LIMIT $limit
         """,
@@ -175,8 +188,10 @@ def top_business_eco(
 
     items = [
         {
-            "business_id": r["business_id"],  # guaranteed non-null due to WHERE b.id IS NOT NULL
-            "name": r.get("name") or "(Unnamed Business)",
+            "business_id": r["business_id"],
+            "display_name": (r.get("display_name") or str(r["business_id"])[-6:]),
+            # keep legacy `name` for backwards-compat (may be None)
+            "name": r.get("legacy_name"),
             "eco": int(r.get("eco", 0) or 0),
         } for r in rows
     ]
@@ -201,13 +216,14 @@ def top_business_eco(
     meta_my = None
     if me_business_id:
         my_row = s.run(
-            """
-            MATCH (b:BusinessProfile {id: $bid})
+            f"""
+            MATCH (b:BusinessProfile {{id: $bid}})
             OPTIONAL MATCH (b)-[:TRIGGERED]->(t:EcoTx)
               WHERE coalesce(t.status,'settled')='settled'
                 AND ($since IS NULL OR t.createdAt >= $since)
-            WITH b, toInteger(coalesce(sum(toInteger(t.amount)),0)) AS my_eco, coalesce(b.name,'(Unnamed Business)') AS name
-            CALL {
+            WITH b, toInteger(coalesce(sum(toInteger(t.amount)),0)) AS my_eco,
+                 {_display_name_expr_business()} AS display_name
+            CALL {{
               WITH my_eco, $since AS since
               MATCH (b2:BusinessProfile)
               WHERE b2.id IS NOT NULL
@@ -217,8 +233,8 @@ def top_business_eco(
               WITH toInteger(coalesce(sum(toInteger(t2.amount)),0)) AS eco2, my_eco
               WHERE eco2 > my_eco
               RETURN count(*) AS higher
-            }
-            RETURN b.id AS business_id, name, my_eco AS value, (1 + higher) AS rank
+            }}
+            RETURN b.id AS business_id, display_name, my_eco AS value, (1 + higher) AS rank
             """,
             bid=me_business_id, since=since
         ).single()
@@ -227,7 +243,7 @@ def top_business_eco(
                 "id": my_row["business_id"],
                 "value": int(my_row["value"] or 0),
                 "rank": int(my_row["rank"] or 1),
-                "display_name": my_row["name"],
+                "display_name": my_row.get("display_name") or str(my_row["business_id"])[-6:],
             }
 
     return {
@@ -269,7 +285,7 @@ def top_youth_actions(
               AND ($kind IS NULL OR $kind='all' OR ms.kind = $kind)
           RETURN u, toInteger(count(ms)) AS completed
         }}
-        WITH u, completed, {_display_name_expr()} AS display_name, u.avatar_url AS avatar_url
+        WITH u, completed, {_display_name_expr_user()} AS display_name, u.avatar_url AS avatar_url
         RETURN u.id AS user_id, display_name, completed, avatar_url
         ORDER BY completed DESC, user_id ASC
         SKIP $offset LIMIT $limit
@@ -280,7 +296,7 @@ def top_youth_actions(
     items = [
         {
             "user_id": r["user_id"],
-            "display_name": r.get("display_name") or r["user_id"][-6:],
+            "display_name": (r.get("display_name") or r["user_id"][-6:]),
             "completed": int(r.get("completed", 0) or 0),
             "avatar_url": r.get("avatar_url"),
         } for r in rows
@@ -313,7 +329,7 @@ def top_youth_actions(
                 AND ($since IS NULL OR coalesce(ms.completedAt, ms.approvedAt, ms.createdAt, 0) >= $since)
                 AND ($kind IS NULL OR $kind='all' OR ms.kind = $kind)
             WITH u, toInteger(count(ms)) AS my_completed
-            WITH u, my_completed, {_display_name_expr()} AS display_name, u.avatar_url AS avatar_url
+            WITH u, my_completed, {_display_name_expr_user()} AS display_name, u.avatar_url AS avatar_url
             CALL {{
               WITH my_completed, $since AS since, $kind AS kind
               MATCH (u2:User)
@@ -334,7 +350,7 @@ def top_youth_actions(
                 "id": my_row["user_id"],
                 "value": int(my_row["value"] or 0),
                 "rank": int(my_row["rank"] or 1),
-                "display_name": my_row.get("display_name"),
+                "display_name": my_row.get("display_name") or str(my_row["user_id"])[-6:],
                 "avatar_url": my_row.get("avatar_url"),
             }
 

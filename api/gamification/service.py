@@ -44,8 +44,9 @@ def _window_bounds(s: Session, cadence: str) -> tuple[str, str]:
         """).single()
     elif cadence == "monthly":
         rec = s.run("""
-          WITH datetime().startOfMonth() AS ms
-          RETURN toString(ms) AS start, toString(ms + duration('P1M')) AS end
+        WITH datetime.truncate('month', datetime()) AS ms
+        RETURN toString(ms) AS start,
+                toString(ms + duration('P1M')) AS end
         """).single()
     elif cadence == "seasonal":
         rec = s.run("""
@@ -670,10 +671,11 @@ def get_leaderboard(
         ).single()
         start, end = res["start"], res["end"]
     elif period == "monthly" and not (start and end):
-        res = s.run(
-            "RETURN toString(datetime().startOfMonth() - duration('P1M')) AS start, "
-            "toString(datetime().startOfMonth()) AS end"
-        ).single()
+        res = s.run("""
+        WITH datetime.truncate('month', datetime()) AS ms
+        RETURN toString(ms - duration('P1M')) AS start,
+                toString(ms)                   AS end
+        """).single()
         start, end = res["start"], res["end"]
     # For "total", start/end may remain None and the Cypher uses the OR guard.
 

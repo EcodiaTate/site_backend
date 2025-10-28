@@ -113,8 +113,11 @@ def referrals_link(
         return ReferralLinkResponse(ok=True, awarded=out["awarded"], amounts=out.get("amounts"))
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
+# site_backend/api/gamification/router_public.py
+from typing import Optional
+from site_backend.core.user_guard import current_user_id, maybe_current_user_id
+# keep the router dependency ensure_user_exists as-is if you made it optional-safe
 
-# ── Public Leaderboard (+ my rank) ────────────────────────────────────────────
 @router.get("/leaderboard", response_model=LeaderboardResponse)
 def leaderboard(
     period: Period = Query(..., description="weekly | monthly | total"),
@@ -127,9 +130,17 @@ def leaderboard(
     cohort_team_id: str | None = Query(None),
     cohort_region: str | None = Query(None),
     include_me: bool = Query(False, description="include requesting user's rank"),
-    uid: str = Depends(current_user_id),
+    uid: Optional[str] = Depends(maybe_current_user_id),   # ⬅️ optional now
     s: Session = Depends(session_dep),
 ):
+    # If the caller asked to include their own rank but they are anonymous, signal that
+    if include_me and not uid:
+        raise HTTPException(
+            status_code=401,
+            detail="login_required_for_include_me",
+            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+        )
+
     res = service.get_leaderboard(
         s,
         period=period,
@@ -142,6 +153,6 @@ def leaderboard(
         cohort_team_id=cohort_team_id,
         cohort_region=cohort_region,
         include_me=include_me,
-        uid=uid,
+        uid=uid,  # service should handle None => no “me” row
     )
     return LeaderboardResponse(**res)
