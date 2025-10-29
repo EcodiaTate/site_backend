@@ -43,7 +43,7 @@ def _has_more(count_page: int, limit: int) -> bool:
     return count_page == limit
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Youth ECO leaderboard (EARNED)
+# Youth ECO leaderboard (EARNED) — unchanged
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_youth_eco(
@@ -53,6 +53,9 @@ def top_youth_eco(
     offset: int = 0,
     me_user_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Total ECO *earned* by youth (e.g., via sidequests, missions). Kept as-is.
+    """
     since = _since_ms(period)
 
     rows = s.run(
@@ -155,7 +158,146 @@ def top_youth_eco(
     }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Business ECO leaderboard (TRIGGERED)
+# NEW: Youth ECO leaderboard (CONTRIBUTED → businesses)
+# ───────────────────────────────────────────────────────────────────────────────
+
+def top_youth_contributed(
+    s: Session,
+    period: Period = "total",
+    limit: int = 20,
+    offset: int = 0,
+    me_user_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Ranks youth by how much ECO they CONTRIBUTED to businesses via EYBA.
+    Tx inclusion: kind/type in {'CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT'} and status 'settled'.
+    """
+    since = _since_ms(period)
+
+    rows = s.run(
+        f"""
+        CALL {{
+          WITH *
+          MATCH (u:User)
+          // Resilient match: user→tx and tx→business
+          OPTIONAL MATCH (u)-[:FROM|:SENT|:SPENT|:CONTRIBUTED]->(tx:EcoTx)-[:TO]->(:BusinessProfile)
+            WHERE coalesce(tx.status,'settled')='settled'
+              AND coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+              AND ($since IS NULL OR
+                   coalesce(
+                     toInteger(tx.createdAt),
+                     toInteger(apoc.date.toUNIXTimestamp(tx.created_at)),
+                     0
+                   ) >= $since
+              )
+          RETURN u, coalesce(sum(toInteger(coalesce(tx.amount, tx.eco, 0))),0) AS eco
+        }}
+        WITH u, toInteger(eco) AS eco
+        WITH u, eco, {_display_name_expr_user()} AS display_name, u.avatar_url AS avatar_url
+        RETURN u.id AS user_id, display_name, eco, avatar_url
+        ORDER BY eco DESC, user_id ASC
+        SKIP $offset LIMIT $limit
+        """,
+        since=since, offset=offset, limit=limit,
+    ).data()
+
+    items = [
+        {
+            "user_id": r["user_id"],
+            "display_name": (r.get("display_name") or r["user_id"][-6:]),
+            "eco": int(r.get("eco", 0) or 0),
+            "avatar_url": r.get("avatar_url"),
+        } for r in rows
+    ]
+
+    top_value = int(s.run(
+        """
+        CALL {
+          WITH *
+          MATCH (u:User)
+          OPTIONAL MATCH (u)-[:FROM|:SENT|:SPENT|:CONTRIBUTED]->(tx:EcoTx)-[:TO]->(:BusinessProfile)
+            WHERE coalesce(tx.status,'settled')='settled'
+              AND coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+              AND ($since IS NULL OR
+                   coalesce(
+                     toInteger(tx.createdAt),
+                     toInteger(apoc.date.toUNIXTimestamp(tx.created_at)),
+                     0
+                   ) >= $since
+              )
+          RETURN toInteger(coalesce(sum(toInteger(coalesce(tx.amount, tx.eco, 0))),0)) AS eco
+        }
+        RETURN coalesce(max(eco),0) AS top_value
+        """,
+        since=since,
+    ).single()["top_value"] or 0)
+
+    total_estimate = int(s.run("MATCH (u:User) RETURN count(u) AS n").single()["n"] or 0)
+    has_more = _has_more(len(items), limit)
+
+    meta_my = None
+    if me_user_id:
+        my_row = s.run(
+            f"""
+            MATCH (u:User {{id: $uid}})
+            OPTIONAL MATCH (u)-[:FROM|:SENT|:SPENT|:CONTRIBUTED]->(tx:EcoTx)-[:TO]->(:BusinessProfile)
+              WHERE coalesce(tx.status,'settled')='settled'
+                AND coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+                AND ($since IS NULL OR
+                     coalesce(
+                       toInteger(tx.createdAt),
+                       toInteger(apoc.date.toUNIXTimestamp(tx.created_at)),
+                       0
+                     ) >= $since
+                )
+            WITH u, toInteger(coalesce(sum(toInteger(coalesce(tx.amount, tx.eco, 0))),0)) AS my_eco,
+                 {_display_name_expr_user()} AS display_name, u.avatar_url AS avatar_url
+            CALL {{
+              WITH my_eco, $since AS since
+              MATCH (u2:User)
+              OPTIONAL MATCH (u2)-[:FROM|:SENT|:SPENT|:CONTRIBUTED]->(tx2:EcoTx)-[:TO]->(:BusinessProfile)
+                WHERE coalesce(tx2.status,'settled')='settled'
+                  AND coalesce(tx2.kind, tx2.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+                  AND (since IS NULL OR
+                       coalesce(
+                         toInteger(tx2.createdAt),
+                         toInteger(apoc.date.toUNIXTimestamp(tx2.created_at)),
+                         0
+                       ) >= since
+                  )
+              WITH toInteger(coalesce(sum(toInteger(coalesce(tx2.amount, tx2.eco, 0))),0)) AS eco2, my_eco
+              WHERE eco2 > my_eco
+              RETURN count(*) AS higher
+            }}
+            RETURN u.id AS user_id, display_name, avatar_url, my_eco AS value, (1 + higher) AS rank
+            """,
+            uid=me_user_id, since=since
+        ).single()
+        if my_row:
+            meta_my = {
+                "id": my_row["user_id"],
+                "value": int(my_row["value"] or 0),
+                "rank": int(my_row["rank"] or 1),
+                "display_name": my_row.get("display_name") or str(my_row["user_id"])[-6:],
+                "avatar_url": my_row.get("avatar_url"),
+            }
+
+    return {
+        "items": items,
+        "meta": {
+            "period": period,
+            "since_ms": since,
+            "limit": limit,
+            "offset": offset,
+            "has_more": has_more,
+            "total_estimate": total_estimate,
+            "top_value": top_value,
+            "my": meta_my,
+        },
+    }
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Business ECO leaderboard — now COLLECTED (contributions in)
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_business_eco(
@@ -165,16 +307,27 @@ def top_business_eco(
     offset: int = 0,
     me_business_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """
+    Ranks businesses by ECO COLLECTED (youth contributions).
+    Tx inclusion: kind/type in {'CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT'} and status 'settled'.
+    """
     since = _since_ms(period)
 
     rows = s.run(
         f"""
         MATCH (b:BusinessProfile)
         WHERE b.id IS NOT NULL
-        OPTIONAL MATCH (b)-[:TRIGGERED]->(t:EcoTx)
-          WHERE coalesce(t.status,'settled')='settled'
-            AND ($since IS NULL OR t.createdAt >= $since)
-        WITH b, toInteger(coalesce(sum(toInteger(t.amount)),0)) AS eco
+        OPTIONAL MATCH (tx:EcoTx)-[:TO]->(b)
+          WHERE coalesce(tx.status,'settled')='settled'
+            AND coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+            AND ($since IS NULL OR
+                 coalesce(
+                   toInteger(tx.createdAt),
+                   toInteger(apoc.date.toUNIXTimestamp(tx.created_at)),
+                   0
+                 ) >= $since
+            )
+        WITH b, toInteger(coalesce(sum(toInteger(coalesce(tx.amount, tx.eco, 0))),0)) AS eco
         WITH b, eco, {_display_name_expr_business()} AS display_name
         RETURN b.id AS business_id,
                display_name,
@@ -202,10 +355,17 @@ def top_business_eco(
           WITH *
           MATCH (b:BusinessProfile)
           WHERE b.id IS NOT NULL
-          OPTIONAL MATCH (b)-[:TRIGGERED]->(t:EcoTx)
-            WHERE coalesce(t.status,'settled')='settled'
-              AND ($since IS NULL OR t.createdAt >= $since)
-          RETURN toInteger(coalesce(sum(toInteger(t.amount)),0)) AS eco
+          OPTIONAL MATCH (tx:EcoTx)-[:TO]->(b)
+            WHERE coalesce(tx.status,'settled')='settled'
+              AND coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+              AND ($since IS NULL OR
+                   coalesce(
+                     toInteger(tx.createdAt),
+                     toInteger(apoc.date.toUNIXTimestamp(tx.created_at)),
+                     0
+                   ) >= $since
+              )
+          RETURN toInteger(coalesce(sum(toInteger(coalesce(tx.amount, tx.eco, 0))),0)) AS eco
         }
         RETURN coalesce(max(eco),0) AS top_value
         """, since=since).single()["top_value"] or 0)
@@ -218,19 +378,33 @@ def top_business_eco(
         my_row = s.run(
             f"""
             MATCH (b:BusinessProfile {{id: $bid}})
-            OPTIONAL MATCH (b)-[:TRIGGERED]->(t:EcoTx)
-              WHERE coalesce(t.status,'settled')='settled'
-                AND ($since IS NULL OR t.createdAt >= $since)
-            WITH b, toInteger(coalesce(sum(toInteger(t.amount)),0)) AS my_eco,
+            OPTIONAL MATCH (tx:EcoTx)-[:TO]->(b)
+              WHERE coalesce(tx.status,'settled')='settled'
+                AND coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+                AND ($since IS NULL OR
+                     coalesce(
+                       toInteger(tx.createdAt),
+                       toInteger(apoc.date.toUNIXTimestamp(tx.created_at)),
+                       0
+                     ) >= $since
+                )
+            WITH b, toInteger(coalesce(sum(toInteger(coalesce(tx.amount, tx.eco, 0))),0)) AS my_eco,
                  {_display_name_expr_business()} AS display_name
             CALL {{
               WITH my_eco, $since AS since
               MATCH (b2:BusinessProfile)
               WHERE b2.id IS NOT NULL
-              OPTIONAL MATCH (b2)-[:TRIGGERED]->(t2:EcoTx)
-                WHERE coalesce(t2.status,'settled')='settled'
-                  AND (since IS NULL OR t2.createdAt >= since)
-              WITH toInteger(coalesce(sum(toInteger(t2.amount)),0)) AS eco2, my_eco
+              OPTIONAL MATCH (tx2:EcoTx)-[:TO]->(b2)
+                WHERE coalesce(tx2.status,'settled')='settled'
+                  AND coalesce(tx2.kind, tx2.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+                  AND (since IS NULL OR
+                       coalesce(
+                         toInteger(tx2.createdAt),
+                         toInteger(apoc.date.toUNIXTimestamp(tx2.created_at)),
+                         0
+                       ) >= since
+                  )
+              WITH toInteger(coalesce(sum(toInteger(coalesce(tx2.amount, tx2.eco, 0))),0)) AS eco2, my_eco
               WHERE eco2 > my_eco
               RETURN count(*) AS higher
             }}
@@ -261,7 +435,7 @@ def top_business_eco(
     }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Youth Actions leaderboard (sidequests)
+# Youth Actions leaderboard (sidequests) — unchanged
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_youth_actions(

@@ -31,6 +31,10 @@ router = APIRouter(
     dependencies=[Depends(ensure_user_exists)],
 )
 
+# ───────────────────────────────────────────────────────────────────────────────
+# ECO ledger summary (explicit fields for StatsOut alignment)
+# ───────────────────────────────────────────────────────────────────────────────
+
 # ── Public endpoints ──────────────────────────────────────────────────────────
 @router.get("/me", response_model=MeBadgesResponse)
 def me_badges_awards(

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Literal, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from neo4j import Session
@@ -10,6 +10,10 @@ from pydantic import BaseModel
 from site_backend.core.neo_driver import session_dep
 
 router = APIRouter(prefix="/eyba/business/public", tags=["eyba-business-public"])
+
+# ---------------------------------------------------------
+# Public business profile
+# ---------------------------------------------------------
 
 class BusinessPublicOut(BaseModel):
     id: str
@@ -29,7 +33,8 @@ def public_profile(business_id: str, s: Session = Depends(session_dep)):
     rec = s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})
-        WHERE coalesce(b.visible_on_map, true) = true   // remove this line if you want to expose all
+        // remove this WHERE if you want to expose all businesses
+        WHERE coalesce(b.visible_on_map, true) = true
         RETURN b.id AS id,
                b.name AS name,
                b.tagline AS tagline,
@@ -48,52 +53,67 @@ def public_profile(business_id: str, s: Session = Depends(session_dep)):
         raise HTTPException(status_code=404, detail="Business not found")
     return BusinessPublicOut(**rec.data())
 
-# ---------- Public stats for a business ----------
+# ---------------------------------------------------------
+# Public stats (unilateral model: businesses COLLECT ECO)
+# ---------------------------------------------------------
+
 class BusinessPublicStatsOut(BaseModel):
     business_id: str
-    minted_eco: int
-    eco_contributed_total: int
-    eco_given_total: int
-    claims_30d: int
-    minted_30d: int
-    last_tx_at: Optional[str] = None  # ISO string if any
+    eco_collected_total: int
+    eco_collected_30d: int
+    contributions_30d: int
+    last_collected_at: Optional[str] = None  # ISO datetime
 
 @router.get("/{business_id}/stats", response_model=BusinessPublicStatsOut)
 def business_public_stats(business_id: str, s: Session = Depends(session_dep)):
+    """
+    Aggregates all EcoTx that represent youth CONTRIBUTIONS to this business.
+    We treat EcoTx.kind/type in {'CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT'} as contributions.
+
+    Timestamp precedence:
+      - tx.at (datetime)
+      - datetime({epochMillis: toInteger(tx.createdAt)})
+      - datetime(tx.created_at)  // string fallback if present
+    """
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=30)
+
     start_iso = start_dt.isoformat()
     end_iso = end_dt.isoformat()
-    start_ms = int(start_dt.timestamp() * 1000)
-    end_ms = int(end_dt.timestamp() * 1000)
 
     rec = s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})
-        OPTIONAL MATCH (b)-[:TRIGGERED]->(t:EcoTx)
-        WITH b, t,
-             toInteger(coalesce(t.amount, t.eco, 0)) AS eco_val,
+
+        // All contribution txns to this business
+        OPTIONAL MATCH (tx:EcoTx)-[:TO]->(b)
+        WHERE coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
+
+        WITH b, tx,
+             toInteger(coalesce(tx.amount, tx.eco, 0)) AS eco_val,
              CASE
-               WHEN t.at IS NOT NULL THEN t.at
-               ELSE datetime({epochMillis: toInteger(t.createdAt)})
+               WHEN tx.at IS NOT NULL THEN tx.at
+               WHEN tx.createdAt IS NOT NULL THEN datetime({epochMillis: toInteger(tx.createdAt)})
+               WHEN tx.created_at IS NOT NULL THEN datetime(tx.created_at)
+               ELSE datetime.transaction()  // fallback so max() works; will not be used if eco_val is 0
              END AS tat
+
+        // Global aggregates + last 30 days slice
         WITH b,
-             sum(eco_val) AS minted_total,
-             collect(t) AS txs,
-             [tx IN collect({tat: tat, eco: eco_val})
-                WHERE tat >= datetime($start_iso) AND tat < datetime($end_iso)] AS last30
+             sum(eco_val) AS collected_total,
+             max(tat)     AS lastTat,
+             collect({tat: tat, eco: eco_val}) AS alltx
+
+        WITH b, collected_total, lastTat,
+             [t IN alltx WHERE t.tat >= datetime($start_iso) AND t.tat < datetime($end_iso)] AS last30
+
         RETURN
-          toInteger(coalesce(b.minted_eco, minted_total, 0)) AS minted_eco,
-          toInteger(coalesce(b.eco_contributed_total,0)) AS eco_contributed_total,
-          toInteger(coalesce(b.eco_given_total,0)) AS eco_given_total,
-          toInteger(reduce(s=0, x IN last30 | s + toInteger(x.eco))) AS minted_30d,
-          toInteger(size(last30)) AS claims_30d,
-          CASE WHEN size(txs) > 0
-            THEN toString( max( coalesce(t.at, datetime({epochMillis: toInteger(t.createdAt)})) ) )
-            ELSE NULL
-          END AS last_tx_at
+          toInteger(coalesce(b.eco_collected_total, collected_total, 0)) AS eco_collected_total,
+          toInteger(reduce(s=0, x IN last30 | s + toInteger(x.eco)))     AS eco_collected_30d,
+          toInteger(size(last30))                                         AS contributions_30d,
+          CASE WHEN lastTat IS NULL THEN NULL ELSE toString(lastTat) END  AS last_collected_at
         """,
-        {"bid": business_id, "start_iso": start_iso, "end_iso": end_iso, "start_ms": start_ms, "end_ms": end_ms},
+        {"bid": business_id, "start_iso": start_iso, "end_iso": end_iso},
     ).single()
 
     if not rec:
@@ -101,17 +121,15 @@ def business_public_stats(business_id: str, s: Session = Depends(session_dep)):
 
     return BusinessPublicStatsOut(
         business_id=business_id,
-        minted_eco=int(rec["minted_eco"] or 0),
-        eco_contributed_total=int(rec["eco_contributed_total"] or 0),
-        eco_given_total=int(rec["eco_given_total"] or 0),
-        minted_30d=int(rec["minted_30d"] or 0),
-        claims_30d=int(rec["claims_30d"] or 0),
-        last_tx_at=rec["last_tx_at"],
+        eco_collected_total=int(rec["eco_collected_total"] or 0),
+        eco_collected_30d=int(rec["eco_collected_30d"] or 0),
+        contributions_30d=int(rec["contributions_30d"] or 0),
+        last_collected_at=rec["last_collected_at"],
     )
 
-
-# ---------- Public offers for a business ----------
-from typing import Literal, Dict, Any  # add to imports if missing
+# ---------------------------------------------------------
+# Public offers (marketing/display only; no wallet semantics)
+# ---------------------------------------------------------
 
 OfferStatus = Literal["active", "paused", "hidden"]
 
@@ -135,10 +153,12 @@ def public_offers_for_business(business_id: str, s: Session = Depends(session_de
         """
         MATCH (b:BusinessProfile {id:$bid})
         WHERE coalesce(b.visible_on_map, true) = true
+
         MATCH (o:Offer)-[:OF]->(b)
         WHERE o.status = 'active'
           AND (o.stock IS NULL OR o.stock > 0)
           AND (o.valid_until IS NULL OR date(o.valid_until) >= date())
+
         RETURN o{
           .id, .title, .blurb, .status, .eco_price, .fiat_cost_cents, .stock,
           .url, .valid_until, .tags, .createdAt,
@@ -151,7 +171,9 @@ def public_offers_for_business(business_id: str, s: Session = Depends(session_de
     out: List[OfferPublicOut] = []
     for r in recs:
         o: Dict[str, Any] = dict(r["offer"])
-        # keep shape stable even if missing
         o.setdefault("status", "active")
+        # Ensure business_id is a concrete string
+        if o.get("business_id") is None:
+            o["business_id"] = business_id
         out.append(OfferPublicOut(**o))
     return out

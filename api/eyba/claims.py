@@ -5,7 +5,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Literal, Dict, Any
+from typing import Optional, Literal, Dict, Any, List
 
 from fastapi import (
     APIRouter,
@@ -27,54 +27,45 @@ router = APIRouter(prefix="/eyba", tags=["eyba"])
 
 PledgeTier = Literal["starter", "builder", "leader"]
 
-
 # ---------- Request / Response ----------
 class ClaimRequest(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
 
-
 class ClaimResponse(BaseModel):
     ok: bool
-    awarded_eco: int = 0
+    awarded_eco: int = 0           # kept for UI compatibility; here it means "contributed ECO"
     balance: int = 0
-    reason: Optional[str] = None  # geofence | cooldown | daily_cap
+    reason: Optional[str] = None   # geofence | cooldown | daily_cap | insufficient_balance
     business_name: Optional[str] = None
     location_name: Optional[str] = None
     tx_id: Optional[str] = None
     business_id: Optional[str] = None
     debug: Optional[Dict[str, Any]] = None
 
-
 # Deprecated (kept for compatibility, now a 410)
 class AttachOfferRequest(BaseModel):
     offer_id: str
 
-
 class AttachOfferResponse(BaseModel):
     ok: bool
-
 
 # ---------- helpers ----------
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
-
 def _now_ms() -> int:
     return int(_now().timestamp() * 1000)
-
 
 def _ms_at_utc_day_start(dt: datetime) -> int:
     d0 = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
     return int(d0.timestamp() * 1000)
-
 
 def _device_hash(ip: str, ua: str) -> str:
     h = hashlib.sha256()
     h.update((ip or "-").encode())
     h.update((ua or "-").encode())
     return h.hexdigest()[:16]
-
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     import math as m
@@ -87,22 +78,18 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     c = 2 * m.atan2(m.sqrt(a), m.sqrt(1 - a))
     return R * c
 
-
 def get_youth_id(req: Request) -> str:
     ip = req.client.host if req.client else "0.0.0.0"
     ua = req.headers.get("user-agent", "")
     return f"y_{_device_hash(ip, ua)}"
 
-
 def _cooldown_bucket_ms(now: datetime, hours: int) -> int:
     slot_ms = max(1, hours) * 3600 * 1000
     return (int(now.timestamp() * 1000) // slot_ms) * slot_ms
 
-
 def _dedupe_id(prefix: str, uid: str, bid: str, bucket_ms: int) -> str:
     h = hashlib.sha256(f"{prefix}|{uid}|{bid}|{bucket_ms}".encode()).hexdigest()[:24]
     return f"{prefix}_{h}"
-
 
 # ---------- DB lookups (QR + Business + Rules) ----------
 @dataclass
@@ -120,7 +107,6 @@ class DBQRMeta:
     rules_cooldown_hours: int
     rules_daily_cap_per_user: int
     rules_geofence_radius_m: Optional[int]
-
 
 def _fetch_qr_meta(s: Session, code: str) -> Optional[DBQRMeta]:
     rows = s.run(
@@ -163,31 +149,25 @@ def _fetch_qr_meta(s: Session, code: str) -> Optional[DBQRMeta]:
         rules_geofence_radius_m=int(rec["geofence_m"]) if rec["geofence_m"] is not None else None,
     )
 
-
 def _compute_eps(pledge_tier: PledgeTier, first_visit: bool) -> float:
     base = 1.5 if first_visit else 1.0
     tier_bonus = {"starter": 1.0, "builder": 1.15, "leader": 1.3}[pledge_tier]
     return round(base * tier_bonus, 2)
 
-
 # Optional current-user dependency that safely awaits your existing one
 async def current_user_id_optional_dep(req: Request) -> Optional[str]:
-    """
-    Return the authenticated user id as a string, or None.
-    Never returns complex objects (e.g. Request).
-    """
     try:
         val = await _current_user_id(req)
         return val if isinstance(val, str) and val else None
     except Exception:
         return None
 
-
 def _last_visit_ms(s: Session, device_id: str, business_id: str) -> Optional[int]:
+    # We still look at CONSTITUTE of past contributions for first_visit determination
     row = s.run(
         """
-        MATCH (:BusinessProfile {id:$bid})-[:TRIGGERED]->(t:EcoTx)
-        WHERE t.kind = 'MINT_ACTION' AND t.device_id = $did
+        MATCH (:BusinessProfile {id:$bid})-[:COLLECTED]->(t:EcoTx)
+        WHERE t.kind IN ['CONTRIBUTE','BURN_REWARD'] AND t.device_id = $did
         RETURN max(toInteger(t.createdAt)) AS last
         """,
         did=device_id,
@@ -196,12 +176,13 @@ def _last_visit_ms(s: Session, device_id: str, business_id: str) -> Optional[int
     last = row["last"] if row else None
     return int(last) if last is not None else None
 
-
 def _today_visits_count(s: Session, device_id: str, business_id: str, today0_ms: int) -> int:
     row = s.run(
         """
-        MATCH (:BusinessProfile {id:$bid})-[:TRIGGERED]->(t:EcoTx)
-        WHERE t.kind='MINT_ACTION' AND t.device_id=$did AND toInteger(t.createdAt) >= $today0
+        MATCH (:BusinessProfile {id:$bid})-[:COLLECTED]->(t:EcoTx)
+        WHERE t.kind IN ['CONTRIBUTE','BURN_REWARD']
+          AND t.device_id=$did
+          AND toInteger(t.createdAt) >= $today0
         RETURN count(t) AS c
         """,
         did=device_id,
@@ -210,11 +191,12 @@ def _today_visits_count(s: Session, device_id: str, business_id: str, today0_ms:
     ).single()
     return int(row["c"] or 0) if row else 0
 
-
 # ---------- Youth balance (ledger) ----------
 def _youth_balance(s: Session, youth_id: str) -> int:
     """
-    Balance = sum(EARNED kind=MINT_ACTION) - sum(SPENT kind=BURN_REWARD) over settled EcoTx.
+    Balance = sum(earned kinds) - sum(spent kinds) over settled EcoTx.
+    Earned kinds include: MINT_ACTION (sidequests, etc.)
+    Spent kinds include:  BURN_REWARD (legacy), CONTRIBUTe (new EYBA)
     """
     row = s.run(
         """
@@ -222,14 +204,16 @@ def _youth_balance(s: Session, youth_id: str) -> int:
         CALL {
           WITH $uid AS uid
           MATCH (u:User {id: uid})
-          OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx {kind:'MINT_ACTION', status:'settled'})
+          OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx {status:'settled'})
+          WHERE te.kind IN ['MINT_ACTION']
           RETURN coalesce(sum(toInteger(te.amount)), 0) AS earned
         }
-        // Spent (retired)
+        // Spent (retired / contributed)
         CALL {
           WITH $uid AS uid
           MATCH (u:User {id: uid})
-          OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx {kind:'BURN_REWARD', status:'settled'})
+          OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx {status:'settled'})
+          WHERE ts.kind IN ['BURN_REWARD','CONTRIBUTE']
           RETURN coalesce(sum(toInteger(ts.amount)), 0) AS spent
         }
         RETURN toInteger(earned - spent) AS balance
@@ -238,12 +222,8 @@ def _youth_balance(s: Session, youth_id: str) -> int:
     ).single()
     return int(row["balance"]) if row and row["balance"] is not None else 0
 
-
 # ---------- Season controls ----------
 def _season_multiplier(s: Session) -> float:
-    """
-    Reads Season.emission_multiplier. Defaults to 1.0.
-    """
     rec = s.run(
         """
         MATCH (se:Season)
@@ -256,7 +236,6 @@ def _season_multiplier(s: Session) -> float:
         return float(rec["mul"]) if rec and rec["mul"] is not None else 1.0
     except Exception:
         return 1.0
-
 
 # ---------- quick QR debug ----------
 @router.get("/qr/{code}/debug", response_model=Dict[str, Any])
@@ -282,8 +261,7 @@ def qr_debug(code: str, s: Session = Depends(session_dep)):
         },
     }
 
-
-# ---------- claim ----------
+# ---------- claim (now: contribute ECO to business) ----------
 @router.post("/qr/{code}/claim", response_model=ClaimResponse)
 async def claim_eco(
     code: str,
@@ -392,24 +370,41 @@ async def claim_eco(
                 business_id=meta.business_id, debug=dbg if debug else None,
             )
 
-        # ----- award math ------------------------------------------------------
+        # ----- contribution math ----------------------------------------------
         first_visit = (last_ms is None)
         eps = _compute_eps(meta.pledge_tier, first_visit)
         base = meta.rules_first_visit if first_visit else meta.rules_return_visit
-        reward = max(1, int(round(base * eps)))
+        target = max(1, int(round(base * eps)))
 
-        # seasonal multiplier
+        # seasonal multiplier (optional to keep narrative symmetry)
         mul = _season_multiplier(s)
-        reward = max(1, int(round(reward * mul)))
+        target = max(1, int(round(target * mul)))
 
         if debug:
-            dbg["award_math"] = {
+            dbg["contribution_math"] = {
                 "first_visit": first_visit, "base": base, "eps": eps,
-                "season_multiplier": mul, "reward_final": reward
+                "season_multiplier": mul, "target_contribution": target
             }
 
-        # ----- write ledger (MINT_ACTION associated to business) --------------
-        tx_id = hashlib.sha256(f"tx|{device_uid}|{meta.business_id}|{_now_ms()}".encode()).hexdigest()[:24]
+        # ----- check youth balance and decide contributed amount --------------
+        balance_before = _youth_balance(s, resolved_uid)
+        if balance_before <= 0:
+            return ClaimResponse(
+                ok=False, reason="insufficient_balance",
+                business_name=meta.business_name, location_name=meta.location_name,
+                business_id=meta.business_id, debug=dbg if debug else None,
+            )
+
+        contributed = min(balance_before, target)
+        if contributed <= 0:
+            return ClaimResponse(
+                ok=False, reason="insufficient_balance",
+                business_name=meta.business_name, location_name=meta.location_name,
+                business_id=meta.business_id, debug=dbg if debug else None,
+            )
+
+        # ----- write ledger (CONTRIBUTE associated to business) ---------------
+        tx_id = hashlib.sha256(f"tx|contrib|{device_uid}|{meta.business_id}|{_now_ms()}".encode()).hexdigest()[:24]
         s.run(
             """
             MERGE (u:User {id:$uid})
@@ -419,8 +414,8 @@ async def claim_eco(
 
             MERGE (t:EcoTx {id:$tx_id})
               ON CREATE SET
-                t.amount      = $eco,
-                t.kind        = "MINT_ACTION",
+                t.amount      = $eco,              // amount contributed (positive integer)
+                t.kind        = "CONTRIBUTE",
                 t.source      = "eyba",
                 t.status      = "settled",
                 t.createdAt   = $now_ms,
@@ -432,14 +427,14 @@ async def claim_eco(
                 t.lat         = $lat,
                 t.lng         = $lng
 
-            MERGE (u)-[:EARNED]->(t)
-            MERGE (b)-[:TRIGGERED]->(t)
+            MERGE (u)-[:SPENT]->(t)
+            MERGE (b)-[:COLLECTED]->(t)
             """,
             uid=resolved_uid,
             did=device_uid,
             bid=meta.business_id,
             tx_id=tx_id,
-            eco=reward,
+            eco=contributed,
             now_ms=_now_ms(),
             now_iso=_now().isoformat(),
             qr=meta.code,
@@ -452,10 +447,16 @@ async def claim_eco(
         if account_uid:
             s.run(
                 """
-                MATCH (d:Device {id:$did})<-[:USES_DEVICE]-(:User)-[:EARNED]->(t:EcoTx)
-                WHERE toInteger(t.createdAt) >= $since
-                WITH DISTINCT t
-                MERGE (u:User {id:$uid})-[:EARNED]->(t)
+                MATCH (d:Device {id:$did})<-[:USES_DEVICE]-(:User)
+                MATCH (t:EcoTx)
+                WHERE t.device_id = $did AND toInteger(t.createdAt) >= $since
+                // Link both earns and spends to the authed user to consolidate history
+                FOREACH (_ IN CASE WHEN t.kind IN ['MINT_ACTION'] THEN [1] ELSE [] END |
+                  MERGE (u:User {id:$uid})-[:EARNED]->(t)
+                )
+                FOREACH (_ IN CASE WHEN t.kind IN ['BURN_REWARD','CONTRIBUTE'] THEN [1] ELSE [] END |
+                  MERGE (u:User {id:$uid})-[:SPENT]->(t)
+                )
                 """,
                 did=device_uid, uid=account_uid, since=_now_ms() - 30*24*3600*1000,
             )
@@ -465,7 +466,7 @@ async def claim_eco(
 
         return ClaimResponse(
             ok=True,
-            awarded_eco=reward,
+            awarded_eco=contributed,   # "awarded" here = contributed to business
             balance=balance_after,
             business_name=meta.business_name,
             location_name=meta.location_name,
@@ -482,15 +483,14 @@ async def claim_eco(
             raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{tb}")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
-
 # ---------- attach offer (post-claim) [DEPRECATED] ----------
 @router.post("/tx/{tx_id}/attach_offer", response_model=AttachOfferResponse)
 def attach_offer(tx_id: str, payload: AttachOfferRequest, s: Session = Depends(session_dep)):
     """
-    Deprecated under the new mechanics. Mint (MINT_ACTION) transactions must NOT be linked to Offers.
-    Offer linkage happens only when retiring ECO on redemption (BURN_REWARD via /offers/{id}/redeem).
+    Deprecated under the new mechanics. EYBA claims are contributions to businesses.
+    Offers redemption should be handled by separate endpoints if/when reintroduced.
     """
     raise HTTPException(
         status_code=410,
-        detail="Deprecated: attach_offer is no longer supported. Use /offers/{id}/redeem to burn ECO when claiming a reward.",
+        detail="Deprecated: attach_offer is no longer supported under unilateral contributions.",
     )
