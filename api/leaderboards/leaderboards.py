@@ -8,7 +8,12 @@ from neo4j import Session, GraphDatabase
 from neo4j.exceptions import ServiceUnavailable
 
 from site_backend.core.neo_driver import session_dep  # your existing dep
-from .service import top_youth_eco, top_business_eco, top_youth_actions
+from .service import (
+    top_youth_eco,
+    top_youth_contributed,   # ← NEW
+    top_business_eco,
+    top_youth_actions,
+)
 
 router = APIRouter(prefix="/leaderboards", tags=["leaderboards"])
 
@@ -21,6 +26,9 @@ class LBYouthEcoRow(BaseModel):
     display_name: str
     eco: int = 0
     avatar_url: Optional[str] = None
+
+# Youth contributed uses the exact same shape as earned:
+LBYouthContribRow = LBYouthEcoRow
 
 class LBBusinessEcoRow(BaseModel):
     business_id: str
@@ -56,11 +64,15 @@ class MetaBlock(BaseModel):
     top_value: Optional[int] = None
     my: Optional[MetaMy] = None
 
-class LBWrapYouthECO (BaseModel):
+class LBWrapYouthECO(BaseModel):
     items: List[LBYouthEcoRow]
     meta: MetaBlock
 
-class LBWrapBizECO (BaseModel):
+class LBWrapYouthContrib(BaseModel):
+    items: List[LBYouthContribRow]
+    meta: MetaBlock
+
+class LBWrapBizECO(BaseModel):
     items: List[LBBusinessEcoRow]
     meta: MetaBlock
 
@@ -104,7 +116,7 @@ def _with_direct_bolt_retry(fn, *args, **kwargs):
 # Endpoints
 # ───────────────────────────────────────────────────────────────────────────────
 
-@router.get("/youth/eco", response_model=LBWrapYouthECO )
+@router.get("/youth/eco", response_model=LBWrapYouthECO)
 def leaderboard_youth_eco(
     period: str = Query("total", pattern="^(total|weekly|monthly)$"),
     limit: int = Query(20, ge=1, le=200),
@@ -112,12 +124,28 @@ def leaderboard_youth_eco(
     me_user_id: Optional[str] = Query(None),
     session: Session = Depends(session_dep),
 ):
-    """Youth ECO leaderboard (sum of settled EcoTx earned in period)."""
+    """Youth ECO leaderboard — total ECO **earned** (settled) in the period."""
     return _with_direct_bolt_retry(
         top_youth_eco, session, period=period, limit=limit, offset=offset, me_user_id=me_user_id
     )
 
-@router.get("/business/eco", response_model=LBWrapBizECO )
+@router.get("/youth/contributed", response_model=LBWrapYouthContrib)
+def leaderboard_youth_contributed(
+    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
+    limit: int = Query(20, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    me_user_id: Optional[str] = Query(None),
+    session: Session = Depends(session_dep),
+):
+    """
+    Youth ECO **contributed** leaderboard — sum of ECO contributed to businesses
+    via EYBA (settled contribution txns) in the period.
+    """
+    return _with_direct_bolt_retry(
+        top_youth_contributed, session, period=period, limit=limit, offset=offset, me_user_id=me_user_id
+    )
+
+@router.get("/business/eco", response_model=LBWrapBizECO)
 def leaderboard_business_eco(
     period: str = Query("total", pattern="^(total|weekly|monthly)$"),
     limit: int = Query(20, ge=1, le=200),
@@ -125,7 +153,7 @@ def leaderboard_business_eco(
     me_business_id: Optional[str] = Query(None),
     session: Session = Depends(session_dep),
 ):
-    """Business ECO leaderboard (sum of settled EcoTx TRIGGERED by business in period)."""
+    """Business ECO leaderboard — total ECO **collected** (youth contributions in) in the period."""
     return _with_direct_bolt_retry(
         top_business_eco, session, period=period, limit=limit, offset=offset, me_business_id=me_business_id
     )

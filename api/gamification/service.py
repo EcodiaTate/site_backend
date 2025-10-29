@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import List, Dict, Optional, Tuple, Any
 from neo4j import Session
+import json
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Level math (derived from total_xp)
@@ -101,14 +102,12 @@ def _nearest_badge_progress(s: Session, stats: Dict) -> Tuple[int, Optional[str]
     pct = int(min(100, max(0, (current / max(1, target)) * 100)))
     return pct, name
 
-
 def _user_banned(s: Session, uid: str) -> bool:
     rec = s.run("MATCH (u:User {id:$uid}) RETURN coalesce(u.banned,false) AS b", uid=uid).single()
     return bool(rec and rec.get("b"))
 
 def _active_season(s: Session) -> Optional[Dict]:
     rec = s.run("""
-      // OPTIONAL so it never errors on missing label
       OPTIONAL MATCH (ss:Season)
       WHERE ss.start <= datetime() AND ss.end > datetime()
       RETURN ss
@@ -121,11 +120,9 @@ def _active_season(s: Session) -> Optional[Dict]:
     except Exception:
         return None
 
-
 def _user_prestige(s: Session, uid: str) -> int:
     rec = s.run("MATCH (u:User {id:$uid}) RETURN toInteger(coalesce(u.prestige,0)) AS p", uid=uid).single()
     return int(rec["p"]) if rec and "p" in rec else 0
-
 
 def _season_actions(s: Session, uid: str, season: Dict) -> int:
     if not season:
@@ -149,7 +146,6 @@ def _collect_multipliers(s: Session, uid: str) -> Dict[str, float]:
         out["season"] = float(season.get("xp_boost") or 1.0)
 
     # Party bonus (users connected via PARTY_WITH edge in last 3 hours)
-    # Example: PARTY_WITH includes a 'at' timestamp set when session started together
     party = s.run("""
       MATCH (u:User {id:$uid})-[:PARTY_WITH]->(p:User)
       WHERE datetime(coalesce(p.party_at, datetime())) >= datetime() - duration('PT3H')
@@ -157,7 +153,6 @@ def _collect_multipliers(s: Session, uid: str) -> Dict[str, float]:
     """, uid=uid).single()
     party_size = int(party["c"] or 0) + 1  # include self
     if party_size >= 2:
-        # configurable multiplier node
         conf = s.run("MATCH (m:MultiplierConfig {id:'party_bonus'}) RETURN m.value AS v, m.max_stack AS ms").single()
         if conf:
             v = float(conf["v"] or 1.1)
@@ -196,12 +191,20 @@ def _apply_multipliers(base_xp: int, base_eco: int, mults: Dict[str, float]) -> 
     return int(round(base_xp * m)), int(round(base_eco * max(1.0, min(m, 3.0))))
 def get_user_badges_and_awards(s: Session, *, uid: str) -> Dict[str, Any]:
     if _user_banned(s, uid):
-        return {"badges": [], "awards": [], "stats": {
-            "total_eco": 0, "total_xp": 0, "actions_total": 0, "season_actions": 0,
-            "streak_days": 0, "level": 1, "next_level_xp": 100, "xp_to_next": 100,
-            "progress_pct": 0, "next_badge_hint": None, "prestige_level": 0,
-            "active_multipliers": {}, "anomaly_flag": "banned"
-        }}
+        return {
+            "badges": [],
+            "awards": [],
+            "stats": {
+                "total_eco": 0, "total_xp": 0, "actions_total": 0, "season_actions": 0,
+                "streak_days": 0, "level": 1, "next_level_xp": 100, "xp_to_next": 100,
+                "progress_pct": 0, "next_badge_hint": None, "prestige_level": 0,
+                "active_multipliers": {}, "anomaly_flag": "banned",
+                # explicit ECO model
+                "eco_balance": 0, "eco_earned_total": 0, "eco_spent_total": 0,
+                "eco_retired_total": 0, "last_tx_at": None,
+            }
+        }
+
 
     badges_rec = s.run("""
       MATCH (u:User {id:$uid})-[:EARNED_BADGE]->(ba:BadgeAward)-[:OF]->(bt:BadgeType)
@@ -228,21 +231,15 @@ def get_user_badges_and_awards(s: Session, *, uid: str) -> Dict[str, Any]:
       RETURN toInteger(coalesce(u.prestige,0)) AS prestige, total_eco, total_xp, actions_total
     """, uid=uid).single()
 
-    if not base:
-        prestige = 0
-        total_eco = 0
-        total_xp = 0
-        actions_total = 0
-    else:
-        prestige = int(base.get("prestige") or 0)
-        total_eco = int(base.get("total_eco") or 0)
-        total_xp = int(base.get("total_xp") or 0)
-        actions_total = int(base.get("actions_total") or 0)
+    prestige = int(base.get("prestige") or 0) if base else 0
+    total_eco = int(base.get("total_eco") or 0) if base else 0
+    total_xp = int(base.get("total_xp") or 0) if base else 0
+    actions_total = int(base.get("actions_total") or 0) if base else 0
 
     season = _active_season(s)
     season_actions = _season_actions(s, uid, season) if season else 0
 
-    # -------- FIXED STREAK QUERY (no implicit grouping, no reviewed_at warnings) --------
+    # streak (fixed)
     streak_rec = s.run("""
       MATCH (u:User {id:$uid})
       OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
@@ -252,9 +249,7 @@ def get_user_badges_and_awards(s: Session, *, uid: str) -> Dict[str, Any]:
       WITH u, d1,
            collect(DISTINCT date(datetime(
              CASE WHEN (s1.reviewed_at) IS NOT NULL AND s1.reviewed_at IS NOT NULL
-                  THEN s1.reviewed_at
-                  ELSE s1.created_at
-             END
+                  THEN s1.reviewed_at ELSE s1.created_at END
            ))) AS d2
       WITH [d IN (d1 + d2) WHERE d IS NOT NULL AND d >= date() - duration('P30D')] AS recent
       RETURN size(apoc.coll.toSet(recent)) AS active_days
@@ -282,6 +277,7 @@ def get_user_badges_and_awards(s: Session, *, uid: str) -> Dict[str, Any]:
     mults = _collect_multipliers(s, uid)
     stats["active_multipliers"] = mults
 
+    # anomaly: XP spike
     spike = s.run("""
       MATCH (:User {id:$uid})-[:EARNED]->(t:EcoTx)
       WHERE date(t.at) = date()
@@ -290,13 +286,65 @@ def get_user_badges_and_awards(s: Session, *, uid: str) -> Dict[str, Any]:
     if int((spike and spike.get("dxp")) or 0) > 10000:
         stats["anomaly_flag"] = "xp_spike"
 
+    # NEW explicit ECO fields
+    ledger = _eco_ledger_for_user(s, uid)
+    stats["eco_balance"]       = ledger["eco_balance"]
+    stats["eco_earned_total"]  = ledger["eco_earned_total"]
+    stats["eco_spent_total"]   = ledger["eco_spent_total"]  # 0 until EYBA burn integrated here
+    stats["eco_retired_total"] = 0                          # business metric; not per-user here
+    stats["last_tx_at"]        = ledger["last_tx_at"]
+
     return {
         "badges": badges_rec.get("badges", []),
         "awards": awards_rec.get("awards", []),
         "stats": stats
     }
 
-import json
+def _eco_ledger_for_user(s: Session, uid: str) -> dict:
+    """
+    Returns:
+      {
+        eco_earned_total: int,
+        eco_spent_total:  int,         # 0 for now (spend lives in EYBA wallet)
+        eco_balance:      int,         # earned - spent
+        last_tx_at:       str | None,  # ISO
+      }
+    """
+    rec = s.run("""
+      MATCH (:User {id:$uid})-[:EARNED]->(t:EcoTx)
+      WITH sum(coalesce(t.eco,0)) AS earned, max(t.at) AS last_at
+      RETURN toInteger(coalesce(earned,0)) AS earned, 
+             CASE WHEN last_at IS NULL THEN NULL ELSE toString(last_at) END AS last_at
+    """, uid=uid).single()
+
+    earned = int((rec and rec.get("earned")) or 0)
+    # NOTE: Redemptions / burns are tracked in the EYBA wallet, not EcoTx here.
+    spent = 0
+    return {
+        "eco_earned_total": earned,
+        "eco_spent_total": spent,
+        "eco_balance": earned - spent,
+        "last_tx_at": (rec and rec.get("last_at")) or None,
+    }
+
+
+def get_business_awards(s: Session, *, bid: str) -> Dict[str, Any]:
+    """
+    Public awards listing for a business profile.
+    Matches Award <-[:OF]- AwardType scoped to 'business' and linked to BusinessProfile.
+    """
+    rows = s.run("""
+      MATCH (b:BusinessProfile {id:$bid})
+      OPTIONAL MATCH (b)<-[:FOR]-(aw:Award)-[:OF]->(at:AwardType)
+      WHERE coalesce(at.scope,'business') IN ['business','global']
+      OPTIONAL MATCH (aw)-[:IN_SEASON]->(ss:Season)
+      RETURN collect({
+        id: aw.id, at: toString(aw.at), rank: aw.rank,
+        period: aw.period, award_type_id: at.id, season: ss.id
+      }) AS awards
+    """, bid=bid).single()
+    return {"awards": (rows and rows.get("awards")) or []}
+
 
 def list_badge_types(s: Session) -> List[Dict]:
     recs = s.run("MATCH (t:BadgeType) RETURN t ORDER BY toLower(t.name) ASC")
@@ -349,8 +397,6 @@ def list_seasons(s: Session) -> List[Dict]:
         })
     return out
 
-import json
-
 def upsert_badge_type(s: Session, payload: Dict) -> Dict:
     # Accept payload["rule"] as dict or None
     rule = payload.get("rule") or {}
@@ -383,7 +429,6 @@ def upsert_badge_type(s: Session, payload: Dict) -> Dict:
       RETURN t
     """, **params).single()
     return dict(rec["t"])
-
 
 def delete_badge_type(s: Session, *, id: str) -> None:
     s.run("MATCH (t:BadgeType {id:$id}) DETACH DELETE t", id=id)
@@ -437,8 +482,6 @@ def list_quest_types(s: Session) -> List[Dict]:
     recs = s.run("MATCH (q:QuestType) RETURN q ORDER BY toLower(q.label)")
     return [dict(r["q"]) for r in recs]
 
-import json
-
 def upsert_quest_type(s: Session, payload: Dict) -> Dict:
     xr = payload.get("extra_rules") or {}
     rule_json = json.dumps(xr) if xr else None
@@ -465,6 +508,7 @@ def upsert_quest_type(s: Session, payload: Dict) -> Dict:
 
 def delete_quest_type(s: Session, *, id: str) -> None:
     s.run("MATCH (q:QuestType {id:$id}) DETACH DELETE q", id=id)
+
 def _get_user_stats_for_rules(s: Session, *, uid: str, season_id: Optional[str]) -> Dict:
     base = s.run("""
       MATCH (u:User {id:$uid})
@@ -514,8 +558,6 @@ def _get_user_stats_for_rules(s: Session, *, uid: str, season_id: Optional[str])
     stats["streak_days"] = int((streak_rec and streak_rec.get("active_days")) or 0)
 
     return stats
-
-
 
 def _should_grant(rule: Dict, stats: Dict, bt: Optional[Dict] = None) -> bool:
     """
@@ -631,9 +673,6 @@ def _compute_leader_rows(s: Session, *, period: str, scope: str,
     params["limit"] = limit
     return s.run(q, **params).data()
 
-from typing import Optional, Dict, List
-from neo4j import Session
-
 def get_leaderboard(
     s: Session, *,
     period: str,
@@ -661,9 +700,7 @@ def get_leaderboard(
         "me": {"id": str, "eco": int, "rank": int} | None
       }
     """
-    # ──────────────────────────────────────────────────────────────────────
-    # Default windows for weekly / monthly (server-time, inclusive start)
-    # ──────────────────────────────────────────────────────────────────────
+    # Default windows for weekly / monthly
     if period == "weekly" and not (start and end):
         res = s.run(
             "RETURN toString(datetime() - duration('P7D')) AS start, "
@@ -679,9 +716,6 @@ def get_leaderboard(
         start, end = res["start"], res["end"]
     # For "total", start/end may remain None and the Cypher uses the OR guard.
 
-    # ──────────────────────────────────────────────────────────────────────
-    # Fetch up to current page and then slice (keeps ranking stable)
-    # ──────────────────────────────────────────────────────────────────────
     fetch = min(page_size * page, 500)
     rows = _compute_leader_rows(
         s,
@@ -721,9 +755,7 @@ def get_leaderboard(
         "page_size": page_size,
     }
 
-    # ──────────────────────────────────────────────────────────────────────
     # Optional "me" computation (youth scope only)
-    # ──────────────────────────────────────────────────────────────────────
     if include_me and uid and scope == "youth":
         params: Dict = {"period": period, "start": start, "end": end, "uid": uid}
 
@@ -799,7 +831,6 @@ def _recommended_title(s: Session, uid: str) -> Optional[str]:
     title_types.sort(key=lambda bt: (bt.get("tier") or 0))
     return as_rule(title_types[0]).get("title_id")
 
-
 def get_progress_preview(s: Session, *, uid: str) -> Dict:
     if _user_banned(s, uid):
         return {
@@ -870,7 +901,6 @@ def _write_ecotx_and_claim(s: Session, *, uid: str, qtype: Dict, amount: int,
         xr = qtype.get("extra_rules") or {}
         if not xr and qtype.get("extra_rules_json"):
             try:
-                import json
                 xr = json.loads(qtype["extra_rules_json"])
             except Exception:
                 xr = {}
@@ -882,14 +912,7 @@ def _write_ecotx_and_claim(s: Session, *, uid: str, qtype: Dict, amount: int,
     if cap_eco is not None:
         total_eco = min(total_eco, int(cap_eco))
 
-
-    # Cap per-claim XP/ECO if configured on QuestType.extra_rules
-    xr = qtype.get("extra_rules") or {}
-    if xr.get("cap_xp_per_claim"):
-        total_xp = min(total_xp, int(xr["cap_xp_per_claim"]))
-    if xr.get("cap_eco_per_claim"):
-        total_eco = min(total_eco, int(xr["cap_eco_per_claim"]))
-
+    # Final write + compute balance_after (sum of ECO after insert)
     res = s.run("""
       MATCH (u:User {id:$uid}), (q:QuestType {id:$qid})
       CREATE (tx:EcoTx {
@@ -919,13 +942,17 @@ def _write_ecotx_and_claim(s: Session, *, uid: str, qtype: Dict, amount: int,
       OPTIONAL MATCH (ss:Season)
         WHERE ss.start <= datetime() AND ss.end > datetime()
       FOREACH (_ IN CASE WHEN ss IS NULL THEN [] ELSE [1] END | MERGE (c)-[:IN_SEASON]->(ss))
-      RETURN tx.id AS txid, c.id AS cid
+      // New: compute balance_after compatibly with frontend ClaimResponse
+      WITH tx, c, u
+      OPTIONAL MATCH (u)-[:EARNED]->(t2:EcoTx)
+      RETURN tx.id AS txid, c.id AS cid, toInteger(sum(coalesce(t2.eco,0))) AS balance_after
     """, uid=uid, qid=qtype["id"], xp=total_xp, eco=total_eco, amount=amount, meta=meta,
        wstart=wstart, wend=wend).single()
 
     return {
         "tx_id": res["txid"],
         "claim_id": res["cid"],
+        "balance_after": int(res.get("balance_after") or 0),
         "awarded": {"xp": total_xp, "eco": total_eco, "per_xp": per_xp, "per_eco": per_eco}
     }
 
@@ -949,7 +976,6 @@ def _user_anomaly_log(s: Session, uid: str, code: str, details: Dict) -> None:
       })
       MERGE (u)-[:FLAGGED]->(a)
     """, uid=uid, code=code, details=details)
-
 def claim_quest(s: Session, *, uid: str, quest_type_id: str, amount: int = 1, metadata: Optional[Dict] = None) -> Dict:
     if _user_banned(s, uid):
         raise ValueError("user_banned")
@@ -973,7 +999,7 @@ def claim_quest(s: Session, *, uid: str, quest_type_id: str, amount: int = 1, me
     remaining = max(0, limit_per_window - used)
     take = min(remaining, amount)
 
-    # Anti-spam: tiny cooldown (30s) on identical claims by same user & quest
+    # Anti-spam: tiny cooldown (30s)
     recent = s.run("""
       MATCH (u:User {id:$uid})-[:CLAIMED]->(c:QuestClaim {quest_type_id:$qid})
       WHERE c.at >= datetime() - duration('PT30S')
@@ -988,26 +1014,29 @@ def claim_quest(s: Session, *, uid: str, quest_type_id: str, amount: int = 1, me
         s, uid=uid, qtype=qtype, amount=take, mults=mults, meta=metadata, wstart=wstart, wend=wend
     )
 
-    # Recompute stats + evaluate badges post-claim
+    # Evaluate badges post-claim
     season = _active_season(s)
-    eval_res = evaluate_badges_for_user(s, uid=uid, season_id=season["id"] if season else None)
+    _ = evaluate_badges_for_user(s, uid=uid, season_id=season["id"] if season else None)
 
-    # Update lightweight streak: ensure "ActivityDay" marker for today
+    # Mark activity day
     s.run("""
       MATCH (u:User {id:$uid})
       MERGE (d:ActivityDay {id: toString(date())})
       MERGE (u)-[:ACTIVE_ON]->(d)
     """, uid=uid)
 
-    # Return summary
+    # Post-claim stats + balance_after
     stats_now = get_user_badges_and_awards(s, uid=uid)["stats"]
+    balance_after = int(stats_now.get("eco_balance") or 0)
+
     return {
         "claim_id": result["claim_id"],
         "tx_id": result["tx_id"],
         "awarded": result["awarded"],
-        "badges_granted": eval_res["granted"],
+        "badges_granted": _["granted"] if isinstance(_, dict) else [],
         "stats": stats_now,
-        "window": {"start": wstart, "end": wend, "used": used + take, "limit": limit_per_window}
+        "window": {"start": wstart, "end": wend, "used": used + take, "limit": limit_per_window},
+        "balance_after": balance_after,   # <— NEW optional field (frontend reads if present)
     }
 
 def grant_prestige(s: Session, *, uid: str) -> Dict:
@@ -1117,7 +1146,6 @@ def link_referral(s: Session, *, referrer_id: str, referee_id: str) -> Dict:
     if int(chk["c"] or 0) > 0:
         return {"ok": True, "awarded": False}
 
-    # Award both
     # Default amounts (configurable)
     cfg = s.run("""
       OPTIONAL MATCH (m:MultiplierConfig {id:'referral_bonus'})
@@ -1162,7 +1190,6 @@ def backfill_titles_from_badges(s: Session) -> Dict:
       MERGE (u)-[:HAS_TITLE]->(t)
     """)
     return {"ok": True}
-
 
 def recompute_all_streaks(s: Session) -> Dict:
     """
