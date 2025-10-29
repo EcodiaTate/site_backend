@@ -1,37 +1,43 @@
 # api/routers/eyba_offers.py
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta, datetime, timezone
 from typing import List, Optional, Literal, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from neo4j import Session
 from pydantic import BaseModel, Field
+from uuid import uuid4
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
-from site_backend.api.eyba.neo_business import (
-    create_offer,
-    list_offers,
-    patch_offer,
-    delete_offer,
-    get_business_metrics,
-    stripe_record_contribution,
+
+# If you keep service wrappers, you can still import them.
+# This router mostly uses Cypher directly to ensure atomicity.
+from site_backend.api.services.neo_business import (
+    create_offer as svc_create_offer,
+    list_offers as svc_list_offers,
+    patch_offer as svc_patch_offer,
+    delete_offer as svc_delete_offer,
 )
 
 router = APIRouter(prefix="/eyba", tags=["eyba"])
 
-# ------------------------------------------------------------
-# Helpers: user → business scoping (+ ownership checks)
-# ------------------------------------------------------------
+# ============================================================
+# Helpers
+# ============================================================
 
-# If your relationships are different, update this set:
 _OWNS_EDGES = (":OWNS|:MANAGES",)  # used in Cypher string
+VOUCHER_TTL_MIN = 15  # one-time QR lifetime
+
+def now_ms() -> int:
+    return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+def short_code() -> str:
+    # short voucher-ish code (you can swap to ULID/nanoid)
+    return uuid4().hex[:10].upper()
 
 def _get_user_business_ids(s: Session, user_id: str) -> List[str]:
-    """
-    Returns all business ids the user owns/manages.
-    """
     recs = s.run(
         f"""
         MATCH (u:User {{id:$uid}})-[{_OWNS_EDGES[0]}]->(b:BusinessProfile)
@@ -47,12 +53,6 @@ def _resolve_user_business_id(
     user_id: str,
     requested_business_id: Optional[str],
 ) -> str:
-    """
-    If a business_id is given: verify ownership.
-    Else: if exactly one business, use it.
-          if none: 404
-          if many: 400 (caller must specify ?business_id=...)
-    """
     if requested_business_id:
         rec = s.run(
             f"""
@@ -67,23 +67,17 @@ def _resolve_user_business_id(
             raise HTTPException(status_code=403, detail="You don't have access to that business")
         return requested_business_id
 
-    # No business_id provided; infer
     ids = _get_user_business_ids(s, user_id)
     if len(ids) == 0:
         raise HTTPException(status_code=404, detail="You don't have a business yet or you arent a business!")
     if len(ids) == 1:
         return ids[0]
-    # Multiple businesses: ask the caller to specify
     raise HTTPException(
         status_code=400,
         detail={"message": "Multiple businesses found; specify ?business_id=...", "your_business_ids": ids},
     )
 
 def _assert_offer_belongs_to_user(s: Session, user_id: str, offer_id: str) -> str:
-    """
-    Ensures the offer belongs to a business owned/managed by user.
-    Returns the business_id if OK.
-    """
     rec = s.run(
         f"""
         MATCH (u:User {{id:$uid}})-[{_OWNS_EDGES[0]}]->(b:BusinessProfile)<-[:OF]-(o:Offer {{id:$oid}})
@@ -97,18 +91,52 @@ def _assert_offer_belongs_to_user(s: Session, user_id: str, offer_id: str) -> st
         raise HTTPException(status_code=403, detail="Offer not found or not yours")
     return rec["bid"]
 
+def _assert_voucher_belongs_to_user_business(s: Session, user_id: str, voucher_code: str) -> Dict[str, Any]:
+    """
+    Ensure a voucher belongs to a business owned/managed by the user.
+    Returns {code, status, expiresAt, offer_id, offer_title, eco_price, business_id}
+    """
+    rec = s.run(
+        f"""
+        MATCH (u:User {{id:$uid}})-[{_OWNS_EDGES[0]}]->(b:BusinessProfile)
+        MATCH (v:Voucher {{code:$code}})-[:FOR_OFFER]->(o:Offer)-[:OF]->(b)
+        RETURN v.code AS code,
+               v.status AS status,
+               toInteger(v.expiresAt) AS expiresAt,
+               o.id AS offer_id,
+               o.title AS offer_title,
+               toInteger(o.eco_price) AS eco_price,
+               b.id AS business_id
+        LIMIT 1
+        """,
+        uid=user_id,
+        code=voucher_code,
+    ).single()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Voucher not found or not for your business")
+    return {
+        "code": rec["code"],
+        "status": rec["status"],
+        "expiresAt": int(rec["expiresAt"] or 0),
+        "offer_id": rec["offer_id"],
+        "offer_title": rec["offer_title"],
+        "eco_price": int(rec["eco_price"] or 0),
+        "business_id": rec["business_id"],
+    }
 
-# ------------------------------------------------------------
-# Models
-# ------------------------------------------------------------
+# ============================================================
+# Models (updated to ECO retire + vouchers)
+# ============================================================
 
-# Create uses the user's current business; no business_id in body
+OfferStatus = Literal["active", "paused", "hidden"]
+
 class OfferIn(BaseModel):
     title: str = Field(..., min_length=2, max_length=120)
     blurb: str = Field(..., min_length=2, max_length=280)
-    type: Literal["discount", "perk", "info"] = "discount"
-    visible: bool = True
-    redeem_eco: Optional[int] = Field(default=None, ge=1)
+    status: OfferStatus = "active"
+    eco_price: int = Field(..., ge=1)            # Required ECO to retire
+    fiat_cost_cents: int = Field(0, ge=0)        # 0 for in-kind
+    stock: Optional[int] = Field(None, ge=0)     # None = unlimited
     url: Optional[str] = None
     valid_until: Optional[date] = None
     tags: List[str] = Field(default_factory=list)
@@ -116,33 +144,115 @@ class OfferIn(BaseModel):
 class OfferOut(OfferIn):
     id: str
     business_id: str
+    claims: int | None = 0
 
 class OfferPatch(BaseModel):
     title: Optional[str] = Field(None, min_length=2, max_length=120)
     blurb: Optional[str] = Field(None, min_length=2, max_length=280)
-    type: Optional[Literal["discount", "perk", "info"]] = None
-    visible: Optional[bool] = None
-    redeem_eco: Optional[int] = Field(None, ge=1, le=100000)
+    status: Optional[OfferStatus] = None
+    eco_price: Optional[int] = Field(None, ge=1)
+    fiat_cost_cents: Optional[int] = Field(None, ge=0)
+    stock: Optional[int] = Field(None, ge=0)
     url: Optional[str] = None
     valid_until: Optional[date] = None
     tags: Optional[List[str]] = None
 
+class RedeemResponse(BaseModel):
+    offer_id: str
+    eco_retired: int
+    balance_after: int
+    voucher_code: str
+    message: str  # "Retired N ECO • Offer: ... • Voucher: ..."
 
-# ------------------------------------------------------------
-# Offers (scoped to current user's business)
-# ------------------------------------------------------------
+# Voucher I/O
+class VoucherVerifyIn(BaseModel):
+    voucher_code: str
+
+class VoucherVerifyOut(BaseModel):
+    ok: bool
+    offer: Dict[str, Any]
+    status: Literal["issued", "verified", "consumed", "expired", "void"]
+    expires_in_sec: int
+
+class VoucherConsumeIn(BaseModel):
+    voucher_code: str
+
+class VoucherConsumeOut(BaseModel):
+    ok: bool
+    voucher_id: str
+    consumedAt: int
+
+# Suggest price (rich POST body)
+OfferType = Literal["discount", "perk", "info"]
+PledgeTier = Literal["starter", "builder", "leader"]
+
+class SuggestPriceIn(BaseModel):
+    type: Optional[OfferType] = None
+    fiat_cost_cents: Optional[int] = Field(None, ge=0)
+    avg_basket_cents: Optional[int] = Field(None, ge=0)
+    percent: Optional[int] = Field(None, ge=0, le=100)
+    pledge: Optional[PledgeTier] = None
+
+class SuggestPriceOut(BaseModel):
+    suggested_eco_price: int
+    rule: str  # description of how we computed it
+
+# ============================================================
+# Offers (owner-scoped)
+# ============================================================
 
 @router.get("/offers", response_model=List[OfferOut])
 def list_offers_api(
-    visible_only: bool = Query(False),
+    status: Optional[OfferStatus] = Query(None, description="Filter by status"),
+    visible_only: Optional[bool] = Query(None, description="Deprecated; owner scope only here"),
     business_id: Optional[str] = Query(None, description="Optional if you own multiple"),
     s: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
     bid = _resolve_user_business_id(s, user_id, business_id)
-    arr = list_offers(s, business_id=bid, visible_only=visible_only)
-    # ensure business_id present in response
-    return [OfferOut(**o, business_id=bid) for o in arr]
+
+    # Prefer service if it supports new fields; else query directly.
+    if svc_list_offers:
+        arr = svc_list_offers(s, business_id=bid, status=status)
+        return [OfferOut(**o, business_id=bid) for o in arr]
+
+    where_status = "AND o.status = $status" if status else ""
+    recs = s.run(
+        f"""
+        MATCH (b:BusinessProfile {{id:$bid}})<-[:OF]-(o:Offer)
+        WHERE ($status IS NULL OR o.status = $status)
+        RETURN o{{.*, business_id: $bid}} AS offer
+        ORDER BY coalesce(o.updated_at, o.created_at) DESC
+        """,
+        bid=bid,
+        status=status,
+    )
+    out: List[OfferOut] = []
+    for r in recs:
+        o = dict(r["offer"])
+        o.setdefault("claims", 0)
+        out.append(OfferOut(**o))
+    return out
+
+@router.get("/offers/{offer_id}", response_model=OfferOut)
+def get_offer_api(
+    offer_id: str,
+    s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
+):
+    bid = _assert_offer_belongs_to_user(s, user_id, offer_id)
+    rec = s.run(
+        """
+        MATCH (o:Offer {id:$oid})-[:OF]->(b:BusinessProfile {id:$bid})
+        RETURN o{.*, business_id:b.id} AS offer
+        """,
+        oid=offer_id, bid=bid
+    ).single()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    o = dict(rec["offer"])
+    o.setdefault("claims", 0)
+    return OfferOut(**o)
 
 @router.post("/offers", response_model=OfferOut, status_code=201)
 def create_offer_api(
@@ -152,23 +262,55 @@ def create_offer_api(
     user_id: str = Depends(current_user_id),
 ):
     bid = _resolve_user_business_id(s, user_id, business_id)
-    try:
-        o = create_offer(
+    if svc_create_offer:
+        o = svc_create_offer(
             s,
             business_id=bid,
             title=payload.title,
             blurb=payload.blurb,
-            offtype=payload.type,
-            visible=payload.visible,
-            redeem_eco=payload.redeem_eco,
+            status=payload.status,
+            eco_price=payload.eco_price,
+            fiat_cost_cents=payload.fiat_cost_cents,
+            stock=payload.stock,
             url=payload.url,
             valid_until=str(payload.valid_until) if payload.valid_until else None,
             tags=payload.tags,
         )
         return OfferOut(**o, business_id=bid)
-    except Exception:
-        # keep it generic; create_offer already ensures Biz exists
-        raise HTTPException(status_code=404, detail="Business not found")
+
+    oid = str(uuid4())
+    s.run(
+        """
+        MATCH (b:BusinessProfile {id:$bid})
+        MERGE (o:Offer {id:$oid})
+        SET o.title=$title,
+            o.blurb=$blurb,
+            o.status=$status,
+            o.eco_price=$eco_price,
+            o.fiat_cost_cents=$fiat_cost_cents,
+            o.stock=$stock,
+            o.url=$url,
+            o.valid_until=$valid_until,
+            o.tags=$tags,
+            o.claims=coalesce(o.claims,0),
+            o.created_at=$now,
+            o.updated_at=$now
+        MERGE (o)-[:OF]->(b)
+        """,
+        bid=bid,
+        oid=oid,
+        title=payload.title,
+        blurb=payload.blurb,
+        status=payload.status,
+        eco_price=int(payload.eco_price),
+        fiat_cost_cents=int(payload.fiat_cost_cents),
+        stock=payload.stock,
+        url=payload.url,
+        valid_until=str(payload.valid_until) if payload.valid_until else None,
+        tags=payload.tags,
+        now=now_ms(),
+    )
+    return OfferOut(id=oid, business_id=bid, **payload.model_dump(), claims=0)
 
 @router.patch("/offers/{offer_id}", response_model=OfferOut)
 def patch_offer_api(
@@ -177,15 +319,37 @@ def patch_offer_api(
     s: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
-    # ownership check (also yields business_id for response)
     bid = _assert_offer_belongs_to_user(s, user_id, offer_id)
+    fields = patch.model_dump(exclude_unset=True)
 
-    fields = {
-        k: (str(v) if k == "valid_until" and v is not None else v)
-        for k, v in patch.model_dump(exclude_unset=True).items()
-    }
-    o = patch_offer(s, offer_id=offer_id, fields=fields)
-    return OfferOut(**o, business_id=bid)
+    if svc_patch_offer:
+        if "valid_until" in fields and fields["valid_until"] is not None:
+            fields["valid_until"] = str(fields["valid_until"])
+        o = svc_patch_offer(s, offer_id=offer_id, fields=fields)
+        return OfferOut(**o, business_id=bid)
+
+    sets = []
+    params: Dict[str, Any] = {"oid": offer_id, "now": now_ms(), "bid": bid}
+    for k, v in fields.items():
+        if k == "valid_until" and v is not None:
+            v = str(v)
+        params[k] = v
+        sets.append(f"o.{k} = ${k}")
+    set_clause = ", ".join(sets + ["o.updated_at = $now"]) if sets else "o.updated_at = $now"
+
+    rec = s.run(
+        f"""
+        MATCH (o:Offer {{id:$oid}})-[:OF]->(b:BusinessProfile {{id:$bid}})
+        SET {set_clause}
+        RETURN o{{.*, business_id:b.id}} AS offer
+        """,
+        **params
+    ).single()
+    if not rec:
+        raise HTTPException(status_code=404, detail="Offer not found")
+    o = dict(rec["offer"])
+    o.setdefault("claims", 0)
+    return OfferOut(**o)
 
 @router.delete("/offers/{offer_id}", response_model=dict)
 def delete_offer_api(
@@ -194,23 +358,366 @@ def delete_offer_api(
     user_id: str = Depends(current_user_id),
 ):
     _assert_offer_belongs_to_user(s, user_id, offer_id)
-    delete_offer(s, offer_id=offer_id)
+    if svc_delete_offer:
+        svc_delete_offer(s, offer_id=offer_id)
+    else:
+        s.run(
+            """
+            MATCH (o:Offer {id:$oid})
+            DETACH DELETE o
+            """,
+            oid=offer_id,
+        )
     return {"ok": True}
 
+# ============================================================
+# Redemption → create Voucher + burn ECO (atomic)
+# ============================================================
 
-# ------------------------------------------------------------
-# Business Metrics (scoped)
-# ------------------------------------------------------------
+@router.post("/offers/{offer_id}/redeem", response_model=RedeemResponse)
+def redeem_offer_api(
+    offer_id: str,
+    s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
+):
+    """
+    Steps (single unit of work):
+      - Check user ECO balance >= eco_price
+      - Offer active & (stock > 0 if finite) & not expired
+      - Create Voucher(code, status='issued', expiresAt=now+TTL)
+      - Create BURN_REWARD linked to Offer, Business, User
+      - Decrement stock if finite (>0)
+      - If fiat_cost_cents > 0: decrement sponsor_balance_cents and write SPONSOR_PAYOUT paired to burn
+      - Return voucher
+    """
+    tx_id = str(uuid4())
+    payout_id = str(uuid4())
+    now = now_ms()
+    voucher_code = short_code()
+    expires_at = now + VOUCHER_TTL_MIN * 60 * 1000
+
+    # Load offer + business + user balance
+    rec = s.run(
+        """
+        // Load offer + business meta
+        MATCH (o:Offer {id:$oid})-[:OF]->(b:BusinessProfile)
+        WITH o, b
+        // user balance
+        MATCH (u:User {id:$uid})
+        OPTIONAL MATCH (u)-[:EARNED]->(m:EcoTx {kind:'MINT_ACTION', status:'settled'})
+        WITH o,b,u, coalesce(sum(m.amount),0) AS earned
+        OPTIONAL MATCH (u)-[:SPENT]->(x:EcoTx {kind:'BURN_REWARD', status:'settled'})
+        WITH o,b,u, earned - coalesce(sum(x.amount),0) AS balance
+        RETURN
+          o.id AS oid,
+          o.title AS title,
+          o.status AS status,
+          toInteger(o.eco_price) AS eco_price,
+          toInteger(coalesce(o.fiat_cost_cents,0)) AS fiat_cost_cents,
+          toInteger(coalesce(o.stock,-1)) AS stock,
+          o.valid_until AS valid_until,
+          b.id AS bid,
+          toInteger(coalesce(b.sponsor_balance_cents,0)) AS sponsor_balance_cents,
+          balance AS user_balance
+        """,
+        oid=offer_id, uid=user_id
+    ).single()
+
+    if not rec:
+        raise HTTPException(status_code=404, detail="Offer not found")
+
+    if rec["status"] != "active":
+        raise HTTPException(status_code=409, detail="Offer unavailable")
+
+    # Expiry check for offer (optional)
+    if rec["valid_until"]:
+        try:
+            # valid_until saved as ISO string
+            vu = datetime.fromisoformat(str(rec["valid_until"]))
+            if vu.tzinfo is None:
+                vu = vu.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) > vu:
+                raise HTTPException(status_code=409, detail="Offer expired")
+        except Exception:
+            pass
+
+    eco_price = int(rec["eco_price"])
+    fiat_cost = int(rec["fiat_cost_cents"])
+    stock     = int(rec["stock"])
+    bid       = rec["bid"]
+    sponsor_balance = int(rec["sponsor_balance_cents"])
+    user_balance    = int(rec["user_balance"] or 0)
+
+    if user_balance < eco_price:
+        raise HTTPException(status_code=400, detail="Insufficient ECO")
+
+    # Stock check
+    if stock == 0:
+        raise HTTPException(status_code=409, detail="Out of stock")
+
+    # Sponsor balance (cash-reimbursed only)
+    if fiat_cost > 0 and sponsor_balance < fiat_cost:
+        raise HTTPException(status_code=402, detail="Temporarily unavailable")
+
+    # Atomic mutations
+    s.run(
+        """
+        MATCH (o:Offer {id:$oid})-[:OF]->(b:BusinessProfile {id:$bid})
+        MATCH (u:User {id:$uid})
+
+        // voucher
+        MERGE (v:Voucher {code:$vcode})
+          ON CREATE SET
+            v.status      = 'issued',
+            v.createdAt   = $now,
+            v.expiresAt   = $expires,
+            v.eco_spent   = $eco_price
+        MERGE (v)-[:FOR_OFFER]->(o)
+        MERGE (v)-[:FOR_BUSINESS]->(b)
+        MERGE (u)-[:HAS_VOUCHER]->(v)
+
+        // burn tx (retire ECO)
+        MERGE (t:EcoTx {id:$tx})
+          ON CREATE SET
+            t.kind      = 'BURN_REWARD',
+            t.amount    = $eco_price,
+            t.burn      = true,
+            t.voucher   = $vcode,
+            t.status    = 'settled',
+            t.createdAt = $now
+
+        MERGE (u)-[:SPENT]->(t)
+        MERGE (t)-[:FOR_OFFER]->(o)
+        MERGE (b)-[:REDEEMED]->(t)
+
+        // stock decrement if finite and positive
+        WITH o,b,t,v
+        CALL apoc.do.when(
+          o.stock IS NOT NULL AND o.stock > 0,
+          'SET o.stock = o.stock - 1 RETURN o',
+          'RETURN o',
+          {o:o}
+        ) YIELD value
+
+        // claims counter
+        SET o.claims = coalesce(o.claims,0) + 1
+
+        // sponsor payout (cash-reimbursed)
+        WITH o,b,t,v
+        CALL apoc.do.when(
+          $fiat_cost > 0,
+          '
+          SET b.sponsor_balance_cents = coalesce(b.sponsor_balance_cents,0) - $fiat_cost
+          MERGE (p:EcoTx {id:$payout})
+            ON CREATE SET p.kind="SPONSOR_PAYOUT",
+                          p.amount=$fiat_cost,
+                          p.status="settled",
+                          p.createdAt=$now
+          MERGE (b)-[:PAID]->(p)
+          MERGE (p)-[:PAIRS]->(t)
+          RETURN b
+          ',
+          'RETURN b',
+          {fiat_cost:$fiat_cost, payout:$payout, now:$now, t:t, b:b}
+        ) YIELD value AS _
+        RETURN 1 AS ok
+        """,
+        oid=offer_id,
+        bid=bid,
+        uid=user_id,
+        tx=tx_id,
+        payout=payout_id,
+        vcode=voucher_code,
+        eco_price=eco_price,
+        fiat_cost=fiat_cost,
+        now=now,
+        expires=expires_at,
+    )
+
+    # Return fresh balance-after
+    bal_rec = s.run(
+        """
+        MATCH (u:User {id:$uid})
+        OPTIONAL MATCH (u)-[:EARNED]->(m:EcoTx {kind:'MINT_ACTION', status:'settled'})
+        WITH u, coalesce(sum(m.amount),0) AS earned
+        OPTIONAL MATCH (u)-[:SPENT]->(b:EcoTx {kind:'BURN_REWARD', status:'settled'})
+        RETURN (earned - coalesce(sum(b.amount),0)) AS balance
+        """,
+        uid=user_id
+    ).single()
+    balance_after = int(bal_rec["balance"] or 0)
+
+    return RedeemResponse(
+        offer_id=offer_id,
+        eco_retired=eco_price,
+        balance_after=balance_after,
+        voucher_code=voucher_code,
+        message=f"Retired {eco_price} ECO • Offer: {rec['title']} • Voucher: {voucher_code}",
+    )
+
+# ============================================================
+# Vouchers (owner: verify & consume)
+# ============================================================
+
+@router.post("/owner/vouchers/verify", response_model=VoucherVerifyOut)
+def verify_voucher_api(
+    body: VoucherVerifyIn,
+    s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
+):
+    meta = _assert_voucher_belongs_to_user_business(s, user_id, body.voucher_code)
+    now = now_ms()
+    expires_in = max(0, (meta["expiresAt"] - now) // 1000)
+
+    # Expired?
+    if meta["expiresAt"] and now > meta["expiresAt"]:
+        # one-time set to expired if still not terminal
+        s.run(
+            """
+            MATCH (v:Voucher {code:$code})
+            WHERE v.status IN ['issued','verified']
+            SET v.status='expired', v.expiredAt=$now
+            """,
+            code=body.voucher_code, now=now
+        )
+        return VoucherVerifyOut(
+            ok=False,
+            offer={"id": meta["offer_id"], "title": meta["offer_title"], "eco_price": meta["eco_price"]},
+            status="expired",
+            expires_in_sec=0,
+        )
+
+    # Idempotent move to verified
+    s.run(
+        """
+        MATCH (v:Voucher {code:$code})
+        WITH v
+        CALL apoc.do.when(
+          v.status = 'issued',
+          'SET v.status="verified", v.verifiedAt=$now RETURN v',
+          'RETURN v',
+          {now:$now}
+        ) YIELD value
+        RETURN 1 AS ok
+        """,
+        code=body.voucher_code, now=now
+    )
+
+    return VoucherVerifyOut(
+        ok=True,
+        offer={"id": meta["offer_id"], "title": meta["offer_title"], "eco_price": meta["eco_price"]},
+        status="verified" if meta["status"] in ("issued", "verified") else meta["status"],
+        expires_in_sec=expires_in,
+    )
+
+@router.post("/owner/vouchers/consume", response_model=VoucherConsumeOut)
+def consume_voucher_api(
+    body: VoucherConsumeIn,
+    s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
+):
+    meta = _assert_voucher_belongs_to_user_business(s, user_id, body.voucher_code)
+    now = now_ms()
+
+    # Expiry gate
+    if meta["expiresAt"] and now > meta["expiresAt"]:
+        s.run(
+            """
+            MATCH (v:Voucher {code:$code})
+            WHERE v.status IN ['issued','verified']
+            SET v.status='expired', v.expiredAt=$now
+            """,
+            code=body.voucher_code, now=now
+        )
+        raise HTTPException(status_code=410, detail="Voucher expired")
+
+    # Idempotent verify then consume
+    rec = s.run(
+        """
+        MATCH (v:Voucher {code:$code})
+        WITH v
+        // auto-verify if still issued
+        CALL apoc.do.when(
+          v.status = 'issued',
+          'SET v.status="verified", v.verifiedAt=$now RETURN v',
+          'RETURN v',
+          {now:$now}
+        ) YIELD value
+        WITH v
+        CALL apoc.do.when(
+          v.status <> 'consumed' AND v.status <> 'void',
+          'SET v.status="consumed", v.consumedAt=$now RETURN v',
+          'RETURN v',
+          {now:$now}
+        ) YIELD value AS vv
+        RETURN vv AS v
+        """,
+        code=body.voucher_code, now=now
+    ).single()
+
+    if not rec:
+        raise HTTPException(status_code=404, detail="Voucher not found")
+
+    # Return canonical id (code) + consumedAt (we just set 'now')
+    return VoucherConsumeOut(ok=True, voucher_id=meta["code"], consumedAt=now)
+
+# ============================================================
+# Suggest ECO price (rich POST body)
+# ============================================================
+
+@router.post("/offers/suggest_price", response_model=SuggestPriceOut)
+def suggest_offer_price_api(
+    body: SuggestPriceIn,
+    s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),  # auth required even though no scope
+):
+    """
+    Deterministic rule:
+      eco_price = clamp( round( (fiat_value_aud * k_by_pledge * k_by_type) ), MIN, MAX )
+    With fallbacks when fiat is missing (percent/avg basket for discounts; fixed perk estimate).
+    """
+    # --- Derive fiat value ---
+    fiat_cents = int(body.fiat_cost_cents or 0)
+
+    if fiat_cents == 0 and (body.type == "discount") and (body.percent is not None):
+        avg_basket = int(body.avg_basket_cents or 2000)  # default $20
+        fiat_cents = max(0, round(avg_basket * (body.percent / 100)))
+
+    if fiat_cents == 0 and (body.type == "perk"):
+        # simple default perk value if not provided
+        fiat_cents = 500  # $5 default
+
+    # --- Multipliers ---
+    k_by_pledge = {"starter": 4.0, "builder": 3.0, "leader": 2.5}
+    k_by_type   = {"discount": 1.0, "perk": 0.7, "info": 0.0}
+    MIN_ECO, MAX_ECO = 5, 250
+
+    pledge_k = k_by_pledge.get(body.pledge or "starter", 4.0)
+    type_k   = k_by_type.get(body.type or "perk", 0.7)
+
+    # info offers cost 0 ECO
+    if (body.type == "info"):
+        return SuggestPriceOut(suggested_eco_price=0, rule="info_type_zero_eco")
+
+    eco = round((fiat_cents / 100.0) * pledge_k * type_k)
+    eco = max(MIN_ECO, min(MAX_ECO, eco))
+    rule = f"pledge_{body.pledge or 'starter'}*type_{body.type or 'perk'}_clamped_{MIN_ECO}_{MAX_ECO}"
+
+    return SuggestPriceOut(suggested_eco_price=int(eco), rule=rule)
+
+# ============================================================
+# Business Metrics (retirements, redemptions, sponsor)
+# ============================================================
 
 class BusinessMetricsOut(BaseModel):
     business_id: str
     name: Optional[str] = None
-    pledge_tier: Optional[str] = None
-    eco_mint_ratio: Optional[int] = None
-    eco_contributed_total: int
-    eco_given_total: int
-    minted_eco: int
-    eco_velocity_30d: float
+    sponsor_balance_cents: int = 0
+    eco_retired_total: int = 0
+    eco_retired_30d: int = 0
+    redemptions_30d: int = 0
+    unique_claimants_30d: int = 0
+    minted_eco_30d: int = 0
 
 @router.get("/business/metrics", response_model=BusinessMetricsOut)
 def get_business_metrics_api(
@@ -219,45 +726,209 @@ def get_business_metrics_api(
     user_id: str = Depends(current_user_id),
 ):
     bid = _resolve_user_business_id(s, user_id, business_id)
-    try:
-        data = get_business_metrics(s, business_id=bid)
-        # ensure the response always contains the resolved business_id
-        if isinstance(data, dict):
-            data = {**data, "business_id": bid}
-        return data
-    except ValueError:
+
+    since_ms = int((datetime.now(tz=timezone.utc) - timedelta(days=30)).timestamp() * 1000)
+
+    rec = s.run(
+        """
+        MATCH (b:BusinessProfile {id:$bid})
+        OPTIONAL MATCH (b)<-[:OF]-(o:Offer)<-[:FOR_OFFER]-(t:EcoTx {kind:'BURN_REWARD', status:'settled'})
+        WITH b, sum(coalesce(t.amount,0)) AS eco_retired_total
+        OPTIONAL MATCH (b)<-[:OF]-(o2:Offer)<-[:FOR_OFFER]-(t2:EcoTx {kind:'BURN_REWARD', status:'settled'})
+        WHERE t2.createdAt >= $since
+        WITH b, eco_retired_total,
+             sum(coalesce(t2.amount,0)) AS eco_retired_30d,
+             count(t2) AS redemptions_30d
+        OPTIONAL MATCH (b)<-[:OF]-(o3:Offer)<-[:FOR_OFFER]-(t3:EcoTx {kind:'BURN_REWARD', status:'settled'})<-[:SPENT]-(u3:User)
+        WHERE t3.createdAt >= $since
+        WITH b, eco_retired_total, eco_retired_30d, redemptions_30d, count(DISTINCT u3) AS unique_claimants_30d
+
+        // Optional: minted at/for this business in last 30d (if such relation exists)
+        OPTIONAL MATCH (b)<-[:AT|:FOR]-(m:EcoTx {kind:'MINT_ACTION', status:'settled'})
+        WHERE m.createdAt >= $since
+        RETURN
+          b.id AS bid,
+          b.name AS name,
+          toInteger(coalesce(b.sponsor_balance_cents,0)) AS sponsor_balance_cents,
+          toInteger(eco_retired_total) AS eco_retired_total,
+          toInteger(eco_retired_30d) AS eco_retired_30d,
+          toInteger(redemptions_30d) AS redemptions_30d,
+          toInteger(unique_claimants_30d) AS unique_claimants_30d,
+          toInteger(coalesce(sum(m.amount),0)) AS minted_eco_30d
+        """,
+        bid=bid,
+        since=since_ms,
+    ).single()
+
+    if not rec:
         raise HTTPException(status_code=404, detail="Business not found")
 
-
-# ------------------------------------------------------------
-# Stripe → ECO contribution mint (manual) (scoped)
-# ------------------------------------------------------------
-
-class ContributionIn(BaseModel):
-    aud_cents: int = Field(..., ge=100)  # min $1
-    eco_mint_ratio: Optional[int] = Field(None, ge=1, le=100)
-
-class ContributionOut(BaseModel):
-    ok: bool
-    tx_id: str
-    eco: int
-    business_id: str
-
-@router.post("/business/contribute", response_model=ContributionOut, status_code=201)
-def post_contribution_api(
-    payload: ContributionIn,
-    business_id: Optional[str] = Query(None, description="Optional if you own multiple"),
-    s: Session = Depends(session_dep),
-    user_id: str = Depends(current_user_id),
-):
-    bid = _resolve_user_business_id(s, user_id, business_id)
-    out = stripe_record_contribution(
-        s,
+    return BusinessMetricsOut(
         business_id=bid,
-        aud_cents=payload.aud_cents,
-        override_eco_mint_ratio=payload.eco_mint_ratio,
+        name=rec.get("name"),
+        sponsor_balance_cents=int(rec.get("sponsor_balance_cents") or 0),
+        eco_retired_total=int(rec.get("eco_retired_total") or 0),
+        eco_retired_30d=int(rec.get("eco_retired_30d") or 0),
+        redemptions_30d=int(rec.get("redemptions_30d") or 0),
+        unique_claimants_30d=int(rec.get("unique_claimants_30d") or 0),
+        minted_eco_30d=int(rec.get("minted_eco_30d") or 0),
     )
-    # enforce business_id on the way out
-    if isinstance(out, dict):
-        out = {**out, "business_id": bid}
-    return out
+
+# ============================================================
+# Public: Places (businesses) with offers for map/listing
+# ============================================================
+
+class PlaceItemOut(BaseModel):
+    id: str                # duplicate of business_id (for your FE shape)
+    business_id: str
+    name: str
+    lat: float
+    lng: float
+    pledge_tier: Literal["starter", "builder", "leader"] | None = None
+    industry_group: Optional[str] = None
+    area_type: Optional[str] = None
+    has_offers: bool
+    distance_km: Optional[float] = None
+
+class PlacesResponseOut(BaseModel):
+    items: List[PlaceItemOut]
+    total: int
+    page: int
+    page_size: int
+
+@router.get("/places/offers", response_model=PlacesResponseOut)
+def public_places_with_offers(
+    # bounding box (optional)
+    min_lat: float | None = Query(None, ge=-90, le=90),
+    min_lng: float | None = Query(None, ge=-180, le=180),
+    max_lat: float | None = Query(None, ge=-90, le=90),
+    max_lng: float | None = Query(None, ge=-180, le=180),
+
+    # free text & filters
+    q: str | None = Query(None, description="Case-insensitive search on name or tags"),
+    pledges: List[Literal["starter","builder","leader"]] = Query(default_factory=list),
+    industries: List[str] = Query(default_factory=list),
+    areas: List[str] = Query(default_factory=list),
+
+    # sorting & user location
+    sort: Literal["distance","name","tier"] = Query("name"),
+    lat: float | None = Query(None, ge=-90, le=90, description="Required for sort=distance"),
+    lng: float | None = Query(None, ge=-180, le=180),
+
+    # paging
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
+
+    s: Session = Depends(session_dep),
+):
+    """
+    Public, unauthenticated listing of businesses that are visible on the map,
+    with an 'has_offers' flag (true if the business has at least one active offer).
+    Supports bbox filtering, simple text search, filters, sorting, and pagination.
+    """
+    use_distance = sort == "distance" and lat is not None and lng is not None
+    if sort == "distance" and not use_distance:
+        sort = "name"
+
+    where_clauses = [
+        "b.visible_on_map = true",
+        "b.lat IS NOT NULL",
+        "b.lng IS NOT NULL",
+    ]
+    params: Dict[str, Any] = {}
+
+    if all(v is not None for v in (min_lat, min_lng, max_lat, max_lng)):
+        where_clauses.append("b.lat >= $min_lat AND b.lat <= $max_lat AND b.lng >= $min_lng AND b.lng <= $max_lng")
+        params.update(dict(min_lat=min_lat, min_lng=min_lng, max_lat=max_lat, max_lng=max_lng))
+
+    if q:
+        where_clauses.append("(toLower(b.name) CONTAINS $q OR any(t IN coalesce(b.tags,[]) WHERE toLower(t) CONTAINS $q))")
+        params["q"] = q.lower()
+
+    if pledges:
+        where_clauses.append("b.pledge_tier IN $pledges")
+        params["pledges"] = pledges
+
+    if industries:
+        where_clauses.append("b.industry_group IN $industries")
+        params["industries"] = industries
+
+    if areas:
+        where_clauses.append("b.area IN $areas")
+        params["areas"] = areas
+
+    where_sql = "WHERE " + " AND ".join(where_clauses) if where_clauses else ""
+
+    distance_expr = "distance(point({latitude:b.lat, longitude:b.lng}), point({latitude:$lat, longitude:$lng}))" if use_distance else "null"
+    if use_distance:
+        params.update(dict(lat=lat, lng=lng))
+
+    if sort == "distance":
+        order_by = "ORDER BY dist ASC, b.name ASC"
+    elif sort == "tier":
+        order_by = "ORDER BY (CASE b.pledge_tier WHEN 'leader' THEN 3 WHEN 'builder' THEN 2 WHEN 'starter' THEN 1 ELSE 0 END) DESC, b.name ASC"
+    else:
+        order_by = "ORDER BY b.name ASC"
+
+    skip = (page - 1) * page_size
+    limit = page_size
+
+    total_rec = s.run(
+        f"""
+        MATCH (b:BusinessProfile)
+        {where_sql}
+        RETURN count(b) AS total
+        """,
+        **params
+    ).single()
+    total = int(total_rec["total"] if total_rec else 0)
+
+    if total == 0:
+        return PlacesResponseOut(items=[], total=0, page=page, page_size=page_size)
+
+    recs = s.run(
+        f"""
+        MATCH (b:BusinessProfile)
+        {where_sql}
+
+        OPTIONAL MATCH (b)<-[:OF]-(o:Offer)
+        WITH b, any(x IN collect(o) WHERE x.status = 'active') AS has_active_offer
+
+        WITH b, has_active_offer,
+             {distance_expr} AS dist
+
+        {order_by}
+        SKIP $skip LIMIT $limit
+
+        RETURN
+          b.id AS business_id,
+          b.name AS name,
+          toFloat(b.lat) AS lat,
+          toFloat(b.lng) AS lng,
+          b.pledge_tier AS pledge_tier,
+          b.industry_group AS industry_group,
+          b.area AS area_type,
+          has_active_offer AS has_offers,
+          (CASE WHEN dist IS NULL THEN NULL ELSE toFloat(dist) / 1000.0 END) AS distance_km
+        """,
+        **params, skip=skip, limit=limit
+    )
+
+    items: List[PlaceItemOut] = []
+    for r in recs:
+        items.append(
+            PlaceItemOut(
+                id=r["business_id"],
+                business_id=r["business_id"],
+                name=r["name"],
+                lat=float(r["lat"]),
+                lng=float(r["lng"]),
+                pledge_tier=r.get("pledge_tier"),
+                industry_group=r.get("industry_group"),
+                area_type=r.get("area_type"),
+                has_offers=bool(r.get("has_offers")),
+                distance_km=(float(r["distance_km"]) if r.get("distance_km") is not None else None),
+            )
+        )
+
+    return PlacesResponseOut(items=items, total=total, page=page, page_size=page_size)

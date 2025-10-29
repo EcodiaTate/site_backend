@@ -1,4 +1,4 @@
-# api/routers/eyba_billing.py
+# api/eyba/billing.py
 from __future__ import annotations
 
 import os
@@ -11,19 +11,17 @@ from neo4j import Session
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
-from site_backend.api.eyba.neo_business import stripe_record_contribution  # webhook path uses UNSCOPED mint
 
-router = APIRouter(prefix="/eyba", tags=["billing"])
+router = APIRouter(prefix="/eyba", tags=["eyba-billing"])
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3000")
+PUBLIC_BASE = os.environ.get("ECODIA_PUBLIC_URL", "http://localhost:3001")
 
 # --------------------------------------------------------------------
 # Ownership helpers (user → business)
 # --------------------------------------------------------------------
 
-# Edit here if your edge names differ (e.g., :ADMIN_OF)
 _OWNS_RELS = ":OWNS|MANAGES"
 
 
@@ -42,12 +40,6 @@ def _user_business_ids(s: Session, user_id: str) -> List[str]:
 def _resolve_user_business_id(
     s: Session, *, user_id: str, requested_business_id: Optional[str]
 ) -> str:
-    """
-    If requested_business_id is provided, verify ownership; else infer:
-      - 0 owned -> 404
-      - 1 owned -> choose it
-      - many   -> 400 with list so caller can choose
-    """
     if requested_business_id:
         ok = s.run(
             f"""
@@ -84,12 +76,13 @@ def _get_business(s: Session, business_id: str) -> Dict[str, Any]:
           id:                      p['id'],
           name:                    p['name'],
           pledge_tier:             p['pledge_tier'],
-          eco_mint_ratio:          coalesce(p['eco_mint_ratio'], 10),
           stripe_customer_id:      p['stripe_customer_id'],
           stripe_subscription_id:  p['stripe_subscription_id'],
           stripe_subscription_item_id: p['stripe_subscription_item_id'],
           subscription_status:     p['subscription_status'],
-          latest_unit_amount_aud:  p['latest_unit_amount_aud']
+          latest_unit_amount_aud:  p['latest_unit_amount_aud'],
+          sponsor_balance_cents:   coalesce(p['sponsor_balance_cents'], 0),
+          sponsor_locked_cents:    coalesce(p['sponsor_locked_cents'], 0)
         } AS b
         """,
         bid=business_id,
@@ -144,7 +137,7 @@ def _hosted_return_url(path: str) -> str:
 
 
 # --------------------------------------------------------------------
-# Models (scoped: no business_id in bodies; pass via query if multi-biz)
+# Models
 # --------------------------------------------------------------------
 class CheckoutIn(BaseModel):
     monthly_aud: int = Field(..., ge=5, le=999)
@@ -156,9 +149,7 @@ class CheckoutOut(BaseModel):
 
 
 class PortalIn(BaseModel):
-    # If not supplied, we'll use the resolved business' stored stripe_customer_id
     customer_id: Optional[str] = None
-    # match new path
     return_path: str = "/my-eco-bizz/billing"
 
 
@@ -167,7 +158,7 @@ class PortalOut(BaseModel):
 
 
 class UpdateAmountIn(BaseModel):
-    monthly_aud: int = Field(..., ge=5, le=999)  # set new monthly in Stripe
+    monthly_aud: int = Field(..., ge=5, le=999)
 
 
 class UpdateAmountOut(BaseModel):
@@ -182,8 +173,9 @@ class BillingStatusOut(BaseModel):
     subscription_status: Optional[str] = None
     customer_id: Optional[str] = None
     pledge_tier: Optional[str] = None
-    eco_mint_ratio: int
-    latest_unit_amount_aud: Optional[int] = None  # last known monthly amount we stored
+    latest_unit_amount_aud: Optional[int] = None
+    sponsor_balance_cents: int
+    sponsor_locked_cents: int
 
 
 # --------------------------------------------------------------------
@@ -208,7 +200,7 @@ def create_checkout(
                     "price_data": {
                         "currency": "aud",
                         "product_data": {
-                            "name": "EYBA Monthly Contribution",
+                            "name": "EYBA Monthly Sponsorship",
                             "metadata": {"business_id": bid},
                         },
                         "recurring": {"interval": "month"},
@@ -237,7 +229,6 @@ def create_portal(
     bid = _resolve_user_business_id(s, user_id=user_id, requested_business_id=business_id)
     b = _get_business(s, bid)
 
-    # If client didn't send a customer_id, use the stored one; else verify ownership.
     customer_id = payload.customer_id or b.get("stripe_customer_id")
     if not customer_id:
         raise HTTPException(status_code=400, detail="No Stripe customer set up yet for this business")
@@ -332,8 +323,9 @@ def billing_status(
         subscription_status=b.get("subscription_status"),
         customer_id=b.get("stripe_customer_id"),
         pledge_tier=b.get("pledge_tier"),
-        eco_mint_ratio=int(b.get("eco_mint_ratio", 10)),
         latest_unit_amount_aud=(int(b["latest_unit_amount_aud"]) if b.get("latest_unit_amount_aud") is not None else None),
+        sponsor_balance_cents=int(b.get("sponsor_balance_cents", 0)),
+        sponsor_locked_cents=int(b.get("sponsor_locked_cents", 0)),
     )
 
 
@@ -384,7 +376,7 @@ async def stripe_webhook(
                 # swallow and still 200, Stripe will retry if needed
                 pass
 
-    # Invoice paid → mint ECO contribution
+    # Invoice paid → CREDIT SPONSOR BALANCE (no ECO mint)
     if t == "invoice.paid":
         subscription_id = data.get("subscription")
         amount_paid_cents = int(data.get("amount_paid") or 0)
@@ -396,9 +388,15 @@ async def stripe_webhook(
             if rec and rec.get("bid"):
                 bid = rec["bid"]
                 try:
-                    # Mint ECO into unified ledger (UNSCOPED canonical path)
-                    stripe_record_contribution(s, business_id=bid, aud_cents=amount_paid_cents)
-                    # Also store latest amount on business for UI
+                    # Increase sponsor balance; do NOT mint ECO
+                    s.run(
+                        """
+                        MATCH (b:BusinessProfile {id:$bid})
+                        SET b.sponsor_balance_cents = coalesce(b.sponsor_balance_cents, 0) + $amt
+                        """,
+                        bid=bid, amt=amount_paid_cents,
+                    )
+                    # Also store latest amount on business for UI convenience
                     _attach_stripe_to_business(
                         s,
                         business_id=bid,
@@ -409,7 +407,8 @@ async def stripe_webhook(
                         latest_unit_amount_aud=amount_paid_cents // 100,
                     )
                 except Exception:
-                    pass  # keep webhook idempotent-friendly
+                    # idempotent-friendly; Stripe will retry if needed
+                    pass
 
     # Subscription lifecycle → update status
     if t in (

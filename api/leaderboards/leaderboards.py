@@ -56,11 +56,11 @@ class MetaBlock(BaseModel):
     top_value: Optional[int] = None
     my: Optional[MetaMy] = None
 
-class LBWrapYouthEco(BaseModel):
+class LBWrapYouthECO (BaseModel):
     items: List[LBYouthEcoRow]
     meta: MetaBlock
 
-class LBWrapBizEco(BaseModel):
+class LBWrapBizECO (BaseModel):
     items: List[LBBusinessEcoRow]
     meta: MetaBlock
 
@@ -104,7 +104,7 @@ def _with_direct_bolt_retry(fn, *args, **kwargs):
 # Endpoints
 # ───────────────────────────────────────────────────────────────────────────────
 
-@router.get("/youth/eco", response_model=LBWrapYouthEco)
+@router.get("/youth/eco", response_model=LBWrapYouthECO )
 def leaderboard_youth_eco(
     period: str = Query("total", pattern="^(total|weekly|monthly)$"),
     limit: int = Query(20, ge=1, le=200),
@@ -117,7 +117,7 @@ def leaderboard_youth_eco(
         top_youth_eco, session, period=period, limit=limit, offset=offset, me_user_id=me_user_id
     )
 
-@router.get("/business/eco", response_model=LBWrapBizEco)
+@router.get("/business/eco", response_model=LBWrapBizECO )
 def leaderboard_business_eco(
     period: str = Query("total", pattern="^(total|weekly|monthly)$"),
     limit: int = Query(20, ge=1, le=200),

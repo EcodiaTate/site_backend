@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional
-import os, time
+import os, re
 from fastapi import Header, Cookie, HTTPException, status
 from jose import jwt, JWTError
 
@@ -9,50 +9,30 @@ from jose import jwt, JWTError
 # =========================
 ACCESS_JWT_SECRET = os.getenv("ACCESS_JWT_SECRET", os.getenv("JWT_SECRET", "dev-secret-change-me"))
 ACCESS_JWT_ALGO   = os.getenv("ACCESS_JWT_ALGO", "HS256")
-ACCESS_JWT_ISS    = os.getenv("ACCESS_JWT_ISS", None)      # e.g. "https://ecodia.au"
-ACCESS_JWT_AUD    = os.getenv("ACCESS_JWT_AUD", None)      # e.g. "ecodia-site"
+ACCESS_JWT_ISS    = os.getenv("ACCESS_JWT_ISS")      # e.g. "https://ecodia.au"
+ACCESS_JWT_AUD    = os.getenv("ACCESS_JWT_AUD")      # e.g. "ecodia-site"
 
-# TEMP: allow legacy cookie during migration
+# TEMP: allow legacy cookie during migration (UUID-only; never JWT)
 ALLOW_LEGACY_COOKIE = os.getenv("ALLOW_LEGACY_COOKIE", "true").lower() in {"1","true","yes"}
 
 # Dev-only impersonation guard (must be explicitly enabled AND requested)
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() in {"1", "true", "yes"}
 
-def _invalid_token_401(detail: str = "Unauthorized") -> HTTPException:
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$", re.I)
+def _looks_like_uuid(s: str) -> bool:
+    return bool(UUID_RE.match(s or ""))
+
+def _looks_like_jwt(s: str) -> bool:
+    # very loose check: three dot-separated base64url-ish parts
+    return isinstance(s, str) and s.count(".") == 2
+
+def _unauth(detail: str = "Unauthorized") -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail=detail,
         headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
     )
-def _invalid_token_headers():
-    return {"WWW-Authenticate": 'Bearer error="invalid_token"'}
 
-async def maybe_current_user_id(
-    authorization: Optional[str] = Header(default=None),
-    session_token: Optional[str] = Cookie(default=None),
-) -> Optional[str]:
-    """
-    Best-effort current user:
-    - If no credentials ⇒ return None (do NOT raise)
-    - If Bearer present but invalid ⇒ return None (treat as anonymous)
-    - TEMP: accept legacy cookie if present
-    """
-    # Bearer path
-    if authorization:
-        auth = authorization.strip()
-        if auth.lower().startswith("bearer "):
-            token = auth.split(" ", 1)[1].strip()
-            if token:
-                try:
-                    return _verify_access_and_get_sub(token)
-                except HTTPException:
-                    return None
-
-    # Legacy cookie fallback (if enabled)
-    if os.getenv("ALLOW_LEGACY_COOKIE", "true").lower() in {"1","true","yes"} and session_token:
-        return session_token
-
-    return None
 def _verify_access_and_get_sub(token: str) -> str:
     """
     Verify the access token and return the subject (uid).
@@ -73,29 +53,57 @@ def _verify_access_and_get_sub(token: str) -> str:
         )
         uid = str(claims.get("sub") or claims.get("uid") or "")
         if not uid:
-            raise _invalid_token_401("Token missing subject")
-        # Optional nbf/exp checks already enforced by jose
+            raise _unauth("Token missing subject")
         return uid
     except JWTError as e:
-        raise _invalid_token_401(f"Invalid/expired access token: {e}")
+        raise _unauth(f"Invalid/expired access token: {e}")
 
+# ---------------- Optional "maybe" dependency ----------------
+async def maybe_current_user_id(
+    authorization: Optional[str] = Header(default=None),
+    session_token: Optional[str] = Cookie(default=None),   # legacy cookie
+) -> Optional[str]:
+    """
+    Best-effort current user:
+    - If no credentials ⇒ return None (do NOT raise)
+    - If Bearer present but invalid ⇒ return None (treat as anonymous)
+    - TEMP: accept legacy cookie only if it looks like a UUID (never JWT)
+    """
+    # 1) Bearer
+    if authorization:
+        auth = authorization.strip()
+        if auth.lower().startswith("bearer "):
+            token = auth.split(" ", 1)[1].strip()
+            if token:
+                try:
+                    return _verify_access_and_get_sub(token)
+                except HTTPException:
+                    return None
+
+    # 2) Legacy cookie (UUID only; reject JWT-shaped or anything else)
+    if ALLOW_LEGACY_COOKIE and session_token and _looks_like_uuid(session_token) and not _looks_like_jwt(session_token):
+        return session_token
+
+    return None
+
+# ---------------- Canonical dependency ----------------
 async def current_user_id(
     authorization: Optional[str] = Header(default=None),
-    # TEMP legacy cookie (keep a week or two only):
+    # TEMP legacy cookie (UUID-only; keep briefly during migration)
     session_token: Optional[str] = Cookie(default=None),
-    # Dev backdoor must be explicit and opt-in:
+    # Dev override (guarded by DEV_MODE)
     x_dev_auth: Optional[str] = Header(default=None, alias="X-Dev-Auth"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ) -> str:
     """
-    Contract hierarchy (final target):
+    Contract hierarchy:
       1) Authorization: Bearer <access_jwt>  ✅
 
     Temporary migration paths:
-      2) Cookie: session_token=<uid>         ⚠️ legacy (remove soon)
-      3) Dev override: X-Dev-Auth: 1 + DEV_MODE=true + X-User-Id=<uid>
+      2) Cookie: session_token=<uuid>         ⚠️ legacy (UUID only)
+      3) Dev override: X-Dev-Auth: 1 + DEV_MODE=true + X-User-Id=<uuid>
     """
-    # --- 1) Proper Bearer flow ---
+    # 1) Proper Bearer flow
     if authorization:
         auth = authorization.strip()
         if auth.lower().startswith("bearer "):
@@ -103,13 +111,13 @@ async def current_user_id(
             if token:
                 return _verify_access_and_get_sub(token)
 
-    # --- 2) Legacy cookie fallback (accept raw uid string) ---
-    if ALLOW_LEGACY_COOKIE and session_token:
+    # 2) Legacy cookie (UUID only)
+    if ALLOW_LEGACY_COOKIE and session_token and _looks_like_uuid(session_token) and not _looks_like_jwt(session_token):
         return session_token
 
-    # --- 3) Dev-only override (never active in prod) ---
-    if DEV_MODE and x_dev_auth == "1" and x_user_id:
+    # 3) Dev-only override
+    if DEV_MODE and x_dev_auth == "1" and x_user_id and _looks_like_uuid(x_user_id):
         return x_user_id
 
     # Advertise Bearer invalid so FE knows to refresh
-    raise _invalid_token_401()
+    raise _unauth()

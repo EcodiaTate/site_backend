@@ -66,14 +66,14 @@ def list_places_with_offer_flag(
 
     # Multi-filters
     if pledges:
-        filters_p += ["coalesce(b.pledge,'') IN $pledges"]
-        filters_b += ["coalesce(b.pledge,'') IN $pledges"]
+        filters_p += ["toLower(coalesce(b.pledge_tier,'')) IN [x IN $pledges | toLower(x)]"]
+        filters_b += ["toLower(coalesce(b.pledge_tier,'')) IN [x IN $pledges | toLower(x)]"]
     if industries:
-        filters_p += ["coalesce(b.industry_group,'') IN $industries"]
-        filters_b += ["coalesce(b.industry_group,'') IN $industries"]
+        filters_p += ["toLower(coalesce(b.industry_group,'')) IN [x IN $industries | toLower(x)]"]
+        filters_b += ["toLower(coalesce(b.industry_group,'')) IN [x IN $industries | toLower(x)]"]
     if areas:
-        filters_p += ["coalesce(b.area,'') IN $areas"]
-        filters_b += ["coalesce(b.area,'') IN $areas"]
+        filters_p += ["toLower(coalesce(b.area,'')) IN [x IN $areas | toLower(x)]"]
+        filters_b += ["toLower(coalesce(b.area,'')) IN [x IN $areas | toLower(x)]"]
 
     where_p = ("WHERE " + " AND ".join(filters_p)) if filters_p else ""
     where_b = ("WHERE " + " AND ".join(filters_b)) if filters_b else ""
@@ -99,7 +99,7 @@ def list_places_with_offer_flag(
       RETURN b.id AS bid,
              p{{.*,
                 business_id:b.id,
-                pledge_tier:coalesce(b.pledge,'starter'),
+                pledge_tier:coalesce(b.pledge_tier,'starter'),
                 industry_group:b.industry_group,
                 area_type:b.area}} AS P,
              b
@@ -114,7 +114,7 @@ def list_places_with_offer_flag(
                  name: coalesce(b.name,''),
                  lat: b.lat, lng: b.lng,
                  business_id:b.id,
-                 pledge_tier:coalesce(b.pledge,'starter'),
+                 pledge_tier:coalesce(b.pledge_tier,'starter'),
                  industry_group:b.industry_group,
                  area_type:b.area }} AS P,
              b
@@ -149,12 +149,16 @@ def list_places_with_offer_flag(
     items: List[Dict[str, Any]] = []
     for r in rows:
         p = dict(r["place"])
+        # lat/lng should be present for both shapes; guard anyway
+        plat, plng = p.get("lat"), p.get("lng")
+        if plat is None or plng is None:
+            continue
         item: Dict[str, Any] = {
             "id": p.get("id"),
             "business_id": p.get("business_id"),
             "name": p.get("name"),
-            "lat": float(p.get("lat")),
-            "lng": float(p.get("lng")),
+            "lat": float(plat),
+            "lng": float(plng),
             "pledge_tier": p.get("pledge_tier", "starter"),
             "industry_group": p.get("industry_group"),
             "area_type": p.get("area_type"),
@@ -179,6 +183,7 @@ def list_places_with_offer_flag(
     }}
     RETURN sum(c) AS total
     """
-    total = s.run(count_cypher, **params).single()["total"] or 0
+    total_rec = s.run(count_cypher, **params).single()
+    total = total_rec["total"] if total_rec and total_rec.get("total") is not None else 0
 
     return {"items": items, "total": int(total), "page": page, "page_size": params["limit"]}

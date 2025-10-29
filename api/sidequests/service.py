@@ -1,4 +1,3 @@
-# site_backend/api/sidequests/service.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
@@ -59,8 +58,6 @@ def _title_key(s: Optional[str]) -> Optional[str]:
 # -------- helpers → SidequestOut --------
 def _to_sidequest_out(d: Dict[str, Any]) -> SidequestOut:
     outward_kind = d.get("kind") or _public_kind_from_legacy(d.get("type"), d.get("sub_type"))
-    # NOTE: These fields assume your Pydantic model SidequestOut includes them.
-    # If not yet present, add: chain_slug: Optional[str], chain_index: Optional[int], chain_length: Optional[int]
     return SidequestOut(
         id=d["id"],
         kind=outward_kind,
@@ -206,11 +203,12 @@ def list_sidequests_all(
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-          chain_slug: CASE
-            WHEN sq.chain_id IS NULL THEN NULL
-            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
-            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-          END,
+        chain_slug: CASE
+  WHEN sq.chain_id IS NULL THEN NULL
+  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
+  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
+END,
+
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
           end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
@@ -346,9 +344,21 @@ def _flatten_from_update(u: SidequestUpdate) -> Dict[str, Any]:
     return out
 
 
+# -------- existence helper --------
+def _sidequest_exists(session: Session, sid: str) -> bool:
+    row = session.run(
+        "MATCH (sq:Sidequest {id:$id}) RETURN count(sq) AS c",
+        {"id": sid},
+    ).single()
+    return bool(row and row["c"] and int(row["c"]) > 0)
+
+
 # -------- sidequests CRUD --------
-def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
-    mid = uuid4().hex
+def create_sidequest(session: Session, m: SidequestCreate, forced_id: Optional[str] = None) -> SidequestOut:
+    """
+    Create a sidequest. If forced_id is provided, use that id (for CSV upsert with explicit ids).
+    """
+    mid = forced_id or uuid4().hex
     now = _now_iso()
     flat = _flatten_from_create(m)
     rec = session.run(
@@ -483,11 +493,12 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-          chain_slug: CASE
-            WHEN sq.chain_id IS NULL THEN NULL
-            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
-            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-          END,
+        chain_slug: CASE
+  WHEN sq.chain_id IS NULL THEN NULL
+  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
+  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
+END,
+
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
           end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
@@ -497,10 +508,18 @@ def create_sidequest(session: Session, m: SidequestCreate) -> SidequestOut:
         """,
         {"id": mid, "now": now, **flat}
     ).single()
+
+    if not rec or not rec["sq"]:
+        raise ValueError("create_sidequest: failed to create or return node")
+
     return _to_sidequest_out(dict(rec["sq"]))
 
 
 def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) -> SidequestOut:
+    if not _sidequest_exists(session, sidequest_id):
+        # Cleaner error (caught by bulk_upsert to fall back to create-with-id)
+        raise ValueError(f"Sidequest not found for update: {sidequest_id}")
+
     now = _now_iso()
     fields = _flatten_from_update(u)
 
@@ -603,11 +622,12 @@ def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) ->
       END,
       chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
       chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-      chain_slug: CASE
-        WHEN sq.chain_id IS NULL THEN NULL
-        WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
-        ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-      END,
+     chain_slug: CASE
+  WHEN sq.chain_id IS NULL THEN NULL
+  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
+  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
+END,
+
       // override top-level temporal fields as ISO strings for Pydantic
       start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
       end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
@@ -616,6 +636,9 @@ def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) ->
     }} AS sq
     """
     rec = session.run(q, params).single()
+    if not rec or not rec["sq"]:
+        raise ValueError(f"update_sidequest: failed to return node for {sidequest_id}")
+
     return _to_sidequest_out(dict(rec["sq"]))
 
 
@@ -682,11 +705,12 @@ def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-          chain_slug: CASE
-            WHEN sq.chain_id IS NULL THEN NULL
-            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
-            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-          END,
+         chain_slug: CASE
+  WHEN sq.chain_id IS NULL THEN NULL
+  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
+  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
+END,
+
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
           end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
@@ -696,7 +720,7 @@ def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
         """,
         {"id": sidequest_id}
     ).single()
-    if not rec:
+    if not rec or not rec["sq"]:
         raise ValueError(f"Sidequest not found: {sidequest_id}")
     return _to_sidequest_out(dict(rec["sq"]))
 
@@ -796,11 +820,12 @@ def list_sidequests(
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-          chain_slug: CASE
-            WHEN sq.chain_id IS NULL THEN NULL
-            WHEN 'chain_slug' IN keys(sq) AND sq.chain_slug IS NOT NULL THEN sq.chain_slug
-            ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-          END,
+        chain_slug: CASE
+  WHEN sq.chain_id IS NULL THEN NULL
+  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
+  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
+END,
+
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
           end_at:   CASE WHEN sq.end_at   IS NULL THEN NULL ELSE toString(sq.end_at)   END,
@@ -811,11 +836,62 @@ def list_sidequests(
     return [_to_sidequest_out(dict(r["sq"])) for r in recs]
 
 
+# --- Add near other helpers ---
+def ensure_chain_prereq(session: Session, sidequest_id: str, user_id: str):
+    """
+    Raise HTTP 403 if this sidequest is part of a chain that requires previous approval
+    and the user hasn't got the previous step approved yet.
+    """
+    rec = session.run("""
+        MATCH (sq:Sidequest {id:$sid})
+        RETURN sq.chain_id AS cid, sq.chain_order AS ord, coalesce(sq.chain_requires_prev,false) AS req
+    """, {"sid": sidequest_id}).single()
+
+    if not rec:
+        return  # unknown sidequest → let general 404/validation handle
+
+    cid = rec["cid"]; ord_ = rec["ord"]; requires = bool(rec["req"])
+    if not cid or not requires:
+        return  # not a chain or rule disabled
+
+    # If it's the first in the chain, nothing to enforce
+    if ord_ is None or int(ord_) <= 0:
+        return
+
+    prev_ord = int(ord_) - 1
+
+    # Does user have an APPROVED submission on the previous step?
+    ok = session.run("""
+        MATCH (prev:Sidequest {chain_id:$cid, chain_order:$prev})
+        OPTIONAL MATCH (:User {id:$uid})-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(prev)
+        RETURN prev.id AS pid, COUNT(sub) > 0 AS has_approved
+    """, {"cid": cid, "prev": prev_ord, "uid": user_id}).single()
+
+    if not ok or not ok["pid"]:
+        # chain broken/malformed; be strict
+        from fastapi import HTTPException, status
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Chain prerequisite not found")
+
+    if not ok["has_approved"]:
+        from fastapi import HTTPException, status
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
+                            detail="Finish the previous chain step first")
+
+
 # -------- submissions & rewards --------
 def create_submission(session: Session, user_id: str, s: SubmissionCreate, media_meta: Optional[Dict[str, Any]]) -> SubmissionOut:
+    # Accept either 'sidequest_id' or legacy 'mission_id'
+    sidequest_id = getattr(s, "sidequest_id", None) or getattr(s, "mission_id", None)
+    if not sidequest_id:
+        raise ValueError("Missing sidequest id")
+
+    # Enforce chain prerequisite (server-side authority)
+    ensure_chain_prereq(session, sidequest_id=sidequest_id, user_id=user_id)
+
     # self import safe in same module
     from .service import get_sidequest  # type: ignore
-    m = get_sidequest(session, s.sidequest_id)
+    m = get_sidequest(session, sidequest_id)
     auto_checks: Dict[str, bool] = {}
 
     auto_checks["within_radius"] = _within_radius(m.geo.model_dump() if m.geo else None, s.user_lat, s.user_lon)
@@ -823,10 +899,10 @@ def create_submission(session: Session, user_id: str, s: SubmissionCreate, media
     phash = (media_meta or {}).get("phash")
     if s.method == "photo_upload" and phash:
         rows = session.run("""
-            MATCH (:User {id:$uid})-[:SUBMITTED]->(sub:Submission)-[:FOR]->(:Sidequest {id:$mid})
+            MATCH (:User {id:$uid})-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(:Sidequest {id:$mid})
             WHERE sub.phash IS NOT NULL
             RETURN sub.phash AS phash
-        """, {"uid": user_id, "mid": s.sidequest_id}).value("phash")
+        """, {"uid": user_id, "mid": sidequest_id}).value("phash")
         auto_checks["duplicate_media"] = phash in set(rows)
     else:
         auto_checks["duplicate_media"] = False
@@ -865,7 +941,7 @@ def create_submission(session: Session, user_id: str, s: SubmissionCreate, media
         MERGE (sub)-[:FOR]->(sq)
         RETURN sub{.*, uid:u.id, mid:sq.id} AS sub
     """, {
-        "uid": user_id, "mid": s.sidequest_id, "sid": sid, "now": now,
+        "uid": user_id, "mid": sidequest_id, "sid": sid, "now": now,
         "method": s.method, "auto": auto_checks,
         "media_url": (media_meta or {}).get("path"),
         "phash": phash,
@@ -1117,10 +1193,14 @@ def rotate_weekly_sidequests(session: Session, payload: RotationRequest) -> Rota
 def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Upsert a list of sidequest dicts.
-    - If 'id' present -> update that sidequest
-    - Else -> create new sidequest
+    Behavior:
+      - If 'id' present AND exists → update
+      - If 'id' present AND missing → create with that same id
+      - If 'id' absent → create (auto id)
     Returns: {"created": int, "updated": int, "errors": [str, ...]}
     """
+    import json, traceback
+
     created = 0
     updated = 0
     errors: List[str] = []
@@ -1128,19 +1208,30 @@ def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str,
     for idx, raw in enumerate(sidequests, start=1):
         try:
             if "id" in raw and raw["id"]:
-                # Update existing
                 sid = str(raw["id"])
                 payload = {k: v for k, v in raw.items() if k != "id"}
-                mu = SidequestUpdate(**payload)
-                update_sidequest(session, sid, mu)
-                updated += 1
+                try:
+                    if _sidequest_exists(session, sid):
+                        mu = SidequestUpdate(**payload)
+                        update_sidequest(session, sid, mu)
+                        updated += 1
+                    else:
+                        # Create with the caller-provided id
+                        mc = SidequestCreate(**payload)
+                        create_sidequest(session, mc, forced_id=sid)
+                        created += 1
+                except Exception as e:
+                    tb = traceback.format_exc().strip().splitlines()[-2:]
+                    errors.append(
+                        f"row {idx}: upsert:{type(e).__name__}: {e} | keys={sorted(list(raw.keys()))} | trace_tail={' | '.join(tb)}"
+                    )
             else:
-                # Create new
                 mc = SidequestCreate(**raw)
                 create_sidequest(session, mc)
                 created += 1
         except Exception as e:
-            errors.append(f"row {idx}: {type(e).__name__}: {e}")
+            tb = traceback.format_exc().strip().splitlines()[-2:]
+            errors.append(f"row {idx}: unknown:{type(e).__name__}: {e} | trace_tail={' | '.join(tb)}")
 
     return {"created": created, "updated": updated, "errors": errors}
 
@@ -1190,8 +1281,8 @@ def get_chain_context(
                {
                  id:      steps[i].id,
                  title:   steps[i].title,
-                 // IMPORTANT: use existing detail route now
-                 href:    '/sidequests/' + steps[i].id,
+                 // SAFE: use an in-page anchor the UI already handles
+                 href:    '#sq-' + steps[i].id,
                  order:   coalesce(steps[i].chain_order, i),
                  done:    steps[i].id IN done_ids,
                  locked:  coalesce(steps[i].chain_requires_prev, false)

@@ -15,14 +15,14 @@ from site_backend.core.neo_driver import session_dep
 SITE_NAME = os.getenv("SITE_NAME", "ecodia")
 
 # JWT verification envs (RS256 preferred; HS256 for dev)
-raw = os.getenv("ECODIA_JWT_PUBLIC_KEY", "")
+raw = os.getenv("JWT_PUBLIC_KEY", "")
 JWT_PUBLIC_KEY = raw.replace("\\n", "\n") if raw else None
-JWT_SECRET     = os.getenv("ECODIA_JWT_SECRET", "dev-secret")
-JWT_ALGS       = (os.getenv("ECODIA_JWT_ALG") or "RS256").split(",")
+JWT_SECRET     = os.getenv("JWT_SECRET", "dev-secret")
+JWT_ALGS       = (os.getenv("JWT_ALG") or "RS256").split(",")
 
 # Optional stricter verification (set if you use them)
-JWT_ISS = os.getenv("ECODIA_JWT_ISS")       # e.g., "https://ecodia.au"
-JWT_AUD = os.getenv("ECODIA_JWT_AUD")       # e.g., "ecodia-site"
+JWT_ISS = os.getenv("JWT_ISS")       # e.g., "https://ecodia.au"
+JWT_AUD = os.getenv("JWT_AUD")       # e.g., "ecodia-site"
 
 
 def _extract_bearer(req: Request) -> Optional[str]:

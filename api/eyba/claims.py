@@ -1,11 +1,11 @@
-# api/routers/eyba_claims.py
+# api/eyba/claims.py
 from __future__ import annotations
 
 import hashlib
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Optional, Literal, Dict, Any, List
+from datetime import datetime, timezone
+from typing import Optional, Literal, Dict, Any
 
 from fastapi import (
     APIRouter,
@@ -21,52 +21,60 @@ from neo4j import Session
 from pydantic import BaseModel
 
 from site_backend.core.neo_driver import session_dep
-from site_backend.api.eyba.neo_business import new_id  # id helper
+from site_backend.core.user_guard import current_user_id as _current_user_id
 
 router = APIRouter(prefix="/eyba", tags=["eyba"])
 
 PledgeTier = Literal["starter", "builder", "leader"]
 
+
 # ---------- Request / Response ----------
 class ClaimRequest(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
-    # If the UI sends this, we'll validate and attach before minting
-    offer_id: Optional[str] = None
+
 
 class ClaimResponse(BaseModel):
     ok: bool
     awarded_eco: int = 0
     balance: int = 0
-    reason: Optional[str] = None
+    reason: Optional[str] = None  # geofence | cooldown | daily_cap
     business_name: Optional[str] = None
     location_name: Optional[str] = None
     tx_id: Optional[str] = None
     business_id: Optional[str] = None
-    debug: Optional[Dict[str, Any]] = None  # optional debug payload
+    debug: Optional[Dict[str, Any]] = None
 
+
+# Deprecated (kept for compatibility, now a 410)
 class AttachOfferRequest(BaseModel):
     offer_id: str
 
+
 class AttachOfferResponse(BaseModel):
     ok: bool
+
 
 # ---------- helpers ----------
 def _now() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _now_ms() -> int:
     return int(_now().timestamp() * 1000)
+
 
 def _ms_at_utc_day_start(dt: datetime) -> int:
     d0 = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
     return int(d0.timestamp() * 1000)
+
 
 def _device_hash(ip: str, ua: str) -> str:
     h = hashlib.sha256()
     h.update((ip or "-").encode())
     h.update((ua or "-").encode())
     return h.hexdigest()[:16]
+
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     import math as m
@@ -79,22 +87,22 @@ def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     c = 2 * m.atan2(m.sqrt(a), m.sqrt(1 - a))
     return R * c
 
+
 def get_youth_id(req: Request) -> str:
     ip = req.client.host if req.client else "0.0.0.0"
     ua = req.headers.get("user-agent", "")
     return f"y_{_device_hash(ip, ua)}"
 
-def _day_bucket_ms(dt: datetime) -> int:
-    d0 = datetime(dt.year, dt.month, dt.day, tzinfo=timezone.utc)
-    return int(d0.timestamp() * 1000)
 
 def _cooldown_bucket_ms(now: datetime, hours: int) -> int:
     slot_ms = max(1, hours) * 3600 * 1000
     return (int(now.timestamp() * 1000) // slot_ms) * slot_ms
 
+
 def _dedupe_id(prefix: str, uid: str, bid: str, bucket_ms: int) -> str:
     h = hashlib.sha256(f"{prefix}|{uid}|{bid}|{bucket_ms}".encode()).hexdigest()[:24]
     return f"{prefix}_{h}"
+
 
 # ---------- DB lookups (QR + Business + Rules) ----------
 @dataclass
@@ -112,6 +120,7 @@ class DBQRMeta:
     rules_cooldown_hours: int
     rules_daily_cap_per_user: int
     rules_geofence_radius_m: Optional[int]
+
 
 def _fetch_qr_meta(s: Session, code: str) -> Optional[DBQRMeta]:
     rows = s.run(
@@ -154,14 +163,14 @@ def _fetch_qr_meta(s: Session, code: str) -> Optional[DBQRMeta]:
         rules_geofence_radius_m=int(rec["geofence_m"]) if rec["geofence_m"] is not None else None,
     )
 
+
 def _compute_eps(pledge_tier: PledgeTier, first_visit: bool) -> float:
     base = 1.5 if first_visit else 1.0
     tier_bonus = {"starter": 1.0, "builder": 1.15, "leader": 1.3}[pledge_tier]
     return round(base * tier_bonus, 2)
 
-# Optional current-user dependency that safely awaits your existing one
-from site_backend.core.user_guard import current_user_id as _current_user_id
 
+# Optional current-user dependency that safely awaits your existing one
 async def current_user_id_optional_dep(req: Request) -> Optional[str]:
     """
     Return the authenticated user id as a string, or None.
@@ -173,51 +182,39 @@ async def current_user_id_optional_dep(req: Request) -> Optional[str]:
     except Exception:
         return None
 
-def _last_scan_ms(s: Session, device_id: str, business_id: str) -> Optional[int]:
-    rows = s.run(
+
+def _last_visit_ms(s: Session, device_id: str, business_id: str) -> Optional[int]:
+    row = s.run(
         """
-        MATCH (:User)-[:EARNED]->(t:EcoTx)<-[:TRIGGERED]-(:BusinessProfile {id:$bid})
-        WHERE t.kind = 'scan' AND t.device_id = $did
-        RETURN max(t.createdAt) AS last
+        MATCH (:BusinessProfile {id:$bid})-[:TRIGGERED]->(t:EcoTx)
+        WHERE t.kind = 'MINT_ACTION' AND t.device_id = $did
+        RETURN max(toInteger(t.createdAt)) AS last
         """,
-        did=device_id, bid=business_id,
-    ).data()
-    if not rows:
-        return None
-    last = rows[0].get("last")
+        did=device_id,
+        bid=business_id,
+    ).single()
+    last = row["last"] if row else None
     return int(last) if last is not None else None
 
-def _today_scans_count(s: Session, device_id: str, business_id: str, today0_ms: int) -> int:
-    rows = s.run(
+
+def _today_visits_count(s: Session, device_id: str, business_id: str, today0_ms: int) -> int:
+    row = s.run(
         """
-        MATCH (:User)-[:EARNED]->(t:EcoTx)<-[:TRIGGERED]-(:BusinessProfile {id:$bid})
-        WHERE t.kind='scan' AND t.device_id=$did AND t.createdAt >= $today0
+        MATCH (:BusinessProfile {id:$bid})-[:TRIGGERED]->(t:EcoTx)
+        WHERE t.kind='MINT_ACTION' AND t.device_id=$did AND toInteger(t.createdAt) >= $today0
         RETURN count(t) AS c
         """,
-        did=device_id, bid=business_id, today0=today0_ms,
-    ).data()
-    return int(rows[0].get("c", 0)) if rows else 0
-
-# Visible offers for a business (id/title/blurb/redeem_eco)
-def _business_visible_offers(s: Session, business_id: str) -> List[Dict[str, Any]]:
-    return s.run(
-        """
-        MATCH (b:BusinessProfile {id:$bid})<-[:OF]-(o:Offer)
-        WHERE coalesce(o.visible, true) = true
-        RETURN o.id AS id,
-               o.title AS title,
-               o.blurb AS blurb,
-               toInteger(o.redeem_eco) AS redeem_eco
-        ORDER BY o.title
-        """,
+        did=device_id,
         bid=business_id,
-    ).data() or []
+        today0=today0_ms,
+    ).single()
+    return int(row["c"] or 0) if row else 0
+
 
 # ---------- Youth balance (ledger) ----------
 def _youth_balance(s: Session, youth_id: str) -> int:
     """
-    Balance = sum(EARNED) - sum(SPENT) over settled EcoTx.
-    Neo4j-5 safe (no implicit grouping).
+    Balance = sum(EARNED kind=MINT_ACTION) - sum(SPENT kind=BURN_REWARD) over settled EcoTx.
     """
     row = s.run(
         """
@@ -225,16 +222,14 @@ def _youth_balance(s: Session, youth_id: str) -> int:
         CALL {
           WITH $uid AS uid
           MATCH (u:User {id: uid})
-          OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx)
-            WHERE coalesce(te.status,'settled') = 'settled'
+          OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx {kind:'MINT_ACTION', status:'settled'})
           RETURN coalesce(sum(toInteger(te.amount)), 0) AS earned
         }
-        // Spent
+        // Spent (retired)
         CALL {
           WITH $uid AS uid
           MATCH (u:User {id: uid})
-          OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx)
-            WHERE coalesce(ts.status,'settled') = 'settled'
+          OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx {kind:'BURN_REWARD', status:'settled'})
           RETURN coalesce(sum(toInteger(ts.amount)), 0) AS spent
         }
         RETURN toInteger(earned - spent) AS balance
@@ -243,16 +238,25 @@ def _youth_balance(s: Session, youth_id: str) -> int:
     ).single()
     return int(row["balance"]) if row and row["balance"] is not None else 0
 
-def _attach_offer_to_tx(s: Session, tx_id: str, offer_id: str):
-    s.run(
+
+# ---------- Season controls ----------
+def _season_multiplier(s: Session) -> float:
+    """
+    Reads Season.emission_multiplier. Defaults to 1.0.
+    """
+    rec = s.run(
         """
-        MATCH (t:EcoTx {id:$tx_id})
-        MATCH (o:Offer {id:$offer_id})<-[:OF]-(b:BusinessProfile)
-        MERGE (t)-[:FOR_OFFER]->(o)
-        SET o.claims = coalesce(o.claims,0) + 1
-        """,
-        tx_id=tx_id, offer_id=offer_id,
-    )
+        MATCH (se:Season)
+        RETURN coalesce(se.emission_multiplier, 1.0) AS mul
+        ORDER BY se.created_at DESC
+        LIMIT 1
+        """
+    ).single()
+    try:
+        return float(rec["mul"]) if rec and rec["mul"] is not None else 1.0
+    except Exception:
+        return 1.0
+
 
 # ---------- quick QR debug ----------
 @router.get("/qr/{code}/debug", response_model=Dict[str, Any])
@@ -277,6 +281,9 @@ def qr_debug(code: str, s: Session = Depends(session_dep)):
             "geofence_radius_m": meta.rules_geofence_radius_m,
         },
     }
+
+
+# ---------- claim ----------
 @router.post("/qr/{code}/claim", response_model=ClaimResponse)
 async def claim_eco(
     code: str,
@@ -328,33 +335,6 @@ async def claim_eco(
         }
 
     try:
-        # ----- require a visible offer + validate it -------------------------
-        offers = _business_visible_offers(s, meta.business_id)
-        if debug:
-            dbg["offers_preview"] = [{"id": o["id"], "title": o.get("title")} for o in offers]
-
-        if len(offers) == 0:
-            return ClaimResponse(
-                ok=False, reason="no_offers",
-                business_name=meta.business_name, location_name=meta.location_name,
-                business_id=meta.business_id, debug=dbg if debug else None,
-            )
-
-        if payload.offer_id is None:
-            return ClaimResponse(
-                ok=False, reason="offer_required",
-                business_name=meta.business_name, location_name=meta.location_name,
-                business_id=meta.business_id,
-                debug=(dbg | {"offers": offers}) if debug else None,
-            )
-
-        if not any(o["id"] == payload.offer_id for o in offers):
-            return ClaimResponse(
-                ok=False, reason="offer_invalid",
-                business_name=meta.business_name, location_name=meta.location_name,
-                business_id=meta.business_id, debug=dbg if debug else None,
-            )
-
         # ----- geofence check (if coords on both sides + radius configured) ---
         if (
             meta.rules_geofence_radius_m
@@ -378,14 +358,14 @@ async def claim_eco(
 
         # ----- soft analytics + guard rails -----------------------------------
         now = _now()
-        last_ms = _last_scan_ms(s, device_uid, meta.business_id)
         today0_ms = _ms_at_utc_day_start(now)
-        todays = _today_scans_count(s, device_uid, meta.business_id, today0_ms)  # uses settled scans
+        last_ms = _last_visit_ms(s, device_uid, meta.business_id)
+        todays = _today_visits_count(s, device_uid, meta.business_id, today0_ms)
         if debug:
             dbg["timing"] = {"now_ms": _now_ms(), "last_ms": last_ms}
-            dbg["count"] = {"today_scans_for_business": todays, "today0_ms": today0_ms}
+            dbg["count"] = {"today_visits_for_business": todays, "today0_ms": today0_ms}
 
-        # DAILY CAP: obey per-user-per-day cap from business rules
+        # DAILY CAP per-user-per-day
         if meta.rules_daily_cap_per_user is not None and todays >= int(meta.rules_daily_cap_per_user):
             return ClaimResponse(
                 ok=False, reason="daily_cap",
@@ -393,7 +373,7 @@ async def claim_eco(
                 business_id=meta.business_id, debug=dbg if debug else None,
             )
 
-        # COOLDOWN: durable bucket per device/business
+        # COOLDOWN bucket per device/business
         cool0 = _cooldown_bucket_ms(now, meta.rules_cooldown_hours)
         cool_id = _dedupe_id("cool", device_uid, meta.business_id, cool0)
         rows = s.run(
@@ -417,11 +397,19 @@ async def claim_eco(
         eps = _compute_eps(meta.pledge_tier, first_visit)
         base = meta.rules_first_visit if first_visit else meta.rules_return_visit
         reward = max(1, int(round(base * eps)))
-        if debug:
-            dbg["award_math"] = {"first_visit": first_visit, "base": base, "eps": eps, "reward": reward}
 
-        # ----- write ledger ----------------------------------------------------
-        tx_id = new_id("eco_tx")
+        # seasonal multiplier
+        mul = _season_multiplier(s)
+        reward = max(1, int(round(reward * mul)))
+
+        if debug:
+            dbg["award_math"] = {
+                "first_visit": first_visit, "base": base, "eps": eps,
+                "season_multiplier": mul, "reward_final": reward
+            }
+
+        # ----- write ledger (MINT_ACTION associated to business) --------------
+        tx_id = hashlib.sha256(f"tx|{device_uid}|{meta.business_id}|{_now_ms()}".encode()).hexdigest()[:24]
         s.run(
             """
             MERGE (u:User {id:$uid})
@@ -432,16 +420,18 @@ async def claim_eco(
             MERGE (t:EcoTx {id:$tx_id})
               ON CREATE SET
                 t.amount      = $eco,
-                t.kind        = "scan",
+                t.kind        = "MINT_ACTION",
                 t.source      = "eyba",
                 t.status      = "settled",
-                t.createdAt   = $now,
+                t.createdAt   = $now_ms,
+                t.at          = datetime($now_iso),
                 t.qr_code     = $qr,
                 t.device_id   = $did,
                 t.account_id  = $uid,
                 t.first_visit = $first_visit,
                 t.lat         = $lat,
                 t.lng         = $lng
+
             MERGE (u)-[:EARNED]->(t)
             MERGE (b)-[:TRIGGERED]->(t)
             """,
@@ -450,25 +440,25 @@ async def claim_eco(
             bid=meta.business_id,
             tx_id=tx_id,
             eco=reward,
-            now=_now_ms(),
+            now_ms=_now_ms(),
+            now_iso=_now().isoformat(),
             qr=meta.code,
             first_visit=first_visit,
             lat=payload.lat,
             lng=payload.lng,
         )
 
-        # link chosen offer
-        _attach_offer_to_tx(s, tx_id, payload.offer_id)
-
-        # bump business counters
-        s.run(
-            """
-            MATCH (b:BusinessProfile {id:$bid})
-            SET b.eco_given_total = coalesce(b.eco_given_total,0) + $eco,
-                b.minted_eco      = coalesce(b.minted_eco,0) + $eco
-            """,
-            bid=meta.business_id, eco=reward,
-        )
+        # If user has just authenticated, relink last 30d device txs to their account
+        if account_uid:
+            s.run(
+                """
+                MATCH (d:Device {id:$did})<-[:USES_DEVICE]-(:User)-[:EARNED]->(t:EcoTx)
+                WHERE toInteger(t.createdAt) >= $since
+                WITH DISTINCT t
+                MERGE (u:User {id:$uid})-[:EARNED]->(t)
+                """,
+                did=device_uid, uid=account_uid, since=_now_ms() - 30*24*3600*1000,
+            )
 
         # return balance for resolved user
         balance_after = _youth_balance(s, resolved_uid)
@@ -493,8 +483,14 @@ async def claim_eco(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
-# ---------- attach offer (post-claim) ----------
+# ---------- attach offer (post-claim) [DEPRECATED] ----------
 @router.post("/tx/{tx_id}/attach_offer", response_model=AttachOfferResponse)
 def attach_offer(tx_id: str, payload: AttachOfferRequest, s: Session = Depends(session_dep)):
-    _attach_offer_to_tx(s, tx_id, payload.offer_id)
-    return AttachOfferResponse(ok=True)
+    """
+    Deprecated under the new mechanics. Mint (MINT_ACTION) transactions must NOT be linked to Offers.
+    Offer linkage happens only when retiring ECO on redemption (BURN_REWARD via /offers/{id}/redeem).
+    """
+    raise HTTPException(
+        status_code=410,
+        detail="Deprecated: attach_offer is no longer supported. Use /offers/{id}/redeem to burn ECO when claiming a reward.",
+    )

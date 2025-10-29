@@ -8,6 +8,9 @@ from neo4j import Session
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 def new_id(prefix: str) -> str:
     return f"{prefix}_{uuid4().hex[:12]}"
 
@@ -70,7 +73,6 @@ def upsert_impact_inputs(
     return {"ok": True}
 
 def _score_practices(pr: Dict[str, Any]) -> int:
-    # Expect normalized 0..5 answers, weight to 0..45 total
     def subscore(k): return max(0, min(5, int(pr.get(k, 0))))
     energy = subscore("energy") * 3   # 0..15
     waste  = subscore("waste") * 3    # 0..15
@@ -86,11 +88,10 @@ _CERT_POINTS = {
 def _score_certs(certs: List[str]) -> int:
     pts = 0
     for c in certs or []:
-        pts += _CERT_POINTS.get(c.lower(), 2)  # unknown gets 2
+        pts += _CERT_POINTS.get(str(c).lower(), 2)  # unknown gets 2
     return min(20, pts)
 
 def _score_social(so: Dict[str, Any]) -> int:
-    # Expect booleans/levels 0..5 → scale to 0..15
     inc = int(so.get("inclusive_hiring", 0))
     youth = int(so.get("youth_support", 0))
     comm = int(so.get("community_initiatives", 0))
@@ -122,15 +123,13 @@ def compute_and_store_bis(s: Session, *, business_id: str) -> Dict[str, Any]:
     tr = rec["tr"] or {}
 
     base = _score_practices(pr) + _score_social(so) + _score_certs(certs) + _score_transparency(tr) # 0..90
-    # Freshness decay: if older than ~90 days, subtract up to 10
     decay = 0
     if rec["upd"]:
         age_days = max(0, (datetime.now(timezone.utc).timestamp()*1000 - rec["upd"]) / (1000*60*60*24))
-        decay = min(10, int(age_days // 30))  # 1 point per ~month, cap 10
+        decay = min(10, int(age_days // 30))  # ~1 point per month, cap 10
     bis = max(0, min(100, base - decay))
 
     s.run("MATCH (b:BusinessProfile {id:$bid}) SET b.impact_score=$bis", bid=business_id, bis=int(bis))
-    # History point
     s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})
@@ -158,7 +157,7 @@ def enable_events_for_business(s: Session, *, business_id: str, event_keys: List
     )
     return {"ok": True, "enabled": valid}
 
-# -------------------- Scan & Mint --------------------
+# -------------------- Scan & Mint (unified EcoTx) --------------------
 def record_scan_mint(
     s: Session,
     *,
@@ -171,6 +170,7 @@ def record_scan_mint(
 ) -> Dict[str, Any]:
     if event_key not in IMPACT_EVENTS:
         raise ValueError("Unknown event")
+
     rec = s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})
@@ -180,6 +180,7 @@ def record_scan_mint(
     ).single()
     if not rec or not rec["yid"]:
         raise ValueError("Business or youth not found")
+
     enabled = rec["enabled"] or []
     if event_key not in enabled:
         raise PermissionError("Event not enabled for this business")
@@ -193,7 +194,7 @@ def record_scan_mint(
     rows = s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})-[:TRIGGERED]->(t:EcoTx {kind:'scan'})<-[:EARNED]-(y:User {id:$yid})
-        WHERE t.event_key=$ek AND t.createdAt >= $sinceYouth
+        WHERE t.event_key=$ek AND toInteger(t.createdAt) >= $sinceYouth
         RETURN count(t) AS c
         """,
         bid=business_id, yid=youth_id, ek=event_key,
@@ -202,11 +203,11 @@ def record_scan_mint(
     if rows and int(rows["c"]) > 0:
         return {"ok": False, "reason": "youth_cooldown", "awarded_eco": 0}
 
-    # Simple business burst control (avoid mass scans in a second)
+    # Simple business burst control
     rows2 = s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})-[:TRIGGERED]->(t:EcoTx {kind:'scan'})
-        WHERE t.createdAt >= $sinceBiz
+        WHERE toInteger(t.createdAt) >= $sinceBiz
         RETURN count(t) AS c
         """,
         bid=business_id, sinceBiz=_now_ms() - business_burst*1000
@@ -221,26 +222,32 @@ def record_scan_mint(
     eco = max(1, int(round(base * mult)))
 
     txid = new_id("eco_tx")
+    now_ms = _now_ms()
+    now_iso = _now_iso()
 
     s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})
         MATCH (y:User {id:$yid})
         MERGE (t:EcoTx {id:$txid})
-          ON CREATE SET t.amount=$eco,
-                        t.kind='scan',
-                        t.event_key=$ek,
-                        t.createdAt=$now,
-                        t.evidence=$evidence,
-                        t.client_ip=$cip,
-                        t.device_id=$dev
+          ON CREATE SET
+            t.amount     = $eco,
+            t.kind       = 'scan',
+            t.source     = 'eyba',
+            t.status     = 'settled',
+            t.event_key  = $ek,
+            t.createdAt  = $now_ms,
+            t.at         = datetime($now_iso),
+            t.evidence   = $evidence,
+            t.client_ip  = $cip,
+            t.device_id  = $dev
         MERGE (b)-[:TRIGGERED]->(t)
         MERGE (y)-[:EARNED]->(t)
         SET b.eco_given_total = coalesce(b.eco_given_total,0) + $eco,
-            b.minted_eco       = coalesce(b.minted_eco,0) - $eco
+            b.minted_eco      = coalesce(b.minted_eco,0) + $eco
         """,
         bid=business_id, yid=youth_id, txid=txid, eco=eco, ek=event_key,
-        now=_now_ms(), evidence=evidence or {}, cip=client_ip, dev=device_id
+        now_ms=now_ms, now_iso=now_iso, evidence=evidence or {}, cip=client_ip, dev=device_id
     )
 
     return {
