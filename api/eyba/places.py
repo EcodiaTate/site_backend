@@ -1,4 +1,4 @@
-# api/routers/eyba_places.py
+# api/eyba/places.py
 from __future__ import annotations
 
 from typing import Optional, List, Literal, Tuple, Dict, Any
@@ -25,7 +25,7 @@ class PlaceOut(BaseModel):
     pledge_tier: PledgeTier
     industry_group: Optional[str] = None
     area_type: Optional[AreaType] = None
-    has_offers: bool = False
+    has_offers: bool = False  # active offers requiring ECO to retire (status=active, stock ok)
 
     # Optional enrichments
     address: Optional[str] = None
@@ -136,9 +136,12 @@ def get_places(
         lat=lat, lng=lng, user_lat=lat, user_lng=lng,
         page=page, page_size=page_size,
     )
+
+    # Primary source: service
     from site_backend.api.services.neo_places import list_places_with_offer_flag
     raw = _call_service_safely(list_places_with_offer_flag, s, svc_kwargs)
 
+    # Normalize to PlacesResponse
     if isinstance(raw, dict):
         raw_items = raw.get("items", []) or []
         items: List[PlaceOut] = []
@@ -147,8 +150,31 @@ def get_places(
         total = int(raw.get("total", len(items)))
         data = PlacesResponse(items=items, total=total, page=page, page_size=page_size)
     else:
+        # If service returns a Pydantic-like object already
         data = raw  # type: ignore
 
+    # Backfill has_offers if not provided by the service or to enforce the new rule:
+    # active offers with eco_price>0 and (stock is None or stock>0)
+    missing = [p.business_id for p in data.items if p.has_offers is False]
+    if missing:
+        rows = s.run(
+            """
+            MATCH (b:BusinessProfile)
+            WHERE b.id IN $bids
+            OPTIONAL MATCH (b)<-[:OF]-(o:Offer)
+            WHERE coalesce(o.status,'active')='active'
+              AND toInteger(coalesce(o.eco_price,0)) > 0
+              AND (o.stock IS NULL OR toInteger(o.stock) > 0)
+            RETURN b.id AS bid, count(o) AS c
+            """,
+            bids=list(set(missing)),
+        ).data() or []
+        has_by_bid = {r["bid"]: (int(r["c"]) > 0) for r in rows}
+        for i, p in enumerate(data.items):
+            if not p.has_offers:
+                data.items[i].has_offers = bool(has_by_bid.get(p.business_id, False))
+
+    # Sort post-processing
     if sort == "distance" and lat is not None and lng is not None:
         for i, p in enumerate(data.items):
             if p.distance_km is None:

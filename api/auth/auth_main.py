@@ -2,7 +2,7 @@ from __future__ import annotations
 from uuid import uuid4
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel, EmailStr, Field
 from argon2 import PasswordHasher
 from neo4j import Session
@@ -11,6 +11,7 @@ from jose import jwt
 from neo4j.exceptions import ConstraintError
 
 from site_backend.core.neo_driver import session_dep
+from site_backend.core.user_guard import current_user_id  # <-- needed for /auth/admin-cookie
 
 router = APIRouter()
 ph = PasswordHasher()
@@ -31,29 +32,6 @@ REFRESH_JWT_SECRET  = os.getenv("REFRESH_JWT_SECRET", JWT_SECRET)
 REFRESH_JWT_ALGO    = os.getenv("REFRESH_JWT_ALGO", "HS256")
 REFRESH_TTL_DAYS    = int(os.getenv("REFRESH_TTL_DAYS", "90"))
 REFRESH_COOKIE_NAME = os.getenv("REFRESH_COOKIE_NAME", "refresh_token")
-
-# ------------------ Role default capabilities ------------------
-ROLE_DEFAULT_CAPS: dict[str, dict[str, Any]] = {
-    "youth": {
-        "max_redemptions_per_week": 5,
-        "streak_bonus_enabled": True,
-        "max_active_sidequests": 7,
-    },
-    "business": {
-        "max_active_offers": 3,
-        "can_issue_qr": True,
-        "analytics_enabled": True,
-    },
-    "creative": {
-        "max_active_collabs": 3,
-        "portfolio_required": False,
-    },
-    "partner": {
-        "max_workspaces": 2,
-        "can_host_events": True,
-    },
-    "public": {},
-}
 
 def _now_s() -> int:
     return int(time.time())
@@ -95,6 +73,53 @@ def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
     if not caps:
         caps = ROLE_DEFAULT_CAPS.get(role, {})
     return caps
+
+# ---- Admin helpers (cookie-based) ----
+def is_admin_email(email: str) -> bool:
+    if not email:
+        return False
+    e = email.lower()
+    # keep simple: exact match or whole domain
+    return e == ADMIN_EMAIL or e.endswith("@ecodia.au")
+
+def mint_admin_token(email: str, ttl_secs: int = 6 * 60 * 60) -> str:
+    now = _now_s()
+    payload = {
+        "sub": email,
+        "scope": "admin",
+        "iat": now,
+        "exp": now + ttl_secs,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+def get_user_by_id(session: Session, uid: str) -> Optional[dict]:
+    rec = session.run("MATCH (u:User {id:$id}) RETURN u.email AS email", {"id": uid}).single()
+    if not rec:
+        return None
+    return {"email": rec["email"]}
+
+# ------------------ Role default capabilities ------------------
+ROLE_DEFAULT_CAPS: dict[str, dict[str, Any]] = {
+    "youth": {
+        "max_redemptions_per_week": 5,
+        "streak_bonus_enabled": True,
+        "max_active_sidequests": 7,
+    },
+    "business": {
+        "max_active_offers": 3,
+        "can_issue_qr": True,
+        "analytics_enabled": True,
+    },
+    "creative": {
+        "max_active_collabs": 3,
+        "portfolio_required": False,
+    },
+    "partner": {
+        "max_workspaces": 2,
+        "can_host_events": True,
+    },
+    "public": {},
+}
 
 # ------------------ Schemas ------------------
 class YouthJoinIn(BaseModel):
@@ -177,22 +202,48 @@ def join_youth(p: YouthJoinIn, s: Session = Depends(session_dep)):
         raise HTTPException(status_code=409, detail="That email is already registered. Try logging in, or reset your password.")
     except Exception:
         raise HTTPException(status_code=400, detail="We couldn't create your account. Please try again.")
-
 @router.post("/join/business", response_model=UserOut)
 def join_business(p: BusinessJoinIn, s: Session = Depends(session_dep)):
     uid = str(uuid4())
     hash_ = ph.hash(p.password)
     caps_json = json.dumps(ROLE_DEFAULT_CAPS["business"])
     cypher = """
+    // --- Create user (unique email constraint should exist) ---
     CREATE (u:User {
       id:$id, email:$email, password_hash:$hash, role:"business",
       created_at:datetime(), caps_json:$caps_json
     })
-    CREATE (bp:BusinessProfile {
-      user_id:$id, store_name:$store_name, pay_model:"pwyw", pledge:$pledge, eco_score:0
+
+    // --- New-style BusinessProfile (has stable id + name) ---
+    CREATE (b:BusinessProfile {
+      id: 'biz_' + replace(toString(randomUUID()),'-','')[..12],
+      user_id:$id,
+      name:$store_name,
+      pledge_tier: CASE WHEN $pledge IS NULL THEN NULL ELSE toString($pledge) END,
+      eco_score:0,
+      pay_model:'pwyw',
+      created_at:datetime()
     })
-    CREATE (u)-[:HAS_PROFILE]->(bp)
-    RETURN u, bp
+
+    // --- Normalize relationship used everywhere else ---
+    MERGE (u)-[:OWNS]->(b)
+
+    // --- Ensure a QR exists and is linked via :OF ---
+    CALL {
+      WITH b
+      OPTIONAL MATCH (q0:QR)-[:OF]->(b)
+      WITH b, q0
+      WHERE q0 IS NOT NULL
+      RETURN q0.code AS code
+      UNION
+      WITH b
+      WITH b, apoc.text.random('ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 10) AS code
+      MERGE (q:QR {code: code})
+      MERGE (q)-[:OF]->(b)
+      RETURN code
+    } AS qr
+
+    RETURN u, b, qr.code AS qr_code
     """
     try:
         rec = s.run(
@@ -206,15 +257,15 @@ def join_business(p: BusinessJoinIn, s: Session = Depends(session_dep)):
         ).single()
         if not rec:
             raise HTTPException(status_code=500, detail="No record returned from Neo4j")
-        u, bp = rec["u"], rec["bp"]
-        out = {
+        u, b, qr_code = rec["u"], rec["b"], rec["qr_code"]
+
+        return {
             "id": u["id"],
             "email": u["email"],
             "role": u["role"],
             "caps": _safe_caps(u.get("caps_json"), "business"),
-            "profile": dict(bp),
+            "profile": {**dict(b), "qr_code": qr_code},
         }
-        return out
     except ConstraintError:
         raise HTTPException(status_code=409, detail="That email is already registered. Try logging in, or reset your password.")
     except Exception:
@@ -410,10 +461,35 @@ def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
         "exp": exp,
     }
 
-    # Preserve your existing admin token behavior
+    # Keep header-mode admin token for backward-compat (optional)
     if ADMIN_EMAIL and u["email"].lower() == ADMIN_EMAIL:
         now = _now_s()
         admin_payload = {"sub": u["email"], "scope": "admin", "iat": now, "exp": now + 60*60*12, "aud": "admin"}
         resp["admin_token"] = jwt.encode(admin_payload, JWT_SECRET, algorithm=JWT_ALGO)
 
     return resp
+
+
+# ------------------ Admin cookie mint/rotate ------------------
+@router.post("/admin-cookie")
+def r_admin_cookie(
+    response: Response,
+    s: Session = Depends(session_dep),
+    uid: str = Depends(current_user_id),
+):
+    user = get_user_by_id(s, uid)
+    email = (user or {}).get("email") or ""
+    if not is_admin_email(email):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not an admin")
+
+    token = mint_admin_token(email, ttl_secs=6*60*60)  # 6h
+    response.set_cookie(
+        key="admin_token",
+        value=token,
+        httponly=True,
+        samesite="Lax",
+        secure=False,   # True in prod HTTPS
+        path="/",
+        max_age=6*60*60,
+    )
+    return {"ok": True}

@@ -192,7 +192,7 @@ def _apply_multipliers(base_xp: int, base_eco: int, mults: Dict[str, float]) -> 
             m *= float(v)
         except Exception:
             continue
-    # XP fully multiplicative; cap Eco a bit to avoid runaway inflation
+    # XP fully multiplicative; cap ECO a bit to avoid runaway inflation
     return int(round(base_xp * m)), int(round(base_eco * max(1.0, min(m, 3.0))))
 def get_user_badges_and_awards(s: Session, *, uid: str) -> Dict[str, Any]:
     if _user_banned(s, uid):
@@ -883,7 +883,7 @@ def _write_ecotx_and_claim(s: Session, *, uid: str, qtype: Dict, amount: int,
         total_eco = min(total_eco, int(cap_eco))
 
 
-    # Cap per-claim XP/Eco if configured on QuestType.extra_rules
+    # Cap per-claim XP/ECO if configured on QuestType.extra_rules
     xr = qtype.get("extra_rules") or {}
     if xr.get("cap_xp_per_claim"):
         total_xp = min(total_xp, int(xr["cap_xp_per_claim"]))

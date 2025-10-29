@@ -12,7 +12,6 @@ def new_id(prefix: str) -> str:
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
-
 # ---------- Standards ----------
 def business_update_standards(
     s: Session,
@@ -53,11 +52,11 @@ def business_update_standards(
         raise ValueError("Business not found")
 
     return rec["out"]
+# site_backend/api/services/neo_business.py
+from uuid import uuid4
 
-
-# ---------- Business Setup / Profile ----------
 def business_init(
-    s: Session,
+    s,
     *,
     user_id: str,
     business_name: str,
@@ -65,54 +64,64 @@ def business_init(
     size: str,
     area: str,
     pledge_tier: str,
-) -> Dict[str, Any]:
-    biz_id = new_id("biz")
-    qr_code = new_id("qr")
+):
+    qr_code = f"biz_{uuid4().hex[:10]}"
+
     rec = s.run(
         """
-        MERGE (u:User {id:$uid})
-        MERGE (b:BusinessProfile {id:$bid})
-          ON CREATE SET b.name=$name,
-                        b.industry_group=$industry_group,
-                        b.size=$size,
-                        b.area=$area,
-                        b.pledge_tier=$pledge_tier,
-                        // Initialize public fields to avoid UnknownPropertyKey warnings
-                        b.website='',
-                        b.tagline='',
-                        b.address='',
-                        b.hours='',
-                        b.description='',
-                        b.hero_url='',
-                        b.tags=[],
-                        b.eco_contributed_total=0,
-                        b.eco_given_total=0,
-                        b.minted_eco=0,
-                        b.visible_on_map=true,
-                        b.createdAt=timestamp()
-        SET b.eco_mint_ratio = 1
-        MERGE (u)-[:OWNS]->(b)
-        MERGE (q:QR {code:$qr})
-          ON CREATE SET q.active=true, q.createdAt=timestamp()
-        MERGE (q)-[:OF]->(b)
-        RETURN b.id AS business_id, q.code AS qr_code
-        """,
-        uid=user_id,
-        bid=biz_id,
-        name=business_name,
-        industry_group=industry_group,
-        size=size,
-        area=area,
-        pledge_tier=pledge_tier,
-        qr=qr_code,
-    ).single()
-    return {"business_id": rec["business_id"], "qr_code": rec["qr_code"]}
+        // Ensure the user exists
+MERGE (u:User {id: $user_id})
 
+// Ensure the BusinessProfile for this user
+MERGE (b:BusinessProfile {user_id: $user_id})
+  ON CREATE SET
+    b.id              = randomUUID(),
+    b.created_at      = datetime(),
+    b.visible_on_map  = true
+
+SET b.name           = $name,
+    b.industry_group = $industry_group,
+    b.size           = $size,
+    b.area           = $area,
+    b.pledge_tier    = $pledge_tier
+
+// Carry vars
+WITH u, b
+
+MERGE (r:Role {name:'business'})
+MERGE (u)-[:HAS_ROLE]->(r)
+
+MERGE (u)-[:OWNS]->(b)
+
+WITH b
+MERGE (q:QR {code: $qr_code})
+MERGE (q)-[:OF]->(b)
+ON CREATE SET q.created_at = datetime()
+
+RETURN b.id AS business_id, q.code AS qr_code
+
+        """,
+        {
+            "user_id": user_id,
+            "name": business_name.strip(),
+            "industry_group": industry_group.strip(),
+            "size": size.strip(),
+            "area": area.strip(),
+            "pledge_tier": pledge_tier.strip(),
+            "qr_code": qr_code,
+        },
+    ).single()
+
+    return {
+        "business_id": rec["business_id"],
+        "qr_code": rec["qr_code"],
+    }
 
 def business_by_owner(s: Session, *, user_id: str) -> Optional[Dict[str, Any]]:
     rec = s.run(
         """
-        MATCH (u:User {id:$uid})-[:OWNS|:MANAGES]->(b:BusinessProfile)
+        MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile)
+        WHERE type(r) IN ['OWNS','MANAGES']
         OPTIONAL MATCH (q:QR)-[:OF]->(b)
         RETURN {
           id:b.id,
@@ -139,7 +148,6 @@ def business_by_owner(s: Session, *, user_id: str) -> Optional[Dict[str, Any]]:
     ).single()
     return rec["out"] if rec else None
 
-
 def business_update_public_profile(
     s: Session,
     *,
@@ -162,7 +170,8 @@ def business_update_public_profile(
 
     rec = s.run(
         f"""
-        MATCH (u:User {{id:$uid}})-[:OWNS|:MANAGES]->(b:BusinessProfile {{id:$bid}})
+        MATCH (u:User {{id:$uid}})-[r]->(b:BusinessProfile {{id:$bid}})
+        WHERE type(r) IN ['OWNS','MANAGES']
         SET {sets}
         RETURN {{
           id:b.id, name:b.name, tagline:b.tagline, website:b.website, address:b.address,
@@ -176,7 +185,6 @@ def business_update_public_profile(
     if not rec:
         raise PermissionError("Not owner/manager or business not found")
     return rec["out"]
-
 
 # ---------- Stripe contributions (standardize on TRIGGERED) ----------
 def stripe_record_contribution(
@@ -205,8 +213,9 @@ def stripe_record_contribution(
             t.kind       = "contribution",
             t.source     = "stripe",
             t.status     = "settled",
-            t.createdAt  = $now
-        MERGE (b)-[:TRIGGERED]->(t)   // use TRIGGERED for all Biz->Tx edges
+            t.createdAt  = $now,
+            t.at         = datetime({epochMillis: $now})
+        MERGE (b)-[:TRIGGERED]->(t)
         SET b.eco_contributed_total = coalesce(b.eco_contributed_total,0) + $eco,
             b.minted_eco            = coalesce(b.minted_eco,0) + $eco
         """,
@@ -214,18 +223,13 @@ def stripe_record_contribution(
     )
     return {"ok": True, "tx_id": tx_id, "eco": eco, "business_id": business_id}
 
-
 # ---------- Metrics & Activity ----------
 def get_business_metrics(s: Session, *, business_id: str) -> Dict[str, Any]:
-    """
-    Returns safe/coerced fields so downstream Pydantic never blows up.
-    """
     rec = s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})
         OPTIONAL MATCH (b)-[:TRIGGERED]->(t:EcoTx)
         WITH b, collect(t) AS txs
-        // Coerce for stable math
         WITH b, [x IN txs WHERE x IS NOT NULL |
             {
               amt: toInteger(coalesce(x.amount, x.eco, 0)),
@@ -256,17 +260,10 @@ def get_business_metrics(s: Session, *, business_id: str) -> Dict[str, Any]:
         raise ValueError("Business not found")
     return rec["out"]
 
-
 def get_business_activity(
     s: Session, *, business_id: str, limit: int = 50
 ) -> List[Dict[str, Any]]:
-    """
-    Returns the most recent EcoTx that were TRIGGERED by this business.
-    Fields are sanitized/coerced to avoid response validation errors.
-    """
-    # Server-side cap (raise as needed)
     limit = max(1, min(int(limit or 50), 1000))
-
     rows = s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})-[:TRIGGERED]->(t:EcoTx)
@@ -289,9 +286,7 @@ def get_business_activity(
         """,
         bid=business_id, lim=limit
     ).data() or []
-
     return [r["row"] for r in rows]
-
 
 # ---------- Offers (unchanged storage; tags supported) ----------
 def create_offer(
@@ -320,20 +315,18 @@ def create_offer(
         raise ValueError("Business not found")
     return rec["o"]
 
-
 def list_offers(s: Session, *, business_id: str, visible_only: bool) -> List[Dict[str, Any]]:
     return [
         r["o"] for r in s.run(
             """
             MATCH (b:BusinessProfile {id:$bid})<-[:OF]-(o:Offer)
-            WHERE $visible_only = false OR o.visible = true
+            WHERE $visible_only = false OR coalesce(o.visible,true) = true
             RETURN o
             ORDER BY coalesce(o.valid_until, date("2999-12-31")) ASC, o.createdAt ASC
             """,
             bid=business_id, visible_only=visible_only
         )
     ]
-
 
 def patch_offer(s: Session, *, offer_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
     if not fields:
@@ -345,7 +338,6 @@ def patch_offer(s: Session, *, offer_id: str, fields: Dict[str, Any]) -> Dict[st
     rec = s.run(f"MATCH (o:Offer {{id:$oid}}) SET {sets} RETURN o", **params).single()
     if not rec: raise ValueError("Offer not found")
     return rec["o"]
-
 
 def delete_offer(s: Session, *, offer_id: str) -> None:
     s.run("MATCH (o:Offer {id:$oid}) DETACH DELETE o", oid=offer_id)

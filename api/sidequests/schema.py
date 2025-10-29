@@ -29,7 +29,7 @@ class PillMeta(BaseModel):
     materials: Optional[List[str]] = None        # optional checklist
 
 class StreakPolicy(BaseModel):
-    name: str = "Weekly Eco Streak"
+    name: str = "Weekly ECO Streak"
     period: Literal["daily", "weekly"] = "weekly"
     bonus_eco_per_step: NonNegInt = 0          # extra ECO granted per consecutive period
     max_steps: Optional[PosInt] = None         # cap bonuses (None = no cap)
