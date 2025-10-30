@@ -85,39 +85,32 @@ async def maybe_current_user_id(
         return session_token
 
     return None
+# core/user_guard.py
+from fastapi import Cookie
 
-# ---------------- Canonical dependency ----------------
 async def current_user_id(
     authorization: Optional[str] = Header(default=None),
-    # TEMP legacy cookie (UUID-only; keep briefly during migration)
     session_token: Optional[str] = Cookie(default=None),
-    # Dev override (guarded by DEV_MODE)
+    access_token: Optional[str] = Cookie(default=None),      # 👈 new
     x_dev_auth: Optional[str] = Header(default=None, alias="X-Dev-Auth"),
     x_user_id: Optional[str] = Header(default=None, alias="X-User-Id"),
 ) -> str:
-    """
-    Contract hierarchy:
-      1) Authorization: Bearer <access_jwt>  ✅
+    # 1) Bearer
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split(" ", 1)[1].strip()
+        if token:
+            return _verify_access_and_get_sub(token)
 
-    Temporary migration paths:
-      2) Cookie: session_token=<uuid>         ⚠️ legacy (UUID only)
-      3) Dev override: X-Dev-Auth: 1 + DEV_MODE=true + X-User-Id=<uuid>
-    """
-    # 1) Proper Bearer flow
-    if authorization:
-        auth = authorization.strip()
-        if auth.lower().startswith("bearer "):
-            token = auth.split(" ", 1)[1].strip()
-            if token:
-                return _verify_access_and_get_sub(token)
+    # 1b) Cookie JWT (if present)
+    if access_token and _looks_like_jwt(access_token):
+        return _verify_access_and_get_sub(access_token)
 
-    # 2) Legacy cookie (UUID only)
+    # 2) Legacy UUID cookie
     if ALLOW_LEGACY_COOKIE and session_token and _looks_like_uuid(session_token) and not _looks_like_jwt(session_token):
         return session_token
 
-    # 3) Dev-only override
+    # 3) Dev override
     if DEV_MODE and x_dev_auth == "1" and x_user_id and _looks_like_uuid(x_user_id):
         return x_user_id
 
-    # Advertise Bearer invalid so FE knows to refresh
     raise _unauth()

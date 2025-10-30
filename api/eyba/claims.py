@@ -1,11 +1,11 @@
-# api/eyba/claims.py
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Literal, Dict, Any, List
+from typing import Optional, Literal, Dict, Any
 
 from fastapi import (
     APIRouter,
@@ -21,7 +21,7 @@ from neo4j import Session
 from pydantic import BaseModel
 
 from site_backend.core.neo_driver import session_dep
-from site_backend.core.user_guard import current_user_id as _current_user_id
+from site_backend.core.user_guard import current_user_id  # strict, same as /eyba/wallet
 
 router = APIRouter(prefix="/eyba", tags=["eyba"])
 
@@ -34,7 +34,7 @@ class ClaimRequest(BaseModel):
 
 class ClaimResponse(BaseModel):
     ok: bool
-    awarded_eco: int = 0           # kept for UI compatibility; here it means "contributed ECO"
+    awarded_eco: int = 0           # UI compatibility; here: “contributed ECO”
     balance: int = 0
     reason: Optional[str] = None   # geofence | cooldown | daily_cap | insufficient_balance
     business_name: Optional[str] = None
@@ -90,6 +90,43 @@ def _cooldown_bucket_ms(now: datetime, hours: int) -> int:
 def _dedupe_id(prefix: str, uid: str, bid: str, bucket_ms: int) -> str:
     h = hashlib.sha256(f"{prefix}|{uid}|{bid}|{bucket_ms}".encode()).hexdigest()[:24]
     return f"{prefix}_{h}"
+
+# ── Dev/test guard bypass ─────────────────────────────────────────────────────
+def _bypass_requested(req: Request, debug: int) -> bool:
+    """
+    True if caller asked to bypass guard rails.
+    - Query:   ?nocap=1
+    - Query:   ?debug=2
+    - Header:  X-EYBA-Dev-Bypass: 1
+    - Env:     EYBA_DEV_DISABLE_GUARDS=1
+    """
+    if os.getenv("EYBA_DEV_DISABLE_GUARDS") == "1":
+        return True
+    if debug and int(debug) >= 2:
+        return True
+    if req.query_params.get("nocap") == "1":
+        return True
+    if req.headers.get("X-EYBA-Dev-Bypass") == "1":
+        return True
+    return False
+
+def _bypass_geofence(req: Request, debug: int) -> bool:
+    """
+    True if caller asked to bypass geofence.
+    - Query:  ?nogeo=1
+    - Header: X-EYBA-NoGeo: 1
+    - Env:    EYBA_DEV_DISABLE_GUARDS=1
+    - Or debug>=2
+    """
+    if os.getenv("EYBA_DEV_DISABLE_GUARDS") == "1":
+        return True
+    if debug and int(debug) >= 2:
+        return True
+    if req.query_params.get("nogeo") == "1":
+        return True
+    if req.headers.get("X-EYBA-NoGeo") == "1":
+        return True
+    return False
 
 # ---------- DB lookups (QR + Business + Rules) ----------
 @dataclass
@@ -157,17 +194,19 @@ def _compute_eps(pledge_tier: PledgeTier, first_visit: bool) -> float:
 # Optional current-user dependency that safely awaits your existing one
 async def current_user_id_optional_dep(req: Request) -> Optional[str]:
     try:
-        val = await _current_user_id(req)
+        val = await current_user_id(req)
         return val if isinstance(val, str) and val else None
     except Exception:
         return None
 
+# ---------- small read helpers (warning-free rel types) ----------
 def _last_visit_ms(s: Session, device_id: str, business_id: str) -> Optional[int]:
-    # We still look at CONSTITUTE of past contributions for first_visit determination
     row = s.run(
         """
-        MATCH (:BusinessProfile {id:$bid})-[:COLLECTED]->(t:EcoTx)
-        WHERE t.kind IN ['CONTRIBUTE','BURN_REWARD'] AND t.device_id = $did
+        MATCH (b:BusinessProfile {id:$bid})-[rel]->(t:EcoTx)
+        WHERE type(rel)='COLLECTED'
+          AND t.kind IN ['CONTRIBUTE','BURN_REWARD']
+          AND t.device_id = $did
         RETURN max(toInteger(t.createdAt)) AS last
         """,
         did=device_id,
@@ -179,8 +218,9 @@ def _last_visit_ms(s: Session, device_id: str, business_id: str) -> Optional[int
 def _today_visits_count(s: Session, device_id: str, business_id: str, today0_ms: int) -> int:
     row = s.run(
         """
-        MATCH (:BusinessProfile {id:$bid})-[:COLLECTED]->(t:EcoTx)
-        WHERE t.kind IN ['CONTRIBUTE','BURN_REWARD']
+        MATCH (b:BusinessProfile {id:$bid})-[rel]->(t:EcoTx)
+        WHERE type(rel)='COLLECTED'
+          AND t.kind IN ['CONTRIBUTE','BURN_REWARD']
           AND t.device_id=$did
           AND toInteger(t.createdAt) >= $today0
         RETURN count(t) AS c
@@ -191,30 +231,24 @@ def _today_visits_count(s: Session, device_id: str, business_id: str, today0_ms:
     ).single()
     return int(row["c"] or 0) if row else 0
 
-# ---------- Youth balance (ledger) ----------
-def _youth_balance(s: Session, youth_id: str) -> int:
-    """
-    Balance = sum(earned kinds) - sum(spent kinds) over settled EcoTx.
-    Earned kinds include: MINT_ACTION (sidequests, etc.)
-    Spent kinds include:  BURN_REWARD (legacy), CONTRIBUTe (new EYBA)
-    """
+def _youth_balance(s: Session, youth_id: Optional[str]) -> int:
+    if not youth_id:
+        return 0
     row = s.run(
         """
         // Earned
-        CALL {
+        CALL () {
           WITH $uid AS uid
-          MATCH (u:User {id: uid})
-          OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx {status:'settled'})
-          WHERE te.kind IN ['MINT_ACTION']
-          RETURN coalesce(sum(toInteger(te.amount)), 0) AS earned
+          OPTIONAL MATCH (:User {id: uid})-[r]->(te:EcoTx {status:'settled'})
+          WHERE type(r) = 'EARNED' AND te.kind IN ['MINT_ACTION']
+          RETURN coalesce(sum(toInteger(coalesce(te.amount, te.eco, 0))), 0) AS earned
         }
         // Spent (retired / contributed)
-        CALL {
+        CALL () {
           WITH $uid AS uid
-          MATCH (u:User {id: uid})
-          OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx {status:'settled'})
-          WHERE ts.kind IN ['BURN_REWARD','CONTRIBUTE']
-          RETURN coalesce(sum(toInteger(ts.amount)), 0) AS spent
+          OPTIONAL MATCH (:User {id: uid})-[r2]->(ts:EcoTx {status:'settled'})
+          WHERE type(r2) = 'SPENT' AND ts.kind IN ['BURN_REWARD','CONTRIBUTE']
+          RETURN coalesce(sum(toInteger(coalesce(ts.amount, ts.eco, 0))), 0) AS spent
         }
         RETURN toInteger(earned - spent) AS balance
         """,
@@ -227,8 +261,9 @@ def _season_multiplier(s: Session) -> float:
     rec = s.run(
         """
         MATCH (se:Season)
-        RETURN coalesce(se.emission_multiplier, 1.0) AS mul
-        ORDER BY se.created_at DESC
+        WITH se, coalesce(se.emission_multiplier, 1.0) AS mul
+        RETURN mul
+        ORDER BY coalesce(se.created_at, datetime({epochMillis:0})) DESC
         LIMIT 1
         """
     ).single()
@@ -236,6 +271,29 @@ def _season_multiplier(s: Session) -> float:
         return float(rec["mul"]) if rec and rec["mul"] is not None else 1.0
     except Exception:
         return 1.0
+
+# ---------- Balance helper to mirror the wallet/counter ----------
+def _wallet_balance_like_counter(s: Session, resolved_uid: Optional[str], device_uid: str) -> int:
+    """
+    EXACTLY like the wallet/counter:
+    - If we have a resolved user id → use that user id.
+    - Else, if we can infer a user who uses this device → use that user id.
+    - Else, return 0 (counter shows a user balance, not device).
+    """
+    if resolved_uid:
+        return _youth_balance(s, resolved_uid)
+
+    rec = s.run(
+        """
+        MATCH (d:Device {id:$did})<-[:USES_DEVICE]-(u:User)
+        RETURN u.id AS uid
+        ORDER BY u.id
+        LIMIT 1
+        """,
+        did=device_uid,
+    ).single()
+    inferred_uid = rec["uid"] if rec and rec.get("uid") else None
+    return _youth_balance(s, inferred_uid) if inferred_uid else 0
 
 # ---------- quick QR debug ----------
 @router.get("/qr/{code}/debug", response_model=Dict[str, Any])
@@ -259,26 +317,42 @@ def qr_debug(code: str, s: Session = Depends(session_dep)):
             "daily_cap_per_user": meta.rules_daily_cap_per_user,
             "geofence_radius_m": meta.rules_geofence_radius_m,
         },
+        "dev_bypass_note": "Pass ?nocap=1 or debug=2 to bypass cap/cooldown; ?nogeo=1 to bypass geofence.",
     }
-
-# ---------- claim (now: contribute ECO to business) ----------
 @router.post("/qr/{code}/claim", response_model=ClaimResponse)
 async def claim_eco(
     code: str,
     req: Request,
-    payload: ClaimRequest = Body(...),
+    payload: Optional[ClaimRequest] = Body(default=None),  # body still optional for easy dev
     x_forwarded_for: Optional[str] = Header(default=None, alias="X-Forwarded-For"),
     user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
-    debug: int = Query(0, description="Set to 1 to return debug payload"),
-    account_uid: Optional[str] = Depends(current_user_id_optional_dep),
+    debug: int = Query(0, description="Set to 1 to include debug payload; 2 = plus dev bypass"),
+    # 🚨 make auth STRICT: same resolver EcoCounter/Wallet uses
+    uid: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
-    # ----- identity (no duplicates; normalize account_uid) -------------------
-    if not isinstance(account_uid, str) or not account_uid.strip():
-        account_uid = None
+    # ----- identity (strict UID; no device fallback) -------------------------
+    device_uid = get_youth_id(req)
+    resolved_uid: Optional[str] = uid  # always present due to strict dep
 
-    device_uid = get_youth_id(req)             # stable device identity
-    resolved_uid = account_uid or device_uid   # ledger owner
+    # Optional relink last 30d device txs to this user (idempotent)
+    s.run(
+        """
+        MERGE (u:User {id:$uid})
+        MERGE (d:Device {id:$did})
+        MERGE (u)-[:USES_DEVICE]->(d)
+        WITH u, d
+        MATCH (t:EcoTx)
+        WHERE t.device_id = $did AND toInteger(t.createdAt) >= $since
+        FOREACH (_ IN CASE WHEN t.kind IN ['MINT_ACTION'] THEN [1] ELSE [] END |
+          MERGE (u)-[:EARNED]->(t)
+        )
+        FOREACH (_ IN CASE WHEN t.kind IN ['BURN_REWARD','CONTRIBUTE'] THEN [1] ELSE [] END |
+          MERGE (u)-[:SPENT]->(t)
+        )
+        """,
+        did=device_uid, uid=uid, since=_now_ms() - 30 * 24 * 3600 * 1000,
+    )
 
     # ----- QR + business meta ------------------------------------------------
     meta = _fetch_qr_meta(s, code)
@@ -286,6 +360,9 @@ async def claim_eco(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="QR not found")
     if not meta.active:
         raise HTTPException(status_code=status.HTTP_410_GONE, detail="QR inactive")
+
+    # Balance BEFORE — EXACTLY like wallet/counter (strict user id)
+    balance_before = _youth_balance(s, uid)
 
     dbg: Dict[str, Any] = {}
     if debug:
@@ -308,180 +385,148 @@ async def claim_eco(
         }
         dbg["identity"] = {
             "device_uid": device_uid,
-            "account_uid": account_uid,
-            "resolved_uid": resolved_uid,
+            "resolved_uid": uid,
+            "auth_header": ("present" if (req.headers.get("authorization") or req.headers.get("Authorization")) else "missing"),
         }
+        dbg["balance_before"] = balance_before
 
-    try:
-        # ----- geofence check (if coords on both sides + radius configured) ---
-        if (
-            meta.rules_geofence_radius_m
-            and payload.lat is not None and payload.lng is not None
-            and meta.lat is not None and meta.lng is not None
-        ):
-            dist = _haversine_m(payload.lat, payload.lng, meta.lat, meta.lng)
-            if debug:
-                dbg["geo"] = {
-                    "provided": {"lat": payload.lat, "lng": payload.lng},
-                    "qr": {"lat": meta.lat, "lng": meta.lng},
-                    "distance_m": round(dist, 2),
-                    "allowed_radius_m": meta.rules_geofence_radius_m,
-                }
-            if dist > float(meta.rules_geofence_radius_m):
-                return ClaimResponse(
-                    ok=False, reason="geofence",
-                    business_name=meta.business_name, location_name=meta.location_name,
-                    business_id=meta.business_id, debug=dbg if debug else None,
-                )
+    # ----- guard rails -------------------------------------------------------
+    bypass = _bypass_requested(req, debug)
+    bypass_geo = _bypass_geofence(req, debug)
+    if debug:
+        dbg["bypass"] = {"nocap_cooldown": bool(bypass), "nogeo": bool(bypass_geo)}
 
-        # ----- soft analytics + guard rails -----------------------------------
-        now = _now()
-        today0_ms = _ms_at_utc_day_start(now)
-        last_ms = _last_visit_ms(s, device_uid, meta.business_id)
-        todays = _today_visits_count(s, device_uid, meta.business_id, today0_ms)
-        if debug:
-            dbg["timing"] = {"now_ms": _now_ms(), "last_ms": last_ms}
-            dbg["count"] = {"today_visits_for_business": todays, "today0_ms": today0_ms}
-
-        # DAILY CAP per-user-per-day
-        if meta.rules_daily_cap_per_user is not None and todays >= int(meta.rules_daily_cap_per_user):
+    # Geofence (only if QR has coords + radius and not bypassed)
+    if not bypass_geo and meta.lat is not None and meta.lng is not None and meta.rules_geofence_radius_m:
+        if payload is None or payload.lat is None or payload.lng is None:
             return ClaimResponse(
-                ok=False, reason="daily_cap",
+                ok=False, reason="geofence",
+                business_name=meta.business_name, location_name=meta.location_name,
+                business_id=meta.business_id, debug=dbg if debug else None,
+            )
+        dist = _haversine_m(meta.lat, meta.lng, float(payload.lat), float(payload.lng))
+        if debug:
+            dbg["geofence"] = {"qr": [meta.lat, meta.lng], "scan": [payload.lat, payload.lng],
+                               "radius_m": meta.rules_geofence_radius_m, "distance_m": round(dist, 2)}
+        if dist > float(meta.rules_geofence_radius_m):
+            return ClaimResponse(
+                ok=False, reason="geofence",
                 business_name=meta.business_name, location_name=meta.location_name,
                 business_id=meta.business_id, debug=dbg if debug else None,
             )
 
-        # COOLDOWN bucket per device/business
-        cool0 = _cooldown_bucket_ms(now, meta.rules_cooldown_hours)
-        cool_id = _dedupe_id("cool", device_uid, meta.business_id, cool0)
-        rows = s.run(
-            """
-            MERGE (c:CooldownClaim {id:$id})
-            ON CREATE SET c.device_id=$did, c.business_id=$bid, c.bucket_ms=$bucket, c.createdAt=$now, c._is_new=true
-            ON MATCH  SET c._is_new=false
-            RETURN c._is_new AS is_new
-            """,
-            id=cool_id, did=device_uid, bid=meta.business_id, bucket=cool0, now=_now_ms(),
-        ).data()
-        if rows and rows[0]["is_new"] is False:
+    # Cooldown + daily cap (per device per business)
+    now_dt = _now()
+    if not bypass:
+        last_ms = _last_visit_ms(s, device_uid, meta.business_id)
+        cooldown_ms = max(1, meta.rules_cooldown_hours) * 3600 * 1000
+        if last_ms is not None and (_now_ms() - int(last_ms)) < cooldown_ms:
+            if debug:
+                dbg["cooldown"] = {"last_ms": last_ms, "cooldown_ms": cooldown_ms}
             return ClaimResponse(
                 ok=False, reason="cooldown",
                 business_name=meta.business_name, location_name=meta.location_name,
                 business_id=meta.business_id, debug=dbg if debug else None,
             )
 
-        # ----- contribution math ----------------------------------------------
-        first_visit = (last_ms is None)
-        eps = _compute_eps(meta.pledge_tier, first_visit)
-        base = meta.rules_first_visit if first_visit else meta.rules_return_visit
-        target = max(1, int(round(base * eps)))
-
-        # seasonal multiplier (optional to keep narrative symmetry)
-        mul = _season_multiplier(s)
-        target = max(1, int(round(target * mul)))
-
+        today0 = _ms_at_utc_day_start(now_dt)
+        count_today = _today_visits_count(s, device_uid, meta.business_id, today0)
         if debug:
-            dbg["contribution_math"] = {
-                "first_visit": first_visit, "base": base, "eps": eps,
-                "season_multiplier": mul, "target_contribution": target
-            }
-
-        # ----- check youth balance and decide contributed amount --------------
-        balance_before = _youth_balance(s, resolved_uid)
-        if balance_before <= 0:
+            dbg["today"] = {"count": count_today, "cap": meta.rules_daily_cap_per_user}
+        if count_today >= max(1, meta.rules_daily_cap_per_user):
             return ClaimResponse(
-                ok=False, reason="insufficient_balance",
+                ok=False, reason="daily_cap",
                 business_name=meta.business_name, location_name=meta.location_name,
                 business_id=meta.business_id, debug=dbg if debug else None,
             )
 
-        contributed = min(balance_before, target)
-        if contributed <= 0:
-            return ClaimResponse(
-                ok=False, reason="insufficient_balance",
-                business_name=meta.business_name, location_name=meta.location_name,
-                business_id=meta.business_id, debug=dbg if debug else None,
-            )
+    # ----- contribution math --------------------------------------------------
+    first_visit = (_last_visit_ms(s, device_uid, meta.business_id) is None)
+    eps = _compute_eps(meta.pledge_tier, first_visit)
+    base = meta.rules_first_visit if first_visit else meta.rules_return_visit
+    target = max(1, int(round(base * eps)))
+    mul = _season_multiplier(s)
+    target = max(1, int(round(target * mul)))
 
-        # ----- write ledger (CONTRIBUTE associated to business) ---------------
-        tx_id = hashlib.sha256(f"tx|contrib|{device_uid}|{meta.business_id}|{_now_ms()}".encode()).hexdigest()[:24]
-        s.run(
-            """
-            MERGE (u:User {id:$uid})
-            MERGE (b:BusinessProfile {id:$bid})
-            MERGE (d:Device {id:$did})
-            MERGE (u)-[:USES_DEVICE]->(d)
+    if debug:
+        dbg["contribution_math"] = {
+            "first_visit": first_visit, "base": base, "eps": eps,
+            "season_multiplier": mul, "target_contribution": target
+        }
 
-            MERGE (t:EcoTx {id:$tx_id})
-              ON CREATE SET
-                t.amount      = $eco,              // amount contributed (positive integer)
-                t.kind        = "CONTRIBUTE",
-                t.source      = "eyba",
-                t.status      = "settled",
-                t.createdAt   = $now_ms,
-                t.at          = datetime($now_iso),
-                t.qr_code     = $qr,
-                t.device_id   = $did,
-                t.account_id  = $uid,
-                t.first_visit = $first_visit,
-                t.lat         = $lat,
-                t.lng         = $lng
-
-            MERGE (u)-[:SPENT]->(t)
-            MERGE (b)-[:COLLECTED]->(t)
-            """,
-            uid=resolved_uid,
-            did=device_uid,
-            bid=meta.business_id,
-            tx_id=tx_id,
-            eco=contributed,
-            now_ms=_now_ms(),
-            now_iso=_now().isoformat(),
-            qr=meta.code,
-            first_visit=first_visit,
-            lat=payload.lat,
-            lng=payload.lng,
-        )
-
-        # If user has just authenticated, relink last 30d device txs to their account
-        if account_uid:
-            s.run(
-                """
-                MATCH (d:Device {id:$did})<-[:USES_DEVICE]-(:User)
-                MATCH (t:EcoTx)
-                WHERE t.device_id = $did AND toInteger(t.createdAt) >= $since
-                // Link both earns and spends to the authed user to consolidate history
-                FOREACH (_ IN CASE WHEN t.kind IN ['MINT_ACTION'] THEN [1] ELSE [] END |
-                  MERGE (u:User {id:$uid})-[:EARNED]->(t)
-                )
-                FOREACH (_ IN CASE WHEN t.kind IN ['BURN_REWARD','CONTRIBUTE'] THEN [1] ELSE [] END |
-                  MERGE (u:User {id:$uid})-[:SPENT]->(t)
-                )
-                """,
-                did=device_uid, uid=account_uid, since=_now_ms() - 30*24*3600*1000,
-            )
-
-        # return balance for resolved user
-        balance_after = _youth_balance(s, resolved_uid)
-
+    # Balance check
+    if balance_before <= 0:
         return ClaimResponse(
-            ok=True,
-            awarded_eco=contributed,   # "awarded" here = contributed to business
-            balance=balance_after,
-            business_name=meta.business_name,
-            location_name=meta.location_name,
-            tx_id=tx_id,
-            business_id=meta.business_id,
-            debug=dbg if debug else None,
+            ok=False, reason="insufficient_balance",
+            business_name=meta.business_name, location_name=meta.location_name,
+            business_id=meta.business_id, debug=dbg if debug else None,
         )
 
-    except Exception as e:
-        logging.exception("claim_eco failed")
-        if debug:
-            import traceback as _tb
-            tb = _tb.format_exc()
-            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}\n{tb}")
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
+    contributed = min(balance_before, target)
+    if contributed <= 0:
+        return ClaimResponse(
+            ok=False, reason="insufficient_balance",
+            business_name=meta.business_name, location_name=meta.location_name,
+            business_id=meta.business_id, debug=dbg if debug else None,
+        )
+
+    # ----- write ledger -------------------------------------------------------
+    now_ms = _now_ms()
+    tx_id = hashlib.sha256(f"tx|contrib|{device_uid}|{meta.business_id}|{now_ms}".encode()).hexdigest()[:24]
+
+    s.run(
+        """
+        MERGE (u:User {id:$uid})
+        MERGE (b:BusinessProfile {id:$bid})
+        MERGE (d:Device {id:$did})
+        MERGE (u)-[:USES_DEVICE]->(d)
+
+        MERGE (t:EcoTx {id:$tx_id})
+          ON CREATE SET
+            t.amount      = $eco,
+            t.kind        = "CONTRIBUTE",
+            t.source      = "eyba",
+            t.status      = "settled",
+            t.createdAt   = $now_ms,
+            t.at          = datetime($now_iso),
+            t.qr_code     = $qr,
+            t.device_id   = $did,
+            t.account_id  = $uid,
+            t.first_visit = $first_visit,
+            t.lat         = $lat,
+            t.lng         = $lng
+
+        MERGE (u)-[:SPENT]->(t)
+        MERGE (b)-[:COLLECTED]->(t)
+        """,
+        uid=uid,
+        did=device_uid,
+        bid=meta.business_id,
+        tx_id=tx_id,
+        eco=contributed,
+        now_ms=now_ms,
+        now_iso=_now().isoformat(),
+        qr=meta.code,
+        first_visit=first_visit,
+        lat=(payload.lat if payload else None),
+        lng=(payload.lng if payload else None),
+    )
+
+    # AFTER — exactly like wallet/counter
+    balance_after = _youth_balance(s, uid)
+    if debug:
+        dbg["balance_after"] = balance_after
+
+    return ClaimResponse(
+        ok=True,
+        awarded_eco=contributed,
+        balance=balance_after,
+        business_name=meta.business_name,
+        location_name=meta.location_name,
+        tx_id=tx_id,
+        business_id=meta.business_id,
+        debug=dbg if debug else None,
+    )
 
 # ---------- attach offer (post-claim) [DEPRECATED] ----------
 @router.post("/tx/{tx_id}/attach_offer", response_model=AttachOfferResponse)

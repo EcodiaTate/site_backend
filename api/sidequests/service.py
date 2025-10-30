@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple, TypedDict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from uuid import uuid4
 from math import radians, sin, cos, asin, sqrt
+import os
 
+from fastapi import HTTPException
 from neo4j import Session
+
+from site_backend.core.urls import abs_media
 
 from .schema import (
     SidequestCreate, SidequestUpdate, SidequestOut,
@@ -13,9 +17,8 @@ from .schema import (
     UserProgressOut, RotationRequest, RotationResult,
 )
 
-# NEW: hook into gamification after awards
+# NEW: hook into gamification after awards (soft import to avoid load-order cycles)
 try:
-    # soft import to avoid circular import issues if modules load order changes
     from site_backend.api.gamification.service import evaluate_badges_for_user as _eval_badges
 except Exception:  # pragma: no cover
     _eval_badges = None
@@ -24,6 +27,10 @@ except Exception:  # pragma: no cover
 # -------- utils --------
 def _now_iso() -> str:
     return datetime.utcnow().isoformat()
+
+
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
 
 
 def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -203,11 +210,11 @@ def list_sidequests_all(
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-        chain_slug: CASE
-  WHEN sq.chain_id IS NULL THEN NULL
-  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
-  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE coalesce(properties(sq)['chain_slug'],
+                          replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-"))
+          END,
 
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -230,7 +237,7 @@ def _flatten_from_create(m: SidequestCreate) -> Dict[str, Any]:
     return {
         "kind": m.kind,
         "title": m.title,
-        "title_key": _title_key(m.title),   # <— add
+        "title_key": _title_key(m.title),
         "subtitle": m.subtitle,
         "description_md": m.description_md,
         "tags": m.tags,
@@ -493,11 +500,11 @@ def create_sidequest(session: Session, m: SidequestCreate, forced_id: Optional[s
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-        chain_slug: CASE
-  WHEN sq.chain_id IS NULL THEN NULL
-  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
-  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE coalesce(properties(sq)['chain_slug'],
+                          replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-"))
+          END,
 
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -622,11 +629,11 @@ def update_sidequest(session: Session, sidequest_id: str, u: SidequestUpdate) ->
       END,
       chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
       chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-     chain_slug: CASE
-  WHEN sq.chain_id IS NULL THEN NULL
-  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
-  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-END,
+      chain_slug: CASE
+        WHEN sq.chain_id IS NULL THEN NULL
+        ELSE coalesce(properties(sq)['chain_slug'],
+                      replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-"))
+      END,
 
       // override top-level temporal fields as ISO strings for Pydantic
       start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -705,11 +712,11 @@ def get_sidequest(session: Session, sidequest_id: str) -> SidequestOut:
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-         chain_slug: CASE
-  WHEN sq.chain_id IS NULL THEN NULL
-  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
-  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE coalesce(properties(sq)['chain_slug'],
+                          replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-"))
+          END,
 
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -820,11 +827,11 @@ def list_sidequests(
           END,
           chain_index: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE sq.chain_order END,
           chain_length: CASE WHEN sq.chain_id IS NULL THEN NULL ELSE _chain_len END,
-        chain_slug: CASE
-  WHEN sq.chain_id IS NULL THEN NULL
-  WHEN sq.chain_slug IS NOT NULL THEN sq.chain_slug
-  ELSE replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-")
-END,
+          chain_slug: CASE
+            WHEN sq.chain_id IS NULL THEN NULL
+            ELSE coalesce(properties(sq)['chain_slug'],
+                          replace(coalesce(sq.title_key, toLower(sq.title)), " ", "-"))
+          END,
 
           // override top-level temporal fields as ISO strings for Pydantic
           start_at: CASE WHEN sq.start_at IS NULL THEN NULL ELSE toString(sq.start_at) END,
@@ -836,7 +843,7 @@ END,
     return [_to_sidequest_out(dict(r["sq"])) for r in recs]
 
 
-# --- Add near other helpers ---
+# --- Chain prerequisite enforcement ---
 def ensure_chain_prereq(session: Session, sidequest_id: str, user_id: str):
     """
     Raise HTTP 403 if this sidequest is part of a chain that requires previous approval
@@ -868,7 +875,6 @@ def ensure_chain_prereq(session: Session, sidequest_id: str, user_id: str):
     """, {"cid": cid, "prev": prev_ord, "uid": user_id}).single()
 
     if not ok or not ok["pid"]:
-        # chain broken/malformed; be strict
         from fastapi import HTTPException, status
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN,
                             detail="Chain prerequisite not found")
@@ -879,8 +885,13 @@ def ensure_chain_prereq(session: Session, sidequest_id: str, user_id: str):
                             detail="Finish the previous chain step first")
 
 
-# -------- submissions & rewards --------
-def create_submission(session: Session, user_id: str, s: SubmissionCreate, media_meta: Optional[Dict[str, Any]]) -> SubmissionOut:
+# -------- submissions --------
+def create_submission(
+    session: Session,
+    user_id: str,
+    s: SubmissionCreate,
+    media_meta: Optional[Dict[str, Any]],
+) -> SubmissionOut:
     # Accept either 'sidequest_id' or legacy 'mission_id'
     sidequest_id = getattr(s, "sidequest_id", None) or getattr(s, "mission_id", None)
     if not sidequest_id:
@@ -889,86 +900,161 @@ def create_submission(session: Session, user_id: str, s: SubmissionCreate, media
     # Enforce chain prerequisite (server-side authority)
     ensure_chain_prereq(session, sidequest_id=sidequest_id, user_id=user_id)
 
-    # self import safe in same module
+    # safe self-import to fetch the sidequest (shape for geo/team checks)
     from .service import get_sidequest  # type: ignore
     m = get_sidequest(session, sidequest_id)
-    auto_checks: Dict[str, bool] = {}
 
-    auto_checks["within_radius"] = _within_radius(m.geo.model_dump() if m.geo else None, s.user_lat, s.user_lon)
+    # ---- auto checks (booleans only) ----
+    auto_checks: Dict[str, bool] = {}
+    auto_checks["within_radius"] = _within_radius(
+        m.geo.model_dump() if getattr(m, "geo", None) else None,
+        getattr(s, "user_lat", None),
+        getattr(s, "user_lon", None),
+    )
 
     phash = (media_meta or {}).get("phash")
     if s.method == "photo_upload" and phash:
-        rows = session.run("""
+        rows = session.run(
+            """
             MATCH (:User {id:$uid})-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(:Sidequest {id:$mid})
             WHERE sub.phash IS NOT NULL
             RETURN sub.phash AS phash
-        """, {"uid": user_id, "mid": sidequest_id}).value("phash")
+            """,
+            {"uid": user_id, "mid": sidequest_id},
+        ).value("phash")
         auto_checks["duplicate_media"] = phash in set(rows)
     else:
         auto_checks["duplicate_media"] = False
 
     tag_ok = False
     if s.method == "instagram_link":
-        if s.instagram_url:
+        if getattr(s, "instagram_url", None):
             u = str(s.instagram_url)
             tag_ok = any(t in u for t in ["#Ecodia", "ecodia", "eco_district", "ecopoints"])
-        if s.caption:
+        if getattr(s, "caption", None):
             cap = s.caption.lower()
             tag_ok = tag_ok or any(t in cap for t in ["#ecodia", "#ecodistrict", "#eco", "#wattle", "ecopoints"])
     auto_checks["insta_tag_heuristic"] = tag_ok
 
+    flags_true = [k for k, v in auto_checks.items() if bool(v)]
+
     team_id = None
-    if s.team_id and m.team and m.team.allowed:
+    if getattr(s, "team_id", None) and getattr(m, "team", None) and m.team.allowed:
         team_id = s.team_id
 
     sid = uuid4().hex
     now = _now_iso()
-    rec = session.run("""
+
+    # Prefer upload_id provided by the /media/upload endpoint — never persist FS paths
+    media_upload_id: Optional[str] = None
+    if getattr(s, "image_upload_id", None):
+        media_upload_id = (str(s.image_upload_id) or "").strip() or None
+        # guard: if a path sneaks in, keep just the filename
+        if media_upload_id and ("/" in media_upload_id or "\\" in media_upload_id):
+            media_upload_id = os.path.basename(media_upload_id)
+
+    # legacy/raw media string (URL or path) if the caller sent it
+    raw_media_url = (
+        (media_meta or {}).get("url")
+        or (media_meta or {}).get("media_url")
+        or (media_meta or {}).get("path")
+        or None
+    )
+
+    rec = session.run(
+        """
         MATCH (u:User {id:$uid}), (sq:Sidequest {id:$mid})
         MERGE (sub:Submission {id:$sid})
-        SET sub.method      = $method,
-            sub.state       = 'pending',
-            sub.created_at  = datetime($now),  // <- store as datetime
-            sub.auto_checks = $auto,
-            sub.media_url   = $media_url,
-            sub.instagram_url = $insta_url,
-            sub.caption     = $caption,
-            sub.user_lat    = $ulat,
-            sub.user_lon    = $ulon,
-            sub.phash       = $phash,
-            sub.team_id     = $team_id
+        SET sub.method          = $method,
+            sub.state           = 'pending',
+            sub.created_at      = datetime($now),
+            sub.flags           = $flags_true,
+            sub.media_upload_id = $media_upload_id,
+            sub.media_url       = $raw_media_url,   // legacy/raw; normalized in projection
+            sub.instagram_url   = $insta_url,
+            sub.caption         = $caption,
+            sub.user_lat        = $ulat,
+            sub.user_lon        = $ulon,
+            sub.phash           = $phash,
+            sub.team_id         = $team_id
         MERGE (u)-[:SUBMITTED]->(sub)
         MERGE (sub)-[:FOR]->(sq)
-        RETURN sub{.*, uid:u.id, mid:sq.id} AS sub
-    """, {
-        "uid": user_id, "mid": sidequest_id, "sid": sid, "now": now,
-        "method": s.method, "auto": auto_checks,
-        "media_url": (media_meta or {}).get("path"),
-        "phash": phash,
-        "insta_url": s.instagram_url, "caption": s.caption,
-        "ulat": s.user_lat, "ulon": s.user_lon,
-        "team_id": team_id,
-    }).single()
+        RETURN sub{
+          .*,
+          created_at: toString(sub.created_at),
+          reviewed_at: CASE WHEN sub.reviewed_at IS NULL THEN NULL ELSE toString(sub.reviewed_at) END,
+          uid: u.id,
+          mid: sq.id,
+          // normalize to a clean web path (prefer upload_id)
+          media_url: CASE
+            WHEN sub.media_upload_id IS NOT NULL AND sub.media_upload_id <> '' THEN '/uploads/' + sub.media_upload_id
+            WHEN sub.media_url IS NULL OR sub.media_url = '' THEN NULL
+            WHEN sub.media_url STARTS WITH '/uploads/' THEN sub.media_url
+            WHEN sub.media_url STARTS WITH 'http' THEN sub.media_url
+            ELSE '/uploads/' + replace(toString(sub.media_url), '/data/uploads/', '')
+          END
+        } AS sub
+        """,
+        {
+            "uid": user_id,
+            "mid": sidequest_id,
+            "sid": sid,
+            "now": now,
+            "method": s.method,
+            "flags_true": flags_true,
+            "media_upload_id": media_upload_id,
+            "raw_media_url": raw_media_url,
+            "phash": phash,
+            "insta_url": getattr(s, "instagram_url", None),
+            "caption": getattr(s, "caption", None),
+            "ulat": getattr(s, "user_lat", None),
+            "ulon": getattr(s, "user_lon", None),
+            "team_id": team_id,
+        },
+    ).single()
 
-    return _to_submission_out(dict(rec["sub"]))
+    sub = dict(rec["sub"])
+    # Prefix relative paths with PUBLIC_API_ORIGIN for the FE
+    sub["media_url"] = abs_media(sub.get("media_url"))
+    return _to_submission_out(sub)
 
 
 def moderate_submission(session: Session, submission_id: str, moderator_id: str, decision: ModerationDecision) -> SubmissionOut:
     now = _now_iso()
-    rec = session.run("""
+    rec = session.run(
+        """
         MATCH (sub:Submission {id:$sid})-[:FOR]->(sq:Sidequest)
-        SET sub.state = $state, sub.reviewed_at = $now, sub.notes = $notes
-        RETURN sub{.*, mid:sq.id} AS sub, sq
-    """, {"sid": submission_id, "state": decision.state, "now": now, "notes": decision.notes}).single()
+        OPTIONAL MATCH (u:User)-[:SUBMITTED]->(sub)
+        SET sub.state = $state, sub.reviewed_at = datetime($now), sub.notes = $notes
+        RETURN
+          sub{
+            .*,
+            created_at: toString(sub.created_at),
+            reviewed_at: CASE WHEN sub.reviewed_at IS NULL THEN NULL ELSE toString(sub.reviewed_at) END,
+            mid: sq.id,
+            uid: u.id,
+            media_url: CASE
+              WHEN sub.media_url IS NULL OR sub.media_url = '' THEN
+                CASE WHEN sub.media_upload_id IS NULL THEN NULL ELSE '/uploads/' + sub.media_upload_id END
+              WHEN sub.media_url STARTS WITH '/uploads/' THEN sub.media_url
+              WHEN sub.media_url STARTS WITH 'http' THEN sub.media_url
+              ELSE '/uploads/' + replace(toString(sub.media_url), '/data/uploads/', '')
+            END
+          } AS sub
+        """,
+        {"sid": submission_id, "state": decision.state, "now": now, "notes": decision.notes},
+    ).single()
+
+    if not rec:
+        raise HTTPException(status_code=404, detail="Submission not found")
 
     sub = dict(rec["sub"])
+    sub["media_url"] = abs_media(sub.get("media_url"))
+
     if decision.state == "approved":
         _award_on_approval(session, submission_id)
-
-        # 🔥 Gamification hook: evaluate badges after every approval.
         try:
             if _eval_badges:
-                # Pass current active Season if present
                 cur_ss = session.run(
                     "MATCH (ss:Season) WHERE ss.start <= datetime() AND ss.end > datetime() RETURN ss LIMIT 1"
                 ).single()
@@ -977,14 +1063,14 @@ def moderate_submission(session: Session, submission_id: str, moderator_id: str,
                 if uid:
                     _ = _eval_badges(session, uid=uid, season_id=season_id)
         except Exception:
-            # don’t block approval if eval fails; logs can capture this server-side
             pass
 
     return _to_submission_out(sub)
 
 
 def _award_on_approval(session: Session, submission_id: str) -> None:
-    rec = session.run("""
+    rec = session.run(
+        """
         MATCH (u:User)-[:SUBMITTED]->(sub:Submission {id:$sid})-[:FOR]->(sq:Sidequest)
         RETURN u.id AS uid, sq.id AS mid, coalesce(sq.reward_eco,0) AS eco,
                coalesce(sq.xp_reward,0) AS xp,
@@ -994,7 +1080,9 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
                sq.streak_max_steps AS streak_cap,
                sq.team_allowed AS team_allowed,
                sub.team_id AS sub_team
-    """, {"sid": submission_id}).single()
+        """,
+        {"sid": submission_id},
+    ).single()
 
     uid = rec["uid"]; mid = rec["mid"]
     eco = rec["eco"]; xp = rec["xp"]
@@ -1002,10 +1090,15 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
     streak_period = rec["streak_period"]; streak_bonus = rec["streak_bonus"]; streak_cap = rec["streak_cap"]
     team_allowed = rec["team_allowed"]; sub_team = rec["sub_team"]
 
-    row = session.run("""
+    # prior approvals for cooldown/max count (exclude this submission)
+    row = session.run(
+        """
         MATCH (:User {id:$uid})-[:SUBMITTED]->(s:Submission {state:'approved'})-[:FOR]->(:Sidequest {id:$mid})
+        WHERE s.id <> $sid
         RETURN count(s) AS c, toString(max(datetime(s.created_at))) AS last_ts
-    """, {"uid": uid, "mid": mid}).single()
+        """,
+        {"uid": uid, "mid": mid, "sid": submission_id},
+    ).single()
     count, last_ts = row["c"], row["last_ts"]
 
     if max_c and count >= max_c:
@@ -1019,54 +1112,82 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
     bonus = 0
     if streak_period and streak_bonus:
         if streak_period == "weekly":
-            prev = session.run("""
+            prev = session.run(
+                """
                 MATCH (:User {id:$uid})-[:SUBMITTED]->(s:Submission {state:'approved'})
+                WHERE s.id <> $sid
                 WITH s, date(datetime(s.created_at)) AS d
                 RETURN d.year AS y, d.week AS w
                 ORDER BY y DESC, w DESC
                 LIMIT 1
-            """, {"uid": uid}).single()
+                """,
+                {"uid": uid, "sid": submission_id},
+            ).single()
             if prev:
                 ty, tw, _ = date.today().isocalendar()
                 if (prev["y"], prev["w"] + 1) == (ty, tw):
                     bonus = streak_bonus
         elif streak_period == "daily":
-            prev = session.run("""
+            prev = session.run(
+                """
                 MATCH (:User {id:$uid})-[:SUBMITTED]->(s:Submission {state:'approved'})
+                WHERE s.id <> $sid
                 RETURN max(date(datetime(s.created_at))) AS d
-            """, {"uid": uid}).single()
+                """,
+                {"uid": uid, "sid": submission_id},
+            ).single()
             if prev and prev["d"]:
                 if prev["d"] == date.today() - timedelta(days=1):
                     bonus = streak_bonus
 
     eco_total = int(eco) + int(bonus)
 
-    # Canonical ECO/XP transaction
+    # Canonical ECO/XP transaction (settled) — include createdAt (ms) + normalized kind
     tid = uuid4().hex
     now = _now_iso()
-    session.run("""
-        MATCH (u:User {id:$uid}), (sub:Submission {id:$sid})-[:FOR]->(sq:Sidequest {id:$mid})
-        MERGE (t:EcoTransaction:EcoTx {id:$tid})
-        SET t.eco    = $eco,
-            t.xp     = $xp,
-            t.bonus  = $bonus,
-            t.at     = datetime($now),
-            t.source = "sidequest",
-            t.reason = "sidequest_reward",
-            t.status = "settled"
+    created_ms = _now_ms()
+    session.run(
+        """
+        // inside _award_on_approval
+        MERGE (t:EcoTx {id: $sid})          // use submission_id as tx id
+        SET  t.eco       = $eco,
+            t.xp        = $xp,
+            t.bonus     = $bonus,
+            t.at        = datetime($now),
+            t.createdAt = coalesce(t.createdAt, timestamp(datetime($now))),
+            t.kind      = 'MINT_ACTION',
+            t.source    = 'sidequest',
+            t.reason    = 'sidequest_reward',
+            t.status    = 'settled'
         MERGE (u)-[:EARNED]->(t)
         MERGE (t)-[:FOR]->(sq)
         MERGE (t)-[:PROOF]->(sub)
-    """, {"uid": uid, "sid": submission_id, "mid": mid, "tid": tid, "eco": eco_total, "xp": xp, "bonus": bonus, "now": now})
+
+        """,
+        {
+            "uid": uid,
+            "sid": submission_id,
+            "mid": mid,
+            "tid": tid,
+            "eco": eco_total,
+            "xp": xp,
+            "bonus": bonus,
+            "now": now,
+            "created_ms": created_ms,
+        },
+    )
 
     if team_allowed and sub_team:
         tbid = uuid4().hex
-        session.run("""
+        session.run(
+            """
             MATCH (t:EcoTx {id:$tid})
             MERGE (tb:TeamBonus {id:$tbid})
             SET tb.team_id = $team_id, tb.eco = 0, tb.at = datetime($now)
             MERGE (t)-[:TEAM_BONUS]->(tb)
-        """, {"tid": tid, "tbid": tbid, "team_id": sub_team, "now": now})
+            """,
+            {"tid": tid, "tbid": tbid, "team_id": sub_team, "now": now},
+        )
 
 
 # -------- progress & rotation --------
@@ -1199,7 +1320,7 @@ def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str,
       - If 'id' absent → create (auto id)
     Returns: {"created": int, "updated": int, "errors": [str, ...]}
     """
-    import json, traceback
+    import traceback
 
     created = 0
     updated = 0
@@ -1269,7 +1390,7 @@ def get_chain_context(
         OPTIONAL MATCH (:User {id:$uid})-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(dsq:Sidequest)
         WHERE $uid IS NOT NULL AND dsq.chain_id = $cid
         WITH steps, collect(dsq.id) AS done_ids
-        // derive slug from first step's title_key/title (kept for later if you add a chain page)
+        // derive slug from first step's title_key/title
         WITH steps, done_ids,
              CASE
                WHEN size(steps) = 0 THEN 'chain'
@@ -1281,8 +1402,7 @@ def get_chain_context(
                {
                  id:      steps[i].id,
                  title:   steps[i].title,
-                 // SAFE: use an in-page anchor the UI already handles
-                 href:    '#sq-' + steps[i].id,
+                 href:    '#sq-' + steps[i].id, // in-page anchor for UI
                  order:   coalesce(steps[i].chain_order, i),
                  done:    steps[i].id IN done_ids,
                  locked:  coalesce(steps[i].chain_requires_prev, false)

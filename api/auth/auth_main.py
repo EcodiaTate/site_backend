@@ -493,3 +493,52 @@ def r_admin_cookie(
         max_age=6*60*60,
     )
     return {"ok": True}
+
+# --- Add with your other Pydantic models ---
+class MinimalJoinIn(BaseModel):
+    email: EmailStr
+    password: str = Field(min_length=6)
+    role: str = Field(pattern="^(youth|business|creative|partner|public)$")
+
+
+# --- New endpoint: creates only (u:User {role}) with no profile node ---
+@router.post("/join/minimal", response_model=UserOut)
+def join_minimal(p: MinimalJoinIn, s: Session = Depends(session_dep)):
+    role = p.role.lower()
+    if role not in ROLE_DEFAULT_CAPS:
+        raise HTTPException(status_code=400, detail="Unknown role")
+
+    uid = str(uuid4())
+    hash_ = ph.hash(p.password)
+    caps_json = json.dumps(ROLE_DEFAULT_CAPS[role])
+
+    cypher = """
+    CREATE (u:User {
+      id:$id, email:$email, password_hash:$hash, role:$role,
+      created_at:datetime(), caps_json:$caps_json
+    })
+    RETURN u
+    """
+    try:
+        rec = s.run(
+            cypher,
+            id=uid,
+            email=p.email.lower(),
+            hash=hash_,
+            role=role,
+            caps_json=caps_json,
+        ).single()
+        if not rec:
+            raise HTTPException(status_code=500, detail="No record returned from Neo4j")
+        u = rec["u"]
+        return {
+            "id": u["id"],
+            "email": u["email"],
+            "role": u["role"],
+            "caps": _safe_caps(u.get("caps_json"), role),
+            "profile": {},  # deliberately empty: profiles are created later
+        }
+    except ConstraintError:
+        raise HTTPException(status_code=409, detail="That email is already registered. Try logging in, or reset your password.")
+    except Exception:
+        raise HTTPException(status_code=400, detail="We couldn't create your account. Please try again.")

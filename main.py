@@ -32,6 +32,7 @@ from pydantic import ValidationError
 
 from neo4j import Driver
 from neo4j.exceptions import Neo4jError
+from site_backend.core.paths import UPLOAD_ROOT
 
 # --- internal imports ---------------------------------------------------------
 from site_backend.core.admin_guard import require_admin, JWT_SECRET, JWT_ALGO
@@ -41,7 +42,7 @@ from site_backend.core import admin_cookie
 from site_backend.api import auth, profile, stats, launchpad, gamification
 from site_backend.api.eco_home import home_routes
 from site_backend.api.eyba import router as eyba_router
-from site_backend.api.sidequests.routers import router as sidequest_router
+from site_backend.api.sidequests import router as sidequest_router
 from site_backend.api.leaderboards import leaderboards
 from site_backend.api.account_delete import router as account_delete_router
 from site_backend.api.notifications import router as notif_router
@@ -63,7 +64,10 @@ ALLOWED_ORIGINS = [
     if o.strip()
 ]
 ERROR_DETAIL = os.getenv("ERROR_DETAIL", "verbose").lower()  # "verbose" | "minimal"
-
+# Upload root: .env wins; otherwise default to <repo>/site_backend/data/uploads
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # .../EcodiaOS/site_backend
+DEFAULT_UPLOAD_ROOT = os.path.normpath(os.path.join(BASE_DIR, "data", "uploads"))
+UPLOAD_ROOT = os.path.abspath(os.getenv("UPLOAD_ROOT", DEFAULT_UPLOAD_ROOT))
 # --- debug router -------------------------------------------------------------
 debug_router = APIRouter()
 
@@ -174,6 +178,8 @@ def create_app() -> FastAPI:
         expose_headers=["X-Owner-Token", "X-Auth-Token"],
     )
 
+    app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
+    print(f"[uploads] serving from: {UPLOAD_ROOT}")  # dev visibility
     # Optional request logger for owner token (dev-only)
     if os.getenv("LOG_OWNER_TOKEN", "0") == "1":
         @app.middleware("http")
@@ -183,14 +189,7 @@ def create_app() -> FastAPI:
                 pid = request.url.path.rsplit("/", 1)[-1]
                 print(f"[owner GET] id={pid} X-Owner-Token={'<present>' if tok else '<missing>'}")
             return await call_next(request)
-
-    # Static /img
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    static_img_dir = os.path.join(base_dir, "static", "img")
-    os.makedirs(static_img_dir, exist_ok=True)
-    app.mount("/img", StaticFiles(directory=static_img_dir), name="img")
-
-    # Routers
+   
     app.include_router(debug_router)
     app.include_router(eyba_router)
     app.include_router(auth.router, prefix="/auth", tags=["auth"])

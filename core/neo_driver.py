@@ -25,6 +25,17 @@ def ensure_constraints(driver: Driver) -> None:
         "CREATE CONSTRAINT privacy_prefs_user IF NOT EXISTS FOR (p:PrivacyPrefs) REQUIRE p.user_id IS UNIQUE",
         # NEW: export job ids
         "CREATE CONSTRAINT export_job_id IF NOT EXISTS FOR (j:DataExportJob) REQUIRE j.id IS UNIQUE",
+        # EcoTx / Submission / Sidequest safety
+        "CREATE CONSTRAINT ecotx_id IF NOT EXISTS FOR (t:EcoTx) REQUIRE t.id IS UNIQUE",
+        "CREATE INDEX ecotx_createdAt IF NOT EXISTS FOR (t:EcoTx) ON (t.createdAt)",
+        "CREATE INDEX ecotx_status_kind IF NOT EXISTS FOR (t:EcoTx) ON (t.status, t.kind)",
+
+        "CREATE CONSTRAINT submission_id IF NOT EXISTS FOR (s:Submission) REQUIRE s.id IS UNIQUE",
+        "CREATE INDEX submission_state_created IF NOT EXISTS FOR (s:Submission) ON (s.state, s.created_at)",
+
+        "CREATE INDEX sidequest_chain_idx IF NOT EXISTS FOR (sq:Sidequest) ON (sq.chain_id, sq.chain_order)",
+        "CREATE INDEX sidequest_title_key IF NOT EXISTS FOR (sq:Sidequest) ON (sq.title_key)",
+
     ]
     with driver.session() as s:
         for q in stmts:

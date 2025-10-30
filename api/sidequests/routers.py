@@ -1,10 +1,9 @@
-# site_backend/api/sidequests/routes.py
 from __future__ import annotations
 
 from typing import List, Optional, Any, Dict
-from fastapi import APIRouter, Depends, File, UploadFile, Query, HTTPException, status
+from fastapi import APIRouter, Depends, File, UploadFile, Query, HTTPException, status, Request
 from neo4j import Session
-import csv, io, json
+import csv, io, json, os
 from datetime import date, datetime
 
 from .schema import (
@@ -16,37 +15,36 @@ from .service import (
     create_sidequest, update_sidequest, get_sidequest, list_sidequests,
     create_submission, moderate_submission, bulk_upsert,
     get_user_progress, rotate_weekly_sidequests, list_sidequests_all, get_chain_context,
-    ensure_chain_prereq,  # ← enforce chain rules before accepting submissions
+    ensure_chain_prereq,
 )
-from .media import save_image_and_fingerprints
+from .media_utils import save_image_and_fingerprints
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.admin_guard import require_admin
 from site_backend.core.user_guard import current_user_id
 
+# ---------------------------------------------------------------------
+# MAIN ROUTER: /sidequests
+# ---------------------------------------------------------------------
 router = APIRouter(prefix="/sidequests", tags=["sidequests"])
 
-# -----------------------------------------------------------------------------
-# Admin-only
-# -----------------------------------------------------------------------------
+# ---------------- Admin-only ----------------
 
 @router.post("", response_model=SidequestOut)
 def r_create_sidequest(
     payload: SidequestCreate,
     session: Session = Depends(session_dep),
-    admin_email: str = Depends(require_admin),
+    _admin: str = Depends(require_admin),
 ):
     return create_sidequest(session, payload)
-
 
 @router.patch("/{sidequest_id}", response_model=SidequestOut)
 def r_update_sidequest(
     sidequest_id: str,
     payload: SidequestUpdate,
     session: Session = Depends(session_dep),
-    admin_email: str = Depends(require_admin),
+    _admin: str = Depends(require_admin),
 ):
     return update_sidequest(session, sidequest_id, payload)
-
 
 @router.get("/all", response_model=List[SidequestOut])
 def r_list_sidequests_all(
@@ -58,45 +56,27 @@ def r_list_sidequests_all(
     cap: int = Query(default=5000, ge=1, le=10000),
     session: Session = Depends(session_dep),
 ):
-    """
-    Return up to `cap` sidequests (no paging). Intended for client pickers/search.
-    """
     return list_sidequests_all(
-        session,
-        kind=kind,
-        status=status,
-        q=q,
-        tag=tag,
-        locality=locality,
-        cap=cap,
+        session, kind=kind, status=status, q=q, tag=tag, locality=locality, cap=cap
     )
-
 
 @router.post("/bulk", response_model=BulkUpsertResult)
 def r_bulk_upsert(
     sidequests: List[dict],
     session: Session = Depends(session_dep),
-    admin_email: str = Depends(require_admin),
+    _admin: str = Depends(require_admin),
 ):
     return BulkUpsertResult(**bulk_upsert(session, sidequests))
-
 
 @router.post("/rotate-weekly", response_model=RotationResult)
 def r_rotate_weekly(
     payload: RotationRequest,
     session: Session = Depends(session_dep),
-    admin_email: str = Depends(require_admin),
+    _admin: str = Depends(require_admin),
 ):
-    """
-    Admin trigger to (re)assign weekly sidequests for the given ISO week.
-    Non-destructive: sets rotation flags on Sidequest nodes and carries forward chains.
-    """
     return rotate_weekly_sidequests(session, payload)
 
-
-# -----------------------------------------------------------------------------
-# Chain Context
-# -----------------------------------------------------------------------------
+# ---------------- Chain Context ----------------
 
 @router.get("/{sidequest_id}/chain")
 def r_get_chain_context(
@@ -104,16 +84,12 @@ def r_get_chain_context(
     session: Session = Depends(session_dep),
     uid: Optional[str] = Depends(current_user_id),
 ):
-    """
-    Return an ordered, user-aware view of a chain for the given sidequest.
-    """
     rec = session.run(
         "MATCH (sq:Sidequest {id:$id}) RETURN sq.chain_id AS cid",
         {"id": sidequest_id},
     ).single()
     if not rec or not rec["cid"]:
         return {"chain_id": None, "slug": "chain", "steps": [], "current_index": 0}
-
     return get_chain_context(
         session,
         chain_id=rec["cid"],
@@ -121,10 +97,7 @@ def r_get_chain_context(
         current_sidequest_id=sidequest_id,
     )
 
-
-# -----------------------------------------------------------------------------
-# Public / User
-# -----------------------------------------------------------------------------
+# ---------------- Public / User ----------------
 
 @router.get("", response_model=List[SidequestOut])
 def r_list_sidequests(
@@ -148,25 +121,9 @@ def r_list_sidequests(
         skip=skip,
     )
 
-
 @router.get("/{sidequest_id}", response_model=SidequestOut)
 def r_get_sidequest(sidequest_id: str, session: Session = Depends(session_dep)):
     return get_sidequest(session, sidequest_id)
-
-
-@router.post("/media/upload")
-async def r_upload_media(file: UploadFile = File(...)):
-    """
-    Upload an image and compute fingerprints (e.g., phash) server-side.
-    Returns an opaque upload_id (path) and metadata.
-    """
-    data = await file.read()
-    path, meta = save_image_and_fingerprints(
-        data,
-        ext_hint=f".{file.filename.split('.')[-1]}",
-    )
-    return {"upload_id": path, "meta": meta}
-
 
 @router.post("/submissions", response_model=SubmissionOut)
 def r_submit_verification(
@@ -174,102 +131,70 @@ def r_submit_verification(
     session: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
-    """
-    Submit proof for a sidequest. Enforces 'requires_prev_approved' on chains.
-    """
     # Enforce chain prerequisites (403 if previous step not approved)
-    try:
-        ensure_chain_prereq(session, sidequest_id=payload.sidequest_id, user_id=user_id)
-    except HTTPException:
-        # propagate FastAPI HTTPException from ensure_chain_prereq
-        raise
+    ensure_chain_prereq(session, sidequest_id=payload.sidequest_id, user_id=user_id)
 
     media_meta: Dict[str, Any] = {}
-    if payload.image_upload_id:
-        media_meta = {"path": payload.image_upload_id}
+    upload_id = None
+    if getattr(payload, "image_upload_id", None):
+        raw = str(payload.image_upload_id).strip()
+        if raw:
+            upload_id = os.path.basename(raw)  # keep just the filename
+            media_meta = {
+                "upload_id": upload_id,                 # persisted as sub.media_upload_id
+                "url": f"/uploads/{upload_id}",         # convenient legacy/raw string
+            }
 
     return create_submission(session, user_id, payload, media_meta)
-
 
 @router.get("/me/progress", response_model=UserProgressOut)
 def r_my_progress(
     session: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
-    """
-    Snapshot of user progress (recent approvals, cooldowns, streaks, etc).
-    """
-    try:
-        return get_user_progress(session, user_id)
-    except Exception as e:
-        import logging
-        logging.getLogger("api").exception("progress failed for %s", user_id)
-        raise HTTPException(
-            status_code=500,
-            detail={"ok": False, "error": "Database error", "message": str(e).splitlines()[0]},
-        )
+    return get_user_progress(session, user_id)
 
-
-# -----------------------------------------------------------------------------
-# CSV Bulk Upload (full schema, tolerant)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------
+# CSV Bulk Upload (unchanged helpers + endpoint)
+# ---------------------------------------------------------------------
 
 def _parse_bool(v: Optional[str]) -> Optional[bool]:
     if v is None:
         return None
     s = str(v).strip().lower()
-    if s in {"1", "true", "yes", "y", "t"}:
-        return True
-    if s in {"0", "false", "no", "n", "f"}:
-        return False
+    if s in {"1", "true", "yes", "y", "t"}: return True
+    if s in {"0", "false", "no", "n", "f"}: return False
     return None
 
-
 def _parse_int(v: Optional[str]) -> Optional[int]:
-    if v is None or str(v).strip() == "":
-        return None
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return None
-
+    if v is None or str(v).strip() == "": return None
+    try: return int(str(v).strip())
+    except Exception: return None
 
 def _parse_float(v: Optional[str]) -> Optional[float]:
-    if v is None or str(v).strip() == "":
-        return None
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return None
-
+    if v is None or str(v).strip() == "": return None
+    try: return float(str(v).strip())
+    except Exception: return None
 
 def _parse_list(v: Optional[str]) -> Optional[List[str]]:
-    if v is None:
-        return None
+    if v is None: return None
     s = str(v).strip()
-    if not s:
-        return None
+    if not s: return None
     parts = [p.strip() for p in s.replace("|", ",").split(",")]
     return [p for p in parts if p]
 
-
 def _maybe_json(v: Optional[str]) -> Optional[dict]:
-    if v is None:
-        return None
+    if v is None: return None
     s = str(v).strip()
-    if not s:
-        return None
+    if not s: return None
     try:
         obj = json.loads(s)
         return obj if isinstance(obj, dict) else None
     except Exception:
         return None
 
-
 def _clean_nested(d: Dict[str, Any]) -> Dict[str, Any]:
-    """Drop keys that are None/''/[]/{} so we can decide if the group is actually present."""
     return {k: v for k, v in d.items() if v not in (None, "", [], {})}
-
 
 _DIFFICULTY_MAP = {
     "1": "easy", "easy": "easy", "e": "easy",
@@ -283,42 +208,23 @@ _IMPACT_MAP = {
 }
 _PERIOD_MAP = {"daily": "daily", "d": "daily", "weekly": "weekly", "w": "weekly"}
 
-
 def _norm_difficulty(v: Optional[str]) -> Optional[str]:
-    if v is None or str(v).strip() == "":
-        return None
+    if v is None or str(v).strip() == "": return None
     s = str(v).strip().lower()
     return _DIFFICULTY_MAP.get(s, s)
 
-
 def _norm_impact(v: Optional[str]) -> Optional[str]:
-    if v is None or str(v).strip() == "":
-        return None
+    if v is None or str(v).strip() == "": return None
     s = str(v).strip().lower()
     return _IMPACT_MAP.get(s, s)
 
-
 def _norm_period(v: Optional[str]) -> Optional[str]:
-    if v is None or str(v).strip() == "":
-        return None
+    if v is None or str(v).strip() == "": return None
     s = str(v).strip().lower()
     return _PERIOD_MAP.get(s, s)
 
-
 def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
-    """
-    Convert one CSV row into a SidequestCreate/Update-compatible dict.
-
-    Supports either:
-      - Prefixed columns like "pills.difficulty", "geo.lat", etc.
-      - Or full JSON in a single column e.g. "pills", "geo", etc.
-
-    Lists: "tags", "verification_methods" accept comma/pipe separated values.
-    Empty nested groups are ignored (not included in the output), so validation won't fire.
-    """
     out: Dict[str, Any] = {}
-
-    # --- top-level simple fields ---
     out["id"] = (row.get("id") or "").strip() or None
     out["kind"] = (row.get("kind") or "").strip() or None
     out["title"] = (row.get("title") or "").strip() or None
@@ -328,27 +234,22 @@ def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
     out["xp_reward"] = _parse_int(row.get("xp_reward"))
     out["max_completions_per_user"] = _parse_int(row.get("max_completions_per_user"))
     out["cooldown_days"] = _parse_int(row.get("cooldown_days"))
-    out["start_at"] = (row.get("start_at") or "").strip() or None   # ISO string
-    out["end_at"] = (row.get("end_at") or "").strip() or None       # ISO string
+    out["start_at"] = (row.get("start_at") or "").strip() or None
+    out["end_at"] = (row.get("end_at") or "").strip() or None
     out["status"] = (row.get("status") or "").strip() or None
     out["hero_image"] = (row.get("hero_image") or "").strip() or None
     out["card_accent"] = (row.get("card_accent") or "").strip() or None
 
     tags = _parse_list(row.get("tags"))
-    if tags is not None:
-        out["tags"] = tags
+    if tags is not None: out["tags"] = tags
 
     vms = _parse_list(row.get("verification_methods"))
-    if vms is not None:
-        out["verification_methods"] = vms
+    if vms is not None: out["verification_methods"] = vms
 
-    # --- nested helpers ---
     def prefixed(ns: str) -> Dict[str, str]:
         p = f"{ns}."
-        # keep only non-empty string values
         return {k[len(p):]: v for k, v in row.items() if k.startswith(p) and str(v or "").strip() != ""}
 
-    # pills
     pills_raw = _maybe_json(row.get("pills")) or {}
     pills_raw |= prefixed("pills")
     pills_norm = {
@@ -359,10 +260,8 @@ def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
         "facts": _parse_list(pills_raw.get("facts")),
     }
     pills_final = _clean_nested(pills_norm)
-    if pills_final:
-        out["pills"] = pills_final
+    if pills_final: out["pills"] = pills_final
 
-    # geo (strict: only include when BOTH lat & lon are present; special-case Anywhere)
     geo_raw = _maybe_json(row.get("geo")) or {}
     geo_raw |= prefixed("geo")
     locality_val = (geo_raw.get("locality") or "").strip()
@@ -371,26 +270,21 @@ def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
 
     if any(k in geo_raw for k in ("lat", "lon", "radius_m", "locality")):
         if (locality_val.lower() in ("anywhere", "") and (lat_val is None or lon_val is None)):
-            # user is saying Anywhere → drop geo completely
             pass
         else:
             if lat_val is None or lon_val is None:
-                # hard error so it surfaces as a row error (but doesn't abort the whole job)
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
                     detail="geo.lat and geo.lon are required when any geo.* is provided (unless locality is 'Anywhere')",
                 )
             geo_norm = {
-                "lat": lat_val,
-                "lon": lon_val,
+                "lat": lat_val, "lon": lon_val,
                 "radius_m": _parse_int(geo_raw.get("radius_m")),
                 "locality": locality_val or None,
             }
             geo_final = _clean_nested(geo_norm)
-            if geo_final:
-                out["geo"] = geo_final
+            if geo_final: out["geo"] = geo_final
 
-    # streak
     streak_raw = _maybe_json(row.get("streak")) or {}
     streak_raw |= prefixed("streak")
     streak_norm = {
@@ -400,10 +294,8 @@ def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
         "max_steps": _parse_int(streak_raw.get("max_steps")),
     }
     streak_final = _clean_nested(streak_norm)
-    if streak_final:
-        out["streak"] = streak_final
+    if streak_final: out["streak"] = streak_final
 
-    # rotation (only meaningful if is_weekly_slot true)
     rotation_raw = _maybe_json(row.get("rotation")) or {}
     rotation_raw |= prefixed("rotation")
     is_weekly = _parse_bool(rotation_raw.get("is_weekly_slot"))
@@ -413,14 +305,12 @@ def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
             "iso_year": _parse_int(rotation_raw.get("iso_year")),
             "iso_week": _parse_int(rotation_raw.get("iso_week")),
             "slot_index": _parse_int(rotation_raw.get("slot_index")),
-            "starts_on": (rotation_raw.get("starts_on") or "").strip() or None,  # YYYY-MM-DD
-            "ends_on": (rotation_raw.get("ends_on") or "").strip() or None,      # YYYY-MM-DD
+            "starts_on": (rotation_raw.get("starts_on") or "").strip() or None,
+            "ends_on": (rotation_raw.get("ends_on") or "").strip() or None,
         }
         rotation_final = _clean_nested(rotation_norm)
-        if rotation_final:
-            out["rotation"] = rotation_final
+        if rotation_final: out["rotation"] = rotation_final
 
-    # chain
     chain_raw = _maybe_json(row.get("chain")) or {}
     chain_raw |= prefixed("chain")
     chain_id = (chain_raw.get("chain_id") or "").strip()
@@ -431,10 +321,8 @@ def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
             "requires_prev_approved": _parse_bool(chain_raw.get("requires_prev_approved")),
         }
         chain_final = _clean_nested(chain_norm)
-        if chain_final:
-            out["chain"] = chain_final
+        if chain_final: out["chain"] = chain_final
 
-    # team (only if allowed true)
     team_raw = _maybe_json(row.get("team")) or {}
     team_raw |= prefixed("team")
     allowed = _parse_bool(team_raw.get("allowed"))
@@ -446,37 +334,16 @@ def _row_to_sidequest_dict(row: Dict[str, str]) -> Dict[str, Any]:
             "team_bonus_eco": _parse_int(team_raw.get("team_bonus_eco")),
         }
         team_final = _clean_nested(team_norm)
-        if team_final:
-            out["team"] = team_final
+        if team_final: out["team"] = team_final
 
-    # prune top-level empties
     return {k: v for k, v in out.items() if v is not None}
-
 
 @router.post("/bulk/csv", response_model=BulkUpsertResult)
 async def r_bulk_upsert_csv(
     file: UploadFile = File(...),
     session: Session = Depends(session_dep),
-    admin_email: str = Depends(require_admin),
+    _admin: str = Depends(require_admin),
 ):
-    """
-    CSV bulk upsert for Sidequests.
-
-    Accepts columns:
-      - Top-level: id, kind, title, subtitle, description_md, reward_eco, xp_reward,
-                   max_completions_per_user, cooldown_days, tags, verification_methods,
-                   start_at, end_at, status, hero_image, card_accent
-      - Nested via prefixes or JSON:
-          pills.*      (difficulty, impact, time_estimate_min, materials, facts)
-          geo.*        (lat, lon, radius_m, locality)
-          streak.*     (name, period, bonus_eco_per_step, max_steps)
-          rotation.*   (is_weekly_slot, iso_year, iso_week, slot_index, starts_on, ends_on)
-          chain.*      (chain_id, chain_order, requires_prev_approved)
-          team.*       (allowed, min_size, max_size, team_bonus_eco)
-
-    Lists accept comma or pipe separators. Booleans accept 1/0, true/false, yes/no.
-    If 'id' is present → update; else → create.
-    """
     try:
         raw = await file.read()
         text = raw.decode("utf-8-sig")
@@ -489,7 +356,7 @@ async def r_bulk_upsert_csv(
         raise HTTPException(status_code=400, detail=f"Invalid CSV: {e}")
 
     rows: List[Dict[str, Any]] = []
-    for i, row in enumerate(reader, start=2):  # start=2 to account for header line=1
+    for i, row in enumerate(reader, start=2):
         try:
             payload = _row_to_sidequest_dict(row)
             rows.append(payload)
@@ -499,7 +366,6 @@ async def r_bulk_upsert_csv(
             nonempty_keys = [k for k, v in row.items() if str(v or '').strip() != ""]
             rows.append({"__row_error__": f"line {i}: {type(e).__name__}: {e} (keys={nonempty_keys})"})
 
-    # Separate valid rows vs converter errors
     valid_payloads: List[Dict[str, Any]] = []
     conversion_errors: List[str] = []
     for payload in rows:
@@ -508,9 +374,43 @@ async def r_bulk_upsert_csv(
         else:
             valid_payloads.append(payload)
 
-    # Use existing JSON bulk upsert
     result = bulk_upsert(session, valid_payloads)
     if conversion_errors:
         result["errors"] = (result.get("errors") or []) + conversion_errors
 
     return BulkUpsertResult(**result)
+
+# ---------------------------------------------------------------------
+# MEDIA ROUTER: /sidequests/media
+# ---------------------------------------------------------------------
+media_router = APIRouter(prefix="/sidequests/media", tags=["Sidequest Media"])
+ALLOWED = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}
+
+@media_router.post("/upload")
+async def upload_sidequest_media(
+    request: Request,
+    file: UploadFile = File(...),
+    uid: str = Depends(current_user_id),
+):
+    if file.content_type not in ALLOWED:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported image type")
+
+    content = await file.read()
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Image too large")
+
+    ext = ALLOWED[file.content_type]
+    fs_path, meta = save_image_and_fingerprints(content, ext_hint=ext)
+
+    filename = os.path.basename(fs_path)
+    base = str(request.base_url).rstrip("/")
+    public_url = f"{base}/uploads/{filename}"
+
+    return {
+        "ok": True,
+        "upload_id": filename,
+        "url": public_url,
+        "path": fs_path,
+        "meta": meta,
+    }
+
