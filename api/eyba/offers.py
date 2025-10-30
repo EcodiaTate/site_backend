@@ -28,10 +28,13 @@ router = APIRouter(prefix="/eyba", tags=["eyba"])
 # ============================================================
 
 _OWNS_EDGES = (":OWNS|:MANAGES",)  # used in Cypher string
-VOUCHER_TTL_MIN = 15  # one-time QR lifetime
+VOUCHER_TTL_MIN = 15               # one-time QR lifetime
 
 def now_ms() -> int:
     return int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+
+def now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
 
 def short_code() -> str:
     # short voucher-ish code (you can swap to ULID/nanoid)
@@ -123,6 +126,30 @@ def _assert_voucher_belongs_to_user_business(s: Session, user_id: str, voucher_c
         "eco_price": int(rec["eco_price"] or 0),
         "business_id": rec["business_id"],
     }
+
+# -------- balance helper (PARITY with wallet/counter) --------
+def _user_wallet_balance(s: Session, user_id: str) -> int:
+    row = s.run(
+        """
+        // Earned (posted)
+        CALL {
+          WITH $uid AS uid
+          OPTIONAL MATCH (:User {id: uid})-[:EARNED]->(te:EcoTx {status:'settled'})
+          WHERE te.kind IN ['MINT_ACTION']
+          RETURN coalesce(sum(toInteger(coalesce(te.amount, te.eco, 0))), 0) AS earned
+        }
+        // Spent (posted)
+        CALL {
+          WITH $uid AS uid
+          OPTIONAL MATCH (:User {id: uid})-[:SPENT]->(ts:EcoTx {status:'settled'})
+          WHERE ts.kind IN ['BURN_REWARD','CONTRIBUTE']
+          RETURN coalesce(sum(toInteger(coalesce(ts.amount, ts.eco, 0))), 0) AS spent
+        }
+        RETURN toInteger(earned - spent) AS balance
+        """,
+        uid=user_id,
+    ).single()
+    return int(row["balance"]) if row and row["balance"] is not None else 0
 
 # ============================================================
 # Models (updated to ECO retire + vouchers)
@@ -216,7 +243,6 @@ def list_offers_api(
         arr = svc_list_offers(s, business_id=bid, status=status)
         return [OfferOut(**o, business_id=bid) for o in arr]
 
-    where_status = "AND o.status = $status" if status else ""
     recs = s.run(
         f"""
         MATCH (b:BusinessProfile {{id:$bid}})<-[:OF]-(o:Offer)
@@ -382,32 +408,34 @@ def redeem_offer_api(
 ):
     """
     Steps (single unit of work):
-      - Check user ECO balance >= eco_price
+      - Check user ECO balance >= eco_price  (wallet math)
       - Offer active & (stock > 0 if finite) & not expired
       - Create Voucher(code, status='issued', expiresAt=now+TTL)
-      - Create BURN_REWARD linked to Offer, Business, User
+      - Create BURN_REWARD linked to Offer, Business, User (settled)
       - Decrement stock if finite (>0)
       - If fiat_cost_cents > 0: decrement sponsor_balance_cents and write SPONSOR_PAYOUT paired to burn
-      - Return voucher
+      - Return voucher + balance_after (wallet math)
     """
     tx_id = str(uuid4())
     payout_id = str(uuid4())
     now = now_ms()
-    voucher_code = short_code()
+    vcode = short_code()
     expires_at = now + VOUCHER_TTL_MIN * 60 * 1000
 
-    # Load offer + business + user balance
+    # Load offer + business meta + user's wallet balance (PARITY)
     rec = s.run(
         """
-        // Load offer + business meta
+        // Load offer + business
         MATCH (o:Offer {id:$oid})-[:OF]->(b:BusinessProfile)
-        WITH o, b
-        // user balance
-        MATCH (u:User {id:$uid})
-        OPTIONAL MATCH (u)-[:EARNED]->(m:EcoTx {kind:'MINT_ACTION', status:'settled'})
-        WITH o,b,u, coalesce(sum(m.amount),0) AS earned
-        OPTIONAL MATCH (u)-[:SPENT]->(x:EcoTx {kind:'BURN_REWARD', status:'settled'})
-        WITH o,b,u, earned - coalesce(sum(x.amount),0) AS balance
+        WITH o,b
+
+        // Wallet balance (posted, parity with counter)
+        OPTIONAL MATCH (:User {id:$uid})-[:EARNED]->(m:EcoTx {kind:'MINT_ACTION', status:'settled'})
+        WITH o,b, coalesce(sum(m.amount),0) AS earned
+        OPTIONAL MATCH (:User {id:$uid})-[:SPENT]->(sx:EcoTx {status:'settled'})
+        WHERE sx.kind IN ['BURN_REWARD','CONTRIBUTE']
+        WITH o,b, toInteger(earned - coalesce(sum(sx.amount),0)) AS user_balance
+
         RETURN
           o.id AS oid,
           o.title AS title,
@@ -418,7 +446,7 @@ def redeem_offer_api(
           o.valid_until AS valid_until,
           b.id AS bid,
           toInteger(coalesce(b.sponsor_balance_cents,0)) AS sponsor_balance_cents,
-          balance AS user_balance
+          user_balance AS user_balance
         """,
         oid=offer_id, uid=user_id
     ).single()
@@ -432,7 +460,6 @@ def redeem_offer_api(
     # Expiry check for offer (optional)
     if rec["valid_until"]:
         try:
-            # valid_until saved as ISO string
             vu = datetime.fromisoformat(str(rec["valid_until"]))
             if vu.tzinfo is None:
                 vu = vu.replace(tzinfo=timezone.utc)
@@ -465,7 +492,7 @@ def redeem_offer_api(
         MATCH (o:Offer {id:$oid})-[:OF]->(b:BusinessProfile {id:$bid})
         MATCH (u:User {id:$uid})
 
-        // voucher
+        // Voucher
         MERGE (v:Voucher {code:$vcode})
           ON CREATE SET
             v.status      = 'issued',
@@ -476,15 +503,18 @@ def redeem_offer_api(
         MERGE (v)-[:FOR_BUSINESS]->(b)
         MERGE (u)-[:HAS_VOUCHER]->(v)
 
-        // burn tx (retire ECO)
+        // Burn tx (retire ECO) — include parity fields
         MERGE (t:EcoTx {id:$tx})
           ON CREATE SET
-            t.kind      = 'BURN_REWARD',
-            t.amount    = $eco_price,
-            t.burn      = true,
-            t.voucher   = $vcode,
-            t.status    = 'settled',
-            t.createdAt = $now
+            t.kind        = 'BURN_REWARD',
+            t.amount      = $eco_price,
+            t.burn        = true,
+            t.voucher     = $vcode,
+            t.source      = 'offer',
+            t.status      = 'settled',
+            t.account_id  = $uid,
+            t.createdAt   = $now,
+            t.at          = datetime($now_iso)
 
         MERGE (u)-[:SPENT]->(t)
         MERGE (t)-[:FOR_OFFER]->(o)
@@ -526,33 +556,24 @@ def redeem_offer_api(
         bid=bid,
         uid=user_id,
         tx=tx_id,
-        payout=payout_id,
-        vcode=voucher_code,
+        payout=str(uuid4()),
+        vcode=vcode,
         eco_price=eco_price,
         fiat_cost=fiat_cost,
         now=now,
+        now_iso=now_iso(),
         expires=expires_at,
     )
 
-    # Return fresh balance-after
-    bal_rec = s.run(
-        """
-        MATCH (u:User {id:$uid})
-        OPTIONAL MATCH (u)-[:EARNED]->(m:EcoTx {kind:'MINT_ACTION', status:'settled'})
-        WITH u, coalesce(sum(m.amount),0) AS earned
-        OPTIONAL MATCH (u)-[:SPENT]->(b:EcoTx {kind:'BURN_REWARD', status:'settled'})
-        RETURN (earned - coalesce(sum(b.amount),0)) AS balance
-        """,
-        uid=user_id
-    ).single()
-    balance_after = int(bal_rec["balance"] or 0)
+    # Return fresh balance-after (PARITY helper)
+    balance_after = _user_wallet_balance(s, user_id)
 
     return RedeemResponse(
         offer_id=offer_id,
         eco_retired=eco_price,
         balance_after=balance_after,
-        voucher_code=voucher_code,
-        message=f"Retired {eco_price} ECO • Offer: {rec['title']} • Voucher: {voucher_code}",
+        voucher_code=vcode,
+        message=f"Retired {eco_price} ECO • Offer: {rec['title']} • Voucher: {vcode}",
     )
 
 # ============================================================
@@ -570,12 +591,10 @@ def verify_voucher_api(
     expires_in = max(0, (meta["expiresAt"] - now) // 1000)
 
     # Expired?
-    if meta["expiresAt"] and now > meta["expiresAt"]:
-        # one-time set to expired if still not terminal
+    if meta["expiresAt"] and now > meta["expiresAt"] and meta["status"] in ("issued", "verified"):
         s.run(
             """
             MATCH (v:Voucher {code:$code})
-            WHERE v.status IN ['issued','verified']
             SET v.status='expired', v.expiredAt=$now
             """,
             code=body.voucher_code, now=now
@@ -658,7 +677,6 @@ def consume_voucher_api(
     if not rec:
         raise HTTPException(status_code=404, detail="Voucher not found")
 
-    # Return canonical id (code) + consumedAt (we just set 'now')
     return VoucherConsumeOut(ok=True, voucher_id=meta["code"], consumedAt=now)
 
 # ============================================================
