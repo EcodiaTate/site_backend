@@ -1,15 +1,18 @@
-# site_backend/api/auth/admin_cookie.py
 from __future__ import annotations
 from fastapi import APIRouter, Depends, Response, HTTPException, status
 from datetime import datetime, timedelta
 from jose import jwt
 from neo4j import Session
+import os
 
 from site_backend.core.user_guard import current_user_id
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.admin_guard import JWT_SECRET, JWT_ALGO, is_admin_email
+from site_backend.core.cookies import set_scoped_cookie, delete_scoped_cookie, ADMIN_COOKIE_NAME
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+ADMIN_TTL_DAYS = int(os.getenv("ADMIN_TTL_DAYS", "7"))
 
 def _mint_admin_token(email: str) -> str:
     now = datetime.utcnow()
@@ -17,7 +20,7 @@ def _mint_admin_token(email: str) -> str:
         "sub": email,
         "scope": "admin",
         "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(days=7)).timestamp()),
+        "exp": int((now + timedelta(days=ADMIN_TTL_DAYS)).timestamp()),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
 
@@ -34,18 +37,15 @@ def r_admin_cookie(
     email = (rec["email"] or "").lower() if rec else ""
 
     if not is_admin_email(email):
-        # clear cookie if present (optional nicety)
-        response.delete_cookie("admin_token", path="/", httponly=True, secure=False, samesite="lax")
+        delete_scoped_cookie(response, name=ADMIN_COOKIE_NAME)
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
 
     token = _mint_admin_token(email)
-    response.set_cookie(
-        key="admin_token",
+    set_scoped_cookie(
+        response,
+        name=ADMIN_COOKIE_NAME,
         value=token,
-        path="/",
-        httponly=True,
-        secure=False,   # set True in prod over HTTPS
-        samesite="lax",
-        max_age=7*24*3600,
+        max_age=ADMIN_TTL_DAYS * 24 * 3600,
+        http_only=True,
     )
     return {"ok": True}

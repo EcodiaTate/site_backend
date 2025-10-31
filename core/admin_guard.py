@@ -1,4 +1,3 @@
-# site_backend/core/admin_guard.py
 from __future__ import annotations
 import os, time
 from fastapi import HTTPException, Request, status
@@ -9,6 +8,8 @@ JWT_ALGO   = os.getenv("JWT_ALGO", "HS256")
 
 ADMIN_EMAIL  = (os.getenv("ADMIN_EMAIL") or "").lower().strip() or None
 ADMIN_EMAILS = {"tate@ecodia.au"} | ({ADMIN_EMAIL} if ADMIN_EMAIL else set())
+
+ADMIN_COOKIE_NAME = os.getenv("ADMIN_COOKIE_NAME", "admin_token")
 
 def is_admin_email(email: str) -> bool:
     if not email:
@@ -22,13 +23,7 @@ def mint_admin_token(email: str, ttl_secs: int = 60 * 60) -> str:
     return jwt.encode(claims, JWT_SECRET, algorithm=JWT_ALGO)
 
 def _decode_admin_token(token: str) -> dict:
-    """
-    Decode an admin token. python-jose in this env doesn't support a 'leeway' kwarg,
-    so we implement a 90s grace manually: if the token is expired but within 90s,
-    accept it and let the route re-issue/rotate as needed.
-    """
     try:
-        # Normal strict decode (exp/iat enforced)
         return jwt.decode(
             token,
             JWT_SECRET,
@@ -36,23 +31,18 @@ def _decode_admin_token(token: str) -> dict:
             options={"verify_aud": False, "require_iat": True, "require_exp": True},
         )
     except ExpiredSignatureError:
-        # Manual 90s grace: decode without exp verification, check ourselves
+        # 90s grace decode
         try:
             claims = jwt.decode(
                 token,
                 JWT_SECRET,
                 algorithms=[JWT_ALGO],
-                options={
-                    "verify_aud": False,
-                    "verify_exp": False,   # allow reading claims
-                    "require_iat": True,
-                    "require_exp": True,
-                },
+                options={"verify_aud": False, "verify_exp": False, "require_iat": True, "require_exp": True},
             )
             now = int(time.time())
             exp = int(claims.get("exp", 0))
             if exp and (now - exp) <= 90:
-                return claims  # within grace
+                return claims
         except JWTError:
             pass
         raise HTTPException(
@@ -79,11 +69,11 @@ def _bearer_from_auth_header(request: Request) -> str | None:
 def require_admin(request: Request) -> str:
     """
     Accept admin credentials from, in order of preference:
-    1) HttpOnly cookie 'admin_token'
+    1) HttpOnly cookie ADMIN_COOKIE_NAME
     2) Authorization: Bearer <admin-token>
     3) X-Auth-Token (legacy)
     """
-    cookie = request.cookies.get("admin_token")
+    cookie = request.cookies.get(ADMIN_COOKIE_NAME)
     if cookie:
         claims = _decode_admin_token(cookie)
         if claims.get("scope") == "admin":

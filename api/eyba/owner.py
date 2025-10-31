@@ -70,6 +70,8 @@ class ActivityRow(BaseModel):
     user_id: Optional[str] = None
     kind: str
     amount: float
+    offer_id: Optional[str] = None   # ← add
+
 
 class PatchProfile(BaseModel):
     name: Optional[str] = None
@@ -183,16 +185,11 @@ def get_mine(
     if not b:
         raise HTTPException(status_code=404, detail="Business not found")
     return b
-
 @router.get("/metrics", response_model=Dict[str, Any])
 def get_metrics(
     user_id: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
-    """
-    - No APOC usage.
-    - 30d window based on node datetime 'at' or epochMillis 'createdAt'.
-    """
     _ensure_owner_business(s, user_id)
     cy = """
     MATCH (b:BusinessProfile {user_id:$uid})
@@ -206,34 +203,45 @@ def get_metrics(
     OPTIONAL MATCH (b)-[:SPENT]->(tout:EcoTx {status:'settled'})
     WITH b, d30, ins, collect(tout) AS outs
 
-    // totals
+    // Build 30d slices with robust timestamp coercion
     WITH b, d30, ins, outs,
-         reduce(s=0, t IN ins | s + toInteger(coalesce(t.eco, t.amount, 0))) AS minted_total,
-         reduce(s=0, t IN [x IN ins WHERE coalesce(x.at, datetime({epochMillis:x.createdAt})) >= d30]
-                 | s + toInteger(coalesce(x.eco, x.amount, 0))) AS minted_30d,
-         reduce(s=0, t IN [x IN outs WHERE coalesce(x.kind,'')='BURN_REWARD']
-                 | s + toInteger(coalesce(x.eco, x.amount, 0))) AS retired_total,
-         reduce(s=0, t IN [x IN outs WHERE coalesce(x.kind,'')='BURN_REWARD'
-                            AND coalesce(x.at, datetime({epochMillis:x.createdAt})) >= d30]
-                 | s + toInteger(coalesce(x.eco, x.amount, 0))) AS retired_30d
-    WITH b, d30, ins, minted_30d, retired_30d
+         [t IN ins  WHERE coalesce(t.at,  datetime({epochMillis: toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp()))})) >= d30] AS ins30,
+         [t IN outs WHERE coalesce(t.at,  datetime({epochMillis: toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp()))})) >= d30] AS outs30
 
-    // unique claimants in 30d (id present)
-    UNWIND [x IN ins WHERE coalesce(x.at, datetime({epochMillis:x.createdAt})) >= d30 AND exists(x.user_id) | x.user_id] AS claimant
-    WITH b, d30, minted_30d, retired_30d, collect(DISTINCT claimant) AS claimants
-    WITH b, minted_30d, retired_30d, size(claimants) AS unique_30d, datetime() - duration({days:30}) AS d30b
+    // Totals
+    WITH b, ins, outs, ins30, outs30,
+         reduce(s=0, t IN ins    | s + toInteger(coalesce(t.eco, t.amount, 0))) AS minted_total,
+         reduce(s=0, t IN ins30  | s + toInteger(coalesce(t.eco, t.amount, 0))) AS minted_30d,
+         reduce(s=0, t IN [t IN outs WHERE coalesce(t.kind,'')='BURN_REWARD']
+                         | s + toInteger(coalesce(t.eco, t.amount, 0))) AS retired_total,
+         reduce(s=0, t IN [t IN outs30 WHERE coalesce(t.kind,'')='BURN_REWARD']
+                         | s + toInteger(coalesce(t.eco, t.amount, 0))) AS retired_30d,
+         size(ins30) AS claims_30d,
+         [t IN ins30 WHERE t.user_id IS NOT NULL | t.user_id] AS claimants30_raw
 
-    // redemptions count in 30d
-    OPTIONAL MATCH (b)-[:SPENT]->(r30:EcoTx {status:'settled'})
-    WHERE coalesce(r30.kind,'')='BURN_REWARD'
-      AND coalesce(r30.at, datetime({epochMillis:r30.createdAt})) >= d30b
+    // Last claim: UNWIND then max(datetime)
+    UNWIND ins30 AS tlast
+    WITH b, outs30, minted_30d, retired_30d, claims_30d, claimants30_raw,
+         max(coalesce(tlast.at, datetime({epochMillis: toInteger(coalesce(tlast.createdAt, timestamp(tlast.at), timestamp()))}))) AS last_claim_dt
 
-    WITH b, minted_30d, retired_30d, unique_30d, count(r30) AS redemptions_30d
+    // Unique claimants (pure Cypher distinct)
+    WITH b, outs30, minted_30d, retired_30d, claims_30d, last_claim_dt, claimants30_raw
+    UNWIND claimants30_raw AS c
+    WITH b, outs30, minted_30d, retired_30d, claims_30d, last_claim_dt, collect(DISTINCT c) AS uniqs
+    WITH b, outs30, minted_30d, retired_30d, claims_30d, last_claim_dt,
+         size([u IN uniqs WHERE u IS NOT NULL | u]) AS unique_30d
+
+    // Redemptions count (30d)
+    WITH b, minted_30d, retired_30d, claims_30d, last_claim_dt, unique_30d,
+         size([t IN outs30 WHERE coalesce(t.kind,'')='BURN_REWARD' | 1]) AS redemptions_30d
+
     RETURN {
       business_id: b.id,
       minted_eco_30d: minted_30d,
       eco_retired_30d: retired_30d,
       unique_claimants_30d: unique_30d,
+      claims_30d: claims_30d,
+      last_claim_at: (CASE WHEN last_claim_dt IS NULL THEN NULL ELSE toString(last_claim_dt) END),
       redemptions_30d: redemptions_30d,
       sponsor_balance_cents: toInteger(coalesce(b.sponsor_balance_cents, 0))
     } AS m
@@ -241,7 +249,6 @@ def get_metrics(
     rec = _one(s, cy, {"uid": user_id}) or {"m": {}}
     m = rec.get("m") or {}
 
-    # Backward-compat fields expected by FE; extend as needed
     return {
         "business_id": m.get("business_id"),
         "sponsor_balance_cents": int(m.get("sponsor_balance_cents") or 0),
@@ -249,7 +256,9 @@ def get_metrics(
         "redemptions_30d": int(m.get("redemptions_30d") or 0),
         "unique_claimants_30d": int(m.get("unique_claimants_30d") or 0),
         "minted_eco_30d": int(m.get("minted_eco_30d") or 0),
-        # placeholders kept for compatibility
+        "claims_30d": int(m.get("claims_30d") or 0),
+        "last_claim_at": m.get("last_claim_at"),
+        # compat placeholders
         "name": None,
         "pledge_tier": None,
         "eco_retired_total": 0,
@@ -363,12 +372,6 @@ def delete_offer(
     s.run(cy, uid=user_id, oid=offer_id).consume()
     return {"ok": True}
 
-class ActivityRow(BaseModel):
-    id: str
-    createdAt: str
-    user_id: Optional[str] = None
-    kind: str
-    amount: float
 
 def _all(s: Session, cypher: str, params: Dict[str, Any]) -> list[Dict[str, Any]]:
     return [r.data() for r in s.run(cypher, **params)]
@@ -383,38 +386,38 @@ def business_recent_activity(
     cy = """
     MATCH (b:BusinessProfile {user_id:$uid})
 
-    CALL {
-      WITH b
-      // Inbound: contributions collected by the business
-      MATCH (b)-[:COLLECTED]->(tin:EcoTx)
-      WHERE coalesce(tin.status,'settled')='settled'
-        AND (coalesce(tin.kind,'')='CONTRIBUTE' OR tin.source='contribution' OR tin.source='eyba')
-      RETURN
-        tin.id AS id,
-        toString(datetime({epochMillis: toInteger(coalesce(tin.createdAt, timestamp(tin.at), timestamp()))})) AS createdAt,
-        tin.user_id AS user_id,
-        coalesce(tin.kind,'CONTRIBUTE') AS kind,
-        toFloat(coalesce(tin.eco, tin.amount)) AS amount
+  CALL {
+  WITH b
+  // Inbound: contributions collected by the business
+  MATCH (b)-[:COLLECTED]->(tin:EcoTx)
+  WHERE coalesce(tin.status,'settled')='settled'
+    AND (coalesce(tin.kind,'')='CONTRIBUTE' OR tin.source='contribution' OR tin.source='eyba')
+  RETURN
+    tin.id AS id,
+    toString(datetime({epochMillis: toInteger(coalesce(tin.createdAt, timestamp(tin.at), timestamp()))})) AS createdAt,
+    tin.user_id AS user_id,
+    coalesce(tin.kind,'CONTRIBUTE') AS kind,
+    toFloat(coalesce(tin.eco, tin.amount)) AS amount,
+    NULL AS offer_id                                     // ← new
+  UNION ALL
+  WITH b
+  // Outbound: rewards/payouts initiated by the business
+  MATCH (b)-[r]->(tout:EcoTx)
+  WHERE coalesce(tout.status,'settled')='settled'
+    AND type(r) IN ['SPENT','COLLECTED','EARNED']
+    AND coalesce(tout.kind,'') IN ['BURN_REWARD','SPONSOR_PAYOUT']
+  RETURN
+    tout.id AS id,
+    toString(datetime({epochMillis: toInteger(coalesce(tout.createdAt, timestamp(tout.at), timestamp()))})) AS createdAt,
+    tout.user_id AS user_id,
+    coalesce(tout.kind,'BURN_REWARD') AS kind,
+    toFloat(coalesce(tout.eco, tout.amount)) AS amount,
+    tout.offer_id AS offer_id                              // ← new
+}
+RETURN id, createdAt, user_id, kind, amount, offer_id
+ORDER BY datetime(createdAt) DESC
+LIMIT $limit
 
-      UNION ALL
-
-      WITH b
-      // Outbound: rewards/payouts initiated by the business
-      MATCH (b)-[r]->(tout:EcoTx)
-      WHERE coalesce(tout.status,'settled')='settled'
-        AND type(r) IN ['SPENT','COLLECTED','EARNED']
-        AND coalesce(tout.kind,'') IN ['BURN_REWARD','SPONSOR_PAYOUT']
-      RETURN
-        tout.id AS id,
-        toString(datetime({epochMillis: toInteger(coalesce(tout.createdAt, timestamp(tout.at), timestamp()))})) AS createdAt,
-        tout.user_id AS user_id,
-        coalesce(tout.kind,'BURN_REWARD') AS kind,
-        toFloat(coalesce(tout.eco, tout.amount)) AS amount
-    }
-
-    RETURN id, createdAt, user_id, kind, amount
-    ORDER BY datetime(createdAt) DESC
-    LIMIT $limit
     """
     rows = _all(s, cy, {"uid": user_id, "limit": int(limit)})
 
@@ -426,7 +429,9 @@ def business_recent_activity(
             user_id=r.get("user_id"),
             kind=r.get("kind") or "event",
             amount=float(r.get("amount") or 0.0),
+            offer_id=r.get("offer_id"),                            # ← new
         ))
+
     return out
 
 @router.patch("/profile", response_model=BusinessMine)

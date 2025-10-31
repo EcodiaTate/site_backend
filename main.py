@@ -37,7 +37,7 @@ from site_backend.core.paths import UPLOAD_ROOT
 # --- internal imports ---------------------------------------------------------
 from site_backend.core.admin_guard import require_admin, JWT_SECRET, JWT_ALGO
 from site_backend.core.neo_driver import build_driver, ensure_constraints
-from site_backend.core import admin_cookie
+from site_backend.core.admin_cookie import router as admin_cookie_router
 
 from site_backend.api import auth, profile, stats, launchpad, gamification
 from site_backend.api.eco_home import home_routes
@@ -198,7 +198,7 @@ def create_app() -> FastAPI:
     app.include_router(home_routes.router)
     app.include_router(stats.router)
     app.include_router(account_delete_router)
-    app.include_router(admin_cookie.router)
+    app.include_router(admin_cookie_router)
     app.include_router(launchpad.router)
     app.include_router(leaderboards.router)
     app.include_router(gamification.router)
