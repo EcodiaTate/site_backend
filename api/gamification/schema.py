@@ -122,7 +122,7 @@ class LeaderboardResponse(BaseModel):
     rows: List[LeaderboardRow]
     page: int
     page_size: int
-    me: Optional[LeaderboardRow] = None  # <— NEW
+    me: Optional[LeaderboardRow] = None  # <...  NEW
 
 
 # ─────────────────────────────────────────────────────────────

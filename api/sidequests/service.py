@@ -945,7 +945,7 @@ def create_submission(
     sid = uuid4().hex
     now = _now_iso()
 
-    # Prefer upload_id provided by the /media/upload endpoint — never persist FS paths
+    # Prefer upload_id provided by the /media/upload endpoint... never persist FS paths
     media_upload_id: Optional[str] = None
     if getattr(s, "image_upload_id", None):
         media_upload_id = (str(s.image_upload_id) or "").strip() or None
@@ -1066,15 +1066,16 @@ def moderate_submission(session: Session, submission_id: str, moderator_id: str,
             pass
 
     return _to_submission_out(sub)
-
-
 def _award_on_approval(session: Session, submission_id: str) -> None:
+    # 1) Gather facts for cooldown & streak logic
     rec = session.run(
         """
         MATCH (u:User)-[:SUBMITTED]->(sub:Submission {id:$sid})-[:FOR]->(sq:Sidequest)
-        RETURN u.id AS uid, sq.id AS mid, coalesce(sq.reward_eco,0) AS eco,
-               coalesce(sq.xp_reward,0) AS xp,
-               sq.max_completions_per_user AS max_c, coalesce(sq.cooldown_days,0) AS cd,
+        RETURN u.id AS uid, sq.id AS mid,
+               coalesce(sq.reward_eco,0) AS eco,
+               coalesce(sq.xp_reward,0)   AS xp,
+               sq.max_completions_per_user AS max_c,
+               coalesce(sq.cooldown_days,0) AS cd,
                sq.streak_period AS streak_period,
                coalesce(sq.streak_bonus_eco_per_step,0) AS streak_bonus,
                sq.streak_max_steps AS streak_cap,
@@ -1083,14 +1084,20 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
         """,
         {"sid": submission_id},
     ).single()
+    if not rec:
+        return  # nothing to award
 
-    uid = rec["uid"]; mid = rec["mid"]
-    eco = rec["eco"]; xp = rec["xp"]
-    max_c = rec["max_c"]; cd = rec["cd"]
-    streak_period = rec["streak_period"]; streak_bonus = rec["streak_bonus"]; streak_cap = rec["streak_cap"]
-    team_allowed = rec["team_allowed"]; sub_team = rec["sub_team"]
+    uid        = rec["uid"];      mid = rec["mid"]
+    eco        = rec["eco"];      # base ECO on the sidequest
+    # NOTE: we won't trust 'rec["xp"]' when writing — see step (3)
+    max_c      = rec["max_c"];    cd  = rec["cd"]
+    streak_period = rec["streak_period"]
+    streak_bonus  = rec["streak_bonus"]
+    streak_cap    = rec["streak_cap"]  # currently unused in your code
+    team_allowed  = rec["team_allowed"]
+    sub_team      = rec["sub_team"]
 
-    # prior approvals for cooldown/max count (exclude this submission)
+    # 2) Enforce per-SQ limits (cooldown / max completions) before writing the tx
     row = session.run(
         """
         MATCH (:User {id:$uid})-[:SUBMITTED]->(s:Submission {state:'approved'})-[:FOR]->(:Sidequest {id:$mid})
@@ -1108,7 +1115,7 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
         if datetime.utcnow() < last_dt + timedelta(days=cd):
             return
 
-    # Streak bonus (light heuristic)
+    # Streak bonus (keep your heuristic)
     bonus = 0
     if streak_period and streak_bonus:
         if streak_period == "weekly":
@@ -1141,53 +1148,52 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
                     bonus = streak_bonus
 
     eco_total = int(eco) + int(bonus)
-
-    # Canonical ECO/XP transaction (settled) — include createdAt (ms) + normalized kind
-    tid = uuid4().hex
     now = _now_iso()
-    created_ms = _now_ms()
+
+    # 3) Write the canonical ledger tx.
+    #    IMPORTANT: t.xp is set directly from (sub)-[:FOR]->(sq.xp_reward) via MATCH, not Python.
     session.run(
         """
-        // inside _award_on_approval
-        MERGE (t:EcoTx {id: $sid})          // use submission_id as tx id
-        SET  t.eco       = $eco,
-            t.xp        = $xp,
-            t.bonus     = $bonus,
-            t.at        = datetime($now),
-            t.createdAt = coalesce(t.createdAt, timestamp(datetime($now))),
-            t.kind      = 'MINT_ACTION',
-            t.source    = 'sidequest',
-            t.reason    = 'sidequest_reward',
-            t.status    = 'settled'
+        MATCH (u:User {id:$uid})
+        MATCH (sub:Submission {id:$sid})-[:FOR]->(sq:Sidequest {id:$mid})
+        MERGE (t:EcoTx {id:$sid})                          // submission id as tx id
+        SET  t.eco       = $eco_total,
+             t.xp        = toInteger(coalesce(sq.xp_reward, 0)),
+             t.bonus     = $bonus,
+             t.at        = datetime($now),
+             t.createdAt = coalesce(t.createdAt, timestamp(datetime($now))),
+             t.kind      = 'MINT_ACTION',
+             t.source    = 'sidequest',
+             t.reason    = 'sidequest_reward',
+             t.status    = 'settled'
         MERGE (u)-[:EARNED]->(t)
         MERGE (t)-[:FOR]->(sq)
         MERGE (t)-[:PROOF]->(sub)
-
         """,
         {
             "uid": uid,
             "sid": submission_id,
             "mid": mid,
-            "tid": tid,
-            "eco": eco_total,
-            "xp": xp,
+            "eco_total": eco_total,
             "bonus": bonus,
             "now": now,
-            "created_ms": created_ms,
         },
     )
 
+    # 4) Optional team bonus link (kept as-is, but matches `t` safely)
     if team_allowed and sub_team:
         tbid = uuid4().hex
         session.run(
             """
-            MATCH (t:EcoTx {id:$tid})
+            MATCH (t:EcoTx {id:$sid})
             MERGE (tb:TeamBonus {id:$tbid})
             SET tb.team_id = $team_id, tb.eco = 0, tb.at = datetime($now)
             MERGE (t)-[:TEAM_BONUS]->(tb)
             """,
-            {"tid": tid, "tbid": tbid, "team_id": sub_team, "now": now},
+            {"sid": submission_id, "tbid": tbid, "team_id": sub_team, "now": now},
         )
+
+
 
 
 # -------- progress & rotation --------

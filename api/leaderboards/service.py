@@ -43,7 +43,7 @@ def _has_more(count_page: int, limit: int) -> bool:
     return count_page == limit
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Youth ECO leaderboard (EARNED) — unchanged
+# Youth ECO leaderboard (EARNED)... unchanged
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_youth_eco(
@@ -297,7 +297,7 @@ def top_youth_contributed(
     }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Business ECO leaderboard — now COLLECTED (contributions in)
+# Business ECO leaderboard... now COLLECTED (contributions in)
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_business_eco(
@@ -435,7 +435,7 @@ def top_business_eco(
     }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Youth Actions leaderboard (sidequests) — unchanged
+# Youth Actions leaderboard (sidequests)... unchanged
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_youth_actions(

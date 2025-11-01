@@ -78,7 +78,7 @@ def _project_row(r) -> AdminSubmissionOut:
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# GET /admin/submissions  — list (default: pending)
+# GET /admin/submissions ... list (default: pending)
 # Filters: state, q, sid, uid; Pagination: skip, limit
 # ───────────────────────────────────────────────────────────────────────────────
 @router.get("", response_model=List[AdminSubmissionOut])
@@ -147,7 +147,7 @@ def list_admin_submissions(
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# GET /admin/submissions/{id} — single
+# GET /admin/submissions/{id}... single
 # ───────────────────────────────────────────────────────────────────────────────
 @router.get("/{submission_id}", response_model=AdminSubmissionOut)
 def get_admin_submission(
@@ -187,7 +187,7 @@ def get_admin_submission(
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-# POST /admin/submissions/{id}/moderate — approve/reject + notes
+# POST /admin/submissions/{id}/moderate... approve/reject + notes
 # Uses domain service (awards/badges), then re-reads joins.
 # ───────────────────────────────────────────────────────────────────────────────
 @router.post("/{submission_id}/moderate", response_model=AdminSubmissionOut)

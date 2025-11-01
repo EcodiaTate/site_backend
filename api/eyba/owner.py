@@ -12,7 +12,7 @@ import shutil
 import json
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Auth / DB deps — use your real ones
+# Auth / DB deps... use your real ones
 # ─────────────────────────────────────────────────────────────────────────────
 from site_backend.core.neo_driver import session_dep   # yields a neo4j.Session
 from site_backend.core.user_guard import current_user_id  # validates Bearer or legacy cookie
@@ -471,7 +471,7 @@ def patch_profile(
     if not rec:
         raise HTTPException(status_code=404, detail="Business not found")
 
-    # Add QR (if any) — canonical shape (:QR)-[:OF]->(b)
+    # Add QR (if any)... canonical shape (:QR)-[:OF]->(b)
     cy_qr = """
     MATCH (b:BusinessProfile {user_id:$uid})
     OPTIONAL MATCH (q:QR)-[:OF]->(b)

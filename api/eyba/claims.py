@@ -361,7 +361,7 @@ async def claim_eco(
     if not meta.active:
         raise HTTPException(status_code=status.HTTP_410_GONE, detail="QR inactive")
 
-    # Balance BEFORE — EXACTLY like wallet/counter (strict user id)
+    # Balance BEFORE... EXACTLY like wallet/counter (strict user id)
     balance_before = _youth_balance(s, uid)
 
     dbg: Dict[str, Any] = {}
@@ -512,7 +512,7 @@ async def claim_eco(
         lng=(payload.lng if payload else None),
     )
 
-    # AFTER — exactly like wallet/counter
+    # AFTER... exactly like wallet/counter
     balance_after = _youth_balance(s, uid)
     if debug:
         dbg["balance_after"] = balance_after
