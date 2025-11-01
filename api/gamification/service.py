@@ -223,12 +223,28 @@ def get_user_badges_and_awards(s: Session, *, uid: str) -> Dict[str, Any]:
     """, uid=uid).single() or {"awards": []}
 
     base = s.run("""
-      MATCH (u:User {id:$uid})
-      OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
-      WITH u, toInteger(sum(coalesce(t.eco,0))) AS total_eco, toInteger(sum(coalesce(t.xp,0))) AS total_xp
-      OPTIONAL MATCH (u)-[:SUBMITTED]->(s1:Submission {state:'approved'})
-      WITH u, total_eco, total_xp, count(s1) AS actions_total
-      RETURN toInteger(coalesce(u.prestige,0)) AS prestige, total_eco, total_xp, actions_total
+     MATCH (u:User {id:$uid})
+OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
+WITH u,
+  toInteger(sum(coalesce(t.eco,0))) AS total_eco_ledger,
+  toInteger(sum(coalesce(t.xp,0)))  AS total_xp_ledger
+
+// Virtual gains from approved submissions lacking a ledger tx
+OPTIONAL MATCH (u)-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(sq:Sidequest)
+WHERE NOT (sub)<-[:PROOF]-(:EcoTx)
+WITH u, total_eco_ledger, total_xp_ledger,
+  toInteger(sum(coalesce(sq.reward_eco,0))) AS eco_virtual,
+  toInteger(sum(coalesce(sq.xp_reward,0)))  AS xp_virtual
+
+WITH u,
+  toInteger(coalesce(total_eco_ledger,0) + coalesce(eco_virtual,0)) AS total_eco,
+  toInteger(coalesce(total_xp_ledger,0)  + coalesce(xp_virtual,0))  AS total_xp
+
+// keep actions_total as before
+OPTIONAL MATCH (u)-[:SUBMITTED]->(s1:Submission {state:'approved'})
+WITH u, total_eco, total_xp, count(s1) AS actions_total
+RETURN toInteger(coalesce(u.prestige,0)) AS prestige, total_eco, total_xp, actions_total
+
     """, uid=uid).single()
 
     prestige = int(base.get("prestige") or 0) if base else 0
@@ -512,11 +528,25 @@ def delete_quest_type(s: Session, *, id: str) -> None:
 def _get_user_stats_for_rules(s: Session, *, uid: str, season_id: Optional[str]) -> Dict:
     base = s.run("""
       MATCH (u:User {id:$uid})
-      OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
-      WITH u, toInteger(sum(coalesce(t.eco,0))) AS total_eco, toInteger(sum(coalesce(t.xp,0))) AS total_xp
-      OPTIONAL MATCH (u)-[:SUBMITTED]->(s1:Submission {state:'approved'})
-      WITH total_eco, total_xp, count(s1) AS actions_total
-      RETURN total_eco, total_xp, actions_total
+OPTIONAL MATCH (u)-[:EARNED]->(t:EcoTx)
+WITH u,
+  toInteger(sum(coalesce(t.eco,0))) AS total_eco_ledger,
+  toInteger(sum(coalesce(t.xp,0)))  AS total_xp_ledger
+
+OPTIONAL MATCH (u)-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(sq:Sidequest)
+WHERE NOT (sub)<-[:PROOF]-(:EcoTx)
+WITH u, total_eco_ledger, total_xp_ledger,
+  toInteger(sum(coalesce(sq.reward_eco,0))) AS eco_virtual,
+  toInteger(sum(coalesce(sq.xp_reward,0)))  AS xp_virtual
+
+WITH u,
+  toInteger(coalesce(total_eco_ledger,0) + coalesce(eco_virtual,0)) AS total_eco,
+  toInteger(coalesce(total_xp_ledger,0)  + coalesce(xp_virtual,0))  AS total_xp
+
+OPTIONAL MATCH (u)-[:SUBMITTED]->(s1:Submission {state:'approved'})
+WITH total_eco, total_xp, count(s1) AS actions_total
+RETURN total_eco, total_xp, actions_total
+
     """, uid=uid).single()
 
     stats = {
@@ -1036,7 +1066,7 @@ def claim_quest(s: Session, *, uid: str, quest_type_id: str, amount: int = 1, me
         "badges_granted": _["granted"] if isinstance(_, dict) else [],
         "stats": stats_now,
         "window": {"start": wstart, "end": wend, "used": used + take, "limit": limit_per_window},
-        "balance_after": balance_after,   # <— NEW optional field (frontend reads if present)
+        "balance_after": balance_after,   # <...  NEW optional field (frontend reads if present)
     }
 
 def grant_prestige(s: Session, *, uid: str) -> Dict:

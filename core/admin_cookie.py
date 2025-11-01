@@ -23,7 +23,6 @@ def _mint_admin_token(email: str) -> str:
         "exp": int((now + timedelta(days=ADMIN_TTL_DAYS)).timestamp()),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-
 @router.post("/admin-cookie")
 def r_admin_cookie(
     response: Response,
@@ -41,6 +40,8 @@ def r_admin_cookie(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
 
     token = _mint_admin_token(email)
+
+    # still set the cookie (works in prod same-site), but we'll ALSO return the token
     set_scoped_cookie(
         response,
         name=ADMIN_COOKIE_NAME,
@@ -48,4 +49,6 @@ def r_admin_cookie(
         max_age=ADMIN_TTL_DAYS * 24 * 3600,
         http_only=True,
     )
-    return {"ok": True}
+
+    # 👇 return token so FE can Bearer it for cross-site POSTs in dev
+    return {"ok": True, "admin_token": token}

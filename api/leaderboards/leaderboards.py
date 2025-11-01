@@ -124,7 +124,7 @@ def leaderboard_youth_eco(
     me_user_id: Optional[str] = Query(None),
     session: Session = Depends(session_dep),
 ):
-    """Youth ECO leaderboard — total ECO **earned** (settled) in the period."""
+    """Youth ECO leaderboard... total ECO **earned** (settled) in the period."""
     return _with_direct_bolt_retry(
         top_youth_eco, session, period=period, limit=limit, offset=offset, me_user_id=me_user_id
     )
@@ -138,7 +138,7 @@ def leaderboard_youth_contributed(
     session: Session = Depends(session_dep),
 ):
     """
-    Youth ECO **contributed** leaderboard — sum of ECO contributed to businesses
+    Youth ECO **contributed** leaderboard... sum of ECO contributed to businesses
     via EYBA (settled contribution txns) in the period.
     """
     return _with_direct_bolt_retry(
@@ -153,7 +153,7 @@ def leaderboard_business_eco(
     me_business_id: Optional[str] = Query(None),
     session: Session = Depends(session_dep),
 ):
-    """Business ECO leaderboard — total ECO **collected** (youth contributions in) in the period."""
+    """Business ECO leaderboard... total ECO **collected** (youth contributions in) in the period."""
     return _with_direct_bolt_retry(
         top_business_eco, session, period=period, limit=limit, offset=offset, me_business_id=me_business_id
     )

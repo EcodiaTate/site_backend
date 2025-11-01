@@ -48,57 +48,81 @@ async def _resolve_user_id(req: Request, force_uid: Optional[str] = None) -> Dic
 # ---------- models ----------
 class WalletTx(BaseModel):
     id: str
-    # include CONTRIBUTE so the feed types match the new flow
     kind: Literal["MINT_ACTION", "BURN_REWARD", "CONTRIBUTE", "SPONSOR_DEPOSIT", "SPONSOR_PAYOUT"]
     direction: Literal["earned", "spent"]
-    amount: int
+    amount: int                    # ECO amount (unchanged)
     createdAt: int
     source: Optional[str] = None
-    business: Optional[dict] = None  # {id,name} if available
-    offer_id: Optional[str] = None   # when spent on a reward
+    business: Optional[dict] = None
+    offer_id: Optional[str] = None
+    xp: int = 0                    # NEW: XP tied to this tx (usually only for earned rows)
 
 class WalletOut(BaseModel):
     balance: int
     earned_total: int
     spent_total: int
+    xp_total: int = 0              # NEW: lifetime XP (earned)
+    xp_30d: int = 0                # NEW: last 30 days XP
     txs: List[WalletTx] = Field(default_factory=list)
-    next_before_ms: Optional[int] = None  # for paging
-    debug: Optional[Dict[str, Any]] = None  # returned when ?debug=1
+    next_before_ms: Optional[int] = None
+    debug: Optional[Dict[str, Any]] = None
+from datetime import datetime, timezone, timedelta  # add timedelta
 
-# ---------- queries ----------
-def _youth_totals(s: Session, uid: str) -> Tuple[int, int]:
+def _youth_totals(s: Session, uid: str) -> Tuple[int, int, int, int]:
     """
-    Earned = settled EcoTx (MINT_ACTION or sidequest-sourced) + approved Submissions
-             that don't yet have a PROOF-linked EcoTx (virtual earnings).
-    Spent   = settled EcoTx with kind in (BURN_REWARD, CONTRIBUTE).
+    Returns: (eco_earned, eco_spent, xp_total, xp_30d)
+    - ECO earned = settled EcoTx MINT_ACTION/sidequest + virtual approved submissions w/o tx
+    - ECO spent  = BURN_REWARD, CONTRIBUTE
+    - XP total   = sum(t.xp on earned txs) + virtual approved submissions' sq.xp_reward
+    - XP 30d     = same as XP total but only last 30 days
     """
+    thirty_days_ms = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000)
+
     rec = s.run(
         """
-        // ---------- Earned from real EcoTx ----------
         MATCH (u:User {id:$uid})
-        OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx {status:'settled'})
-        WHERE coalesce(te.kind,'') = 'MINT_ACTION'
-           OR te.source = 'sidequest'
-           OR te.reason = 'sidequest_reward'
-        WITH u, coalesce(sum(toInteger(coalesce(te.eco, te.amount))),0) AS earned_tx
 
-        // ---------- PLUS approved submissions w/o a PROOF-linked EcoTx (virtual) ----------
+        // ---------- A) Real EcoTx (settled) tied to earning/spending ----------
+        OPTIONAL MATCH (u)-[rel:EARNED|SPENT]->(t:EcoTx {status:'settled'})
+        WHERE  coalesce(t.kind,'') IN ['MINT_ACTION','BURN_REWARD','CONTRIBUTE','SPONSOR_DEPOSIT','SPONSOR_PAYOUT']
+           OR  t.source = 'sidequest' OR t.reason = 'sidequest_reward'
+        WITH u, rel, t,
+             toInteger(coalesce(t.eco, t.amount))              AS eco_amt,
+             toInteger(coalesce(t.xp, 0))                      AS xp_amt,
+             toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp())) AS t_ms
+
+        WITH u,
+             sum( CASE WHEN type(rel)='EARNED' THEN eco_amt ELSE 0 END ) AS eco_earned_tx,
+             sum( CASE WHEN type(rel)='SPENT'  THEN eco_amt ELSE 0 END ) AS eco_spent_tx,
+             sum( CASE WHEN type(rel)='EARNED' THEN xp_amt  ELSE 0 END ) AS xp_earned_tx,
+             sum( CASE WHEN type(rel)='EARNED' AND t_ms >= $cutoff_ms THEN xp_amt ELSE 0 END ) AS xp_earned_tx_30d
+
+        // ---------- B) Virtual: approved submissions with no PROOF-linked EcoTx ----------
         OPTIONAL MATCH (u)-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(sq:Sidequest)
         WHERE NOT (sub)<-[:PROOF]-(:EcoTx)
-        WITH u, earned_tx, coalesce(sum(toInteger(coalesce(sq.reward_eco,0))),0) AS earned_subs
-
-        // ---------- Spent ----------
-        OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx {status:'settled'})
-        WHERE coalesce(ts.kind,'') IN ['BURN_REWARD','CONTRIBUTE']
+        WITH u, eco_earned_tx, eco_spent_tx, xp_earned_tx, xp_earned_tx_30d,
+             sum(toInteger(coalesce(sq.reward_eco,0))) AS eco_virtual,
+             sum(toInteger(coalesce(sq.xp_reward,0)))  AS xp_virtual,
+             sum( CASE
+                    WHEN toInteger(timestamp(coalesce(sub.reviewed_at, sub.created_at, datetime()))) >= $cutoff_ms
+                    THEN toInteger(coalesce(sq.xp_reward,0)) ELSE 0
+                  END ) AS xp_virtual_30d
 
         RETURN
-          toInteger(earned_tx + earned_subs) AS earned,
-          toInteger(coalesce(sum(toInteger(coalesce(ts.eco, ts.amount))),0)) AS spent
+          toInteger(coalesce(eco_earned_tx,0) + coalesce(eco_virtual,0)) AS eco_earned,
+          toInteger(coalesce(eco_spent_tx,0)) AS eco_spent,
+          toInteger(coalesce(xp_earned_tx,0) + coalesce(xp_virtual,0)) AS xp_total,
+          toInteger(coalesce(xp_earned_tx_30d,0) + coalesce(xp_virtual_30d,0)) AS xp_30d
         """,
-        {"uid": uid},
+        {"uid": uid, "cutoff_ms": thirty_days_ms},
     ).single() or {}
 
-    return int(rec.get("earned") or 0), int(rec.get("spent") or 0)
+    return (
+        int(rec.get("eco_earned") or 0),
+        int(rec.get("eco_spent") or 0),
+        int(rec.get("xp_total") or 0),
+        int(rec.get("xp_30d") or 0),
+    )
 
 def _youth_txs(s: Session, uid: str, limit: int, before_ms: Optional[int]) -> List[WalletTx]:
     recs = s.run(
@@ -120,10 +144,11 @@ def _youth_txs(s: Session, uid: str, limit: int, before_ms: Optional[int]) -> Li
             toInteger(coalesce(t.eco, t.amount)) AS amount,
             toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp())) AS createdAt,
             t.source AS source,
+            toInteger(coalesce(t.xp,0)) AS xp,
             null AS business,
             null AS offer_id
           WHERE before IS NULL OR createdAt < toInteger(before)
-          RETURN id, kind, direction, amount, createdAt, source, business, offer_id
+          RETURN id, kind, direction, amount, createdAt, source, xp, business, offer_id
 
           UNION ALL
 
@@ -138,12 +163,13 @@ def _youth_txs(s: Session, uid: str, limit: int, before_ms: Optional[int]) -> Li
             toInteger(coalesce(sq.reward_eco,0)) AS amount,
             toInteger(timestamp(coalesce(sub.reviewed_at, sub.created_at, datetime()))) AS createdAt,
             'sidequest' AS source,
+            toInteger(coalesce(sq.xp_reward,0)) AS xp,
             null AS business,
             null AS offer_id
           WHERE before IS NULL OR createdAt < toInteger(before)
-          RETURN id, kind, direction, amount, createdAt, source, business, offer_id
+          RETURN id, kind, direction, amount, createdAt, source, xp, business, offer_id
         }
-        RETURN id, kind, direction, amount, createdAt, source, business, offer_id
+        RETURN id, kind, direction, amount, createdAt, source, xp, business, offer_id
         ORDER BY createdAt DESC
         LIMIT $limit
         """,
@@ -163,12 +189,12 @@ def _youth_txs(s: Session, uid: str, limit: int, before_ms: Optional[int]) -> Li
                 source=row.get("source"),
                 business=row.get("business"),
                 offer_id=row.get("offer_id"),
+                xp=int(row.get("xp") or 0),         # NEW
             )
         )
     return items
 
 
-# ---------- youth wallet route ----------
 @router.get("/wallet", response_model=WalletOut)
 async def get_wallet(
     req: Request,
@@ -177,29 +203,38 @@ async def get_wallet(
     before_ms: Optional[int] = Query(None),
     uid: str = Depends(_current_user_id),
 ):
-    earned_total, spent_total = _youth_totals(s, uid)
-    balance = earned_total - spent_total
+    eco_earned, eco_spent, xp_total, xp_30d = _youth_totals(s, uid)
+    balance = eco_earned - eco_spent
+
     txs = _youth_txs(s, uid, limit=limit, before_ms=before_ms)
     next_before = txs[-1].createdAt if txs else None
 
-    # Intentionally returns debug when ?debug=0 (matches your existing client)
     dbg = None
     if req.query_params.get("debug") == "0":
         authed = uid
         guest = _guest_user_id(req)
         dbg = {
             "resolve": {"final": uid, "authed": authed, "guest": guest},
-            "totals": {"earned_total": earned_total, "spent_total": spent_total, "balance": balance},
+            "totals": {
+                "earned_total": eco_earned,
+                "spent_total": eco_spent,
+                "balance": balance,
+                "xp_total": xp_total,
+                "xp_30d": xp_30d,
+            },
         }
 
     return WalletOut(
         balance=balance,
-        earned_total=earned_total,
-        spent_total=spent_total,
+        earned_total=eco_earned,
+        spent_total=eco_spent,
+        xp_total=xp_total,          # NEW
+        xp_30d=xp_30d,              # NEW
         txs=txs,
         next_before_ms=next_before,
         debug=dbg,
     )
+
 
 
 # ---------- business wallet (mirrors youth) ----------

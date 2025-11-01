@@ -503,7 +503,7 @@ def redeem_offer_api(
         MERGE (v)-[:FOR_BUSINESS]->(b)
         MERGE (u)-[:HAS_VOUCHER]->(v)
 
-        // Burn tx (retire ECO) — include parity fields
+        // Burn tx (retire ECO)... include parity fields
         MERGE (t:EcoTx {id:$tx})
           ON CREATE SET
             t.kind        = 'BURN_REWARD',
