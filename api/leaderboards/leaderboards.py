@@ -1,177 +1,105 @@
+# site_backend/api/leaderboards/router.py
 from __future__ import annotations
-from typing import List, Optional
-import os
-
+from typing import Literal, Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
-from neo4j import Session, GraphDatabase
-from neo4j.exceptions import ServiceUnavailable
+from pydantic import BaseModel, Field
+from neo4j import Session
 
-from site_backend.core.neo_driver import session_dep  # your existing dep
-from .service import (
+from site_backend.core.neo_driver import session_dep
+from .service import (  # ← your provided service file (top_youth_eco, etc.)
     top_youth_eco,
-    top_youth_contributed,   # ← NEW
+    top_youth_contributed,
     top_business_eco,
     top_youth_actions,
 )
 
+Period = Literal["total", "weekly", "monthly"]
+
 router = APIRouter(prefix="/leaderboards", tags=["leaderboards"])
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Schemas (rows)
-# ───────────────────────────────────────────────────────────────────────────────
+# ---------- Pydantic shapes (unified across endpoints) ----------
 
-class LBYouthEcoRow(BaseModel):
-    user_id: str
-    display_name: str
-    eco: int = 0
-    avatar_url: Optional[str] = None
-
-# Youth contributed uses the exact same shape as earned:
-LBYouthContribRow = LBYouthEcoRow
-
-class LBBusinessEcoRow(BaseModel):
-    business_id: str
-    display_name: str
-    # kept for backward-compat (may be None if not present)
-    name: Optional[str] = None
-    eco: int = 0
-
-class LBYouthActionsRow(BaseModel):
-    user_id: str
-    display_name: str
-    completed: int = 0
-    avatar_url: Optional[str] = None
-
-# ───────────────────────────────────────────────────────────────────────────────
-# Schemas (meta + wrappers)
-# ───────────────────────────────────────────────────────────────────────────────
-
-class MetaMy(BaseModel):
+class LBMetaMy(BaseModel):
     id: str
     value: int
     rank: int
-    display_name: Optional[str] = None
+    display_name: str
     avatar_url: Optional[str] = None
 
-class MetaBlock(BaseModel):
-    period: str
-    since_ms: Optional[int]
+class LBMeta(BaseModel):
+    period: Period
+    since_ms: Optional[int] = None
     limit: int
     offset: int
     has_more: bool
-    total_estimate: Optional[int] = None
-    top_value: Optional[int] = None
-    my: Optional[MetaMy] = None
+    total_estimate: int
+    top_value: int
+    my: Optional[LBMetaMy] = None
 
-class LBWrapYouthECO(BaseModel):
-    items: List[LBYouthEcoRow]
-    meta: MetaBlock
+class LBUserEcoItem(BaseModel):
+    user_id: str
+    display_name: str
+    eco: int
+    avatar_url: Optional[str] = None
 
-class LBWrapYouthContrib(BaseModel):
-    items: List[LBYouthContribRow]
-    meta: MetaBlock
+class LBBusinessEcoItem(BaseModel):
+    business_id: str
+    display_name: str
+    eco: int
 
-class LBWrapBizECO(BaseModel):
-    items: List[LBBusinessEcoRow]
-    meta: MetaBlock
+class LBUserActionsItem(BaseModel):
+    user_id: str
+    display_name: str
+    completed: int
+    avatar_url: Optional[str] = None
 
-class LBWrapYouthActions(BaseModel):
-    items: List[LBYouthActionsRow]
-    meta: MetaBlock
+class LBResponse(BaseModel):
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    meta: LBMeta
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Local fallback helper (ONLY used if routing explodes for this call)
-# ───────────────────────────────────────────────────────────────────────────────
+# ---------- Routes ----------
 
-def _with_direct_bolt_retry(fn, *args, **kwargs):
-    """
-    Run the given service function with the provided session first.
-    If routing blows up, retry once using a temporary bolt:// driver + pinned DB.
-    """
-    # First attempt: normal session (already in args[0])
-    try:
-        return fn(*args, **kwargs)
-    except ServiceUnavailable as e:
-        # Retry with temporary bolt driver
-        uri_env = os.getenv("NEO4J_URI", "bolt://localhost:7687").strip()
-        # Rewrite routing schemes to direct bolt only for this fallback
-        if uri_env.startswith("neo4j://") or uri_env.startswith("neo4j+ssc://") or uri_env.startswith("neo4j+s://"):
-            host = uri_env.split("://", 1)[1]
-            uri_env = "bolt://" + host
-        user = os.getenv("NEO4J_USER", "neo4j")
-        pwd  = os.getenv("NEO4J_PASS", "neo4j")
-        db   = os.getenv("NEO4J_DATABASE", "neo4j").strip()
-
-        tmp_driver = GraphDatabase.driver(uri_env, auth=(user, pwd))
-        try:
-            with tmp_driver.session(database=db) as s2:
-                # Replace the session argument (first arg) with the fallback session
-                args2 = (s2, *args[1:])
-                return fn(*args2, **kwargs)
-        finally:
-            tmp_driver.close()
-
-# ───────────────────────────────────────────────────────────────────────────────
-# Endpoints
-# ───────────────────────────────────────────────────────────────────────────────
-
-@router.get("/youth/eco", response_model=LBWrapYouthECO)
-def leaderboard_youth_eco(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    limit: int = Query(20, ge=1, le=200),
+@router.get("/youth/eco", response_model=LBResponse)
+def lb_youth_eco(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     me_user_id: Optional[str] = Query(None),
-    session: Session = Depends(session_dep),
 ):
-    """Youth ECO leaderboard... total ECO **earned** (settled) in the period."""
-    return _with_direct_bolt_retry(
-        top_youth_eco, session, period=period, limit=limit, offset=offset, me_user_id=me_user_id
-    )
+    data = top_youth_eco(s, period=period, limit=limit, offset=offset, me_user_id=me_user_id)
+    return data
 
-@router.get("/youth/contributed", response_model=LBWrapYouthContrib)
-def leaderboard_youth_contributed(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    limit: int = Query(20, ge=1, le=200),
+@router.get("/youth/contributed", response_model=LBResponse)
+def lb_youth_contributed(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     me_user_id: Optional[str] = Query(None),
-    session: Session = Depends(session_dep),
 ):
-    """
-    Youth ECO **contributed** leaderboard... sum of ECO contributed to businesses
-    via EYBA (settled contribution txns) in the period.
-    """
-    return _with_direct_bolt_retry(
-        top_youth_contributed, session, period=period, limit=limit, offset=offset, me_user_id=me_user_id
-    )
+    data = top_youth_contributed(s, period=period, limit=limit, offset=offset, me_user_id=me_user_id)
+    return data
 
-@router.get("/business/eco", response_model=LBWrapBizECO)
-def leaderboard_business_eco(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    limit: int = Query(20, ge=1, le=200),
+@router.get("/business/eco", response_model=LBResponse)
+def lb_business_eco(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     me_business_id: Optional[str] = Query(None),
-    session: Session = Depends(session_dep),
 ):
-    """Business ECO leaderboard... total ECO **collected** (youth contributions in) in the period."""
-    return _with_direct_bolt_retry(
-        top_business_eco, session, period=period, limit=limit, offset=offset, me_business_id=me_business_id
-    )
+    data = top_business_eco(s, period=period, limit=limit, offset=offset, me_business_id=me_business_id)
+    return data
 
-@router.get("/youth/actions", response_model=LBWrapYouthActions)
-def leaderboard_youth_actions(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    type: Optional[str] = Query(None, pattern="^(eco_action|sidequest|all)?$"),
-    limit: int = Query(20, ge=1, le=200),
+@router.get("/youth/actions", response_model=LBResponse)
+def lb_youth_actions(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    kind: Optional[str] = Query(None),  # 'eco_action' | 'sidequest' | 'all' | None
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
     me_user_id: Optional[str] = Query(None),
-    session: Session = Depends(session_dep),
 ):
-    """
-    Youth sidequest completions (approved submissions) leaderboard.
-    - period: total | weekly | monthly
-    - type: eco_action | sidequest | all (default all)
-    """
-    return _with_direct_bolt_retry(
-        top_youth_actions, session, period=period, mission_type=type, limit=limit, offset=offset, me_user_id=me_user_id
-    )
+    data = top_youth_actions(s, period=period, mission_type=kind, limit=limit, offset=offset, me_user_id=me_user_id)
+    return data

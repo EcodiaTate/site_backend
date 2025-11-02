@@ -20,6 +20,8 @@ def ensure_constraints(driver: Driver) -> None:
         "CREATE CONSTRAINT biz_user_unique IF NOT EXISTS FOR (b:BusinessProfile) REQUIRE b.user_id IS UNIQUE",
         # NEW: ensure BusinessProfile.id exists & is unique
         "CREATE CONSTRAINT business_id IF NOT EXISTS FOR (b:BusinessProfile) REQUIRE b.id IS UNIQUE",
+        "CREATE CONSTRAINT avatarblob_sha IF NOT EXISTS FOR (b:AvatarBlob) REQUIRE b.sha IS UNIQUE",
+
     # NEW: one prefs node per user
         "CREATE CONSTRAINT notif_prefs_user IF NOT EXISTS FOR (p:NotificationPrefs) REQUIRE p.user_id IS UNIQUE",
         "CREATE CONSTRAINT privacy_prefs_user IF NOT EXISTS FOR (p:PrivacyPrefs) REQUIRE p.user_id IS UNIQUE",

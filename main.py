@@ -39,7 +39,7 @@ from site_backend.core.admin_guard import require_admin, JWT_SECRET, JWT_ALGO
 from site_backend.core.neo_driver import build_driver, ensure_constraints
 from site_backend.core.admin_cookie import router as admin_cookie_router
 
-from site_backend.api import auth, profile, stats, launchpad, gamification
+from site_backend.api import auth, profile, stats, launchpad, gamification, account
 from site_backend.api.eco_home import home_routes
 from site_backend.api.eyba import router as eyba_router
 from site_backend.api.sidequests import router as sidequest_router
@@ -52,6 +52,8 @@ from site_backend.api.export_worker import router as worker_router
 from site_backend.api.social.router_public import router as social_router
 from site_backend.api.teams.router_public import router as teams_router
 from site_backend.api.tournaments.router_public import router as tournaments_router
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from site_backend.api.account.service import gc_avatar_blobs  # adjust path if your GC lives elsewhere
 
 # --- config -------------------------------------------------------------------
 API_PORT = int(os.getenv("API_PORT", "8000"))
@@ -158,11 +160,44 @@ async def lifespan(app: FastAPI):
     ensure_constraints(driver)
     app.state.driver = driver
     print("[lifespan] Neo4j connected & constraints ensured")
+
+    # ── Avatar GC scheduler ─────────────────────────────────────────────
+    scheduler = AsyncIOScheduler(timezone="Australia/Brisbane")  # or "Australia/Brisbane" if you prefer local time
+    def run_avatar_gc():
+        try:
+            with driver.session() as s:
+                purged = gc_avatar_blobs(s)
+                if purged:
+                    print(f"[avatar-gc] purged {purged} blobs")
+        except Exception as e:
+            # Keep errors from crashing the scheduler
+            print(f"[avatar-gc] error: {e}")
+
+    # Every 6 hours at minute 7 (staggered a bit after the hour)
+    scheduler.add_job(
+        run_avatar_gc,
+        trigger="cron",
+        hour="*/6",
+        minute=7,
+        id="gc_avatars",
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    scheduler.start()
+    app.state.scheduler = scheduler
+    # ───────────────────────────────────────────────────────────────────
+
     try:
         yield
     finally:
+        try:
+            scheduler.shutdown(wait=False)
+        except Exception:
+            pass
         driver.close()
         print("[lifespan] driver closed")
+
+ 
 
 # --- app factory --------------------------------------------------------------
 def create_app() -> FastAPI:
@@ -197,6 +232,7 @@ def create_app() -> FastAPI:
     app.include_router(sidequest_router)
     app.include_router(home_routes.router)
     app.include_router(stats.router)
+    app.include_router(account.router)
     app.include_router(account_delete_router)
     app.include_router(admin_cookie_router)
     app.include_router(launchpad.router)

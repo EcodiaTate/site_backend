@@ -90,9 +90,6 @@ class UserOut(BaseModel):
     role: str
     caps: dict[str, Any]
     profile: dict[str, Any] = {}
-
-# ... join endpoints unchanged ...
-
 @router.post("/login")
 def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
     cypher = """
@@ -110,8 +107,6 @@ def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
 
     u = rec["u"]
     from argon2.exceptions import VerifyMismatchError
-    from argon2 import PasswordHasher
-    ph = PasswordHasher()
     try:
         ph.verify(u["password_hash"], p.password)
     except VerifyMismatchError:
@@ -119,17 +114,29 @@ def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
 
     role = (u.get("role") or "public").lower()
     profile = {}
-    if role == "youth" and rec.get("yp"): profile = dict(rec["yp"])
-    elif role == "business" and rec.get("bp"): profile = dict(rec["bp"])
-    elif role == "creative" and rec.get("cp"): profile = dict(rec["cp"])
-    elif role == "partner" and rec.get("pp"): profile = dict(rec["pp"])
-    elif role == "public" and rec.get("pub"): profile = dict(rec["pub"])
+    if role == "youth" and rec.get("yp"):
+        profile = dict(rec["yp"])
+    elif role == "business" and rec.get("bp"):
+        profile = dict(rec["bp"])
+    elif role == "creative" and rec.get("cp"):
+        profile = dict(rec["cp"])
+    elif role == "partner" and rec.get("pp"):
+        profile = dict(rec["pp"])
+    elif role == "public" and rec.get("pub"):
+        profile = dict(rec["pub"])
+
+    # ⛑️ Unify avatar at session boundary:
+    # Prefer profile.avatar_url if set; otherwise use user.avatar_url.
+    # This lets FE always read resp.profile.avatar_url across roles.
+    prof_avatar = profile.get("avatar_url") if isinstance(profile, dict) else None
+    unified_avatar = prof_avatar or u.get("avatar_url")
+    if isinstance(profile, dict):
+        profile["avatar_url"] = unified_avatar
 
     caps = _safe_caps(u.get("caps_json") or "{}", role)
 
     access, exp = _mint_access(u["id"], u["email"])
     refresh = _mint_refresh(u["id"])
-    # Set refresh cookie with shared helper
     set_scoped_cookie(response, name=REFRESH_COOKIE_NAME, value=refresh, max_age=REFRESH_TTL_DAYS * 24 * 3600)
 
     resp = {
@@ -137,8 +144,8 @@ def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
         "email": u["email"],
         "role": role,
         "caps": caps,
-        "profile": profile,
-        "user_token": u["id"],  # legacy, slated for deprecation
+        "profile": profile,             # ← with unified profile["avatar_url"]
+        "user_token": u["id"],          # legacy
         "token": access,
         "exp": exp,
     }
@@ -149,6 +156,7 @@ def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
         resp["admin_token"] = jwt.encode(admin_payload, JWT_SECRET, algorithm=JWT_ALGO)
 
     return resp
+
 
 @router.post("/admin-cookie")
 def r_admin_cookie_here(
