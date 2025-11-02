@@ -6,7 +6,6 @@ from fastapi import APIRouter, Depends, Query, HTTPException
 from pydantic import BaseModel, Field
 from math import radians, sin, cos, atan2, sqrt
 from neo4j import Session
-from inspect import signature
 
 from site_backend.core.neo_driver import session_dep
 
@@ -25,14 +24,12 @@ class PlaceOut(BaseModel):
     pledge_tier: PledgeTier
     industry_group: Optional[str] = None
     area_type: Optional[AreaType] = None
-    has_offers: bool = False  # active offers requiring ECO to retire (status=active, stock ok)
-
+    has_offers: bool = False  # active & in-stock offers with eco_price>0
     # Optional enrichments
     address: Optional[str] = None
     url: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     open_now: Optional[bool] = None
-
     # Calculated
     distance_km: Optional[float] = None
 
@@ -73,12 +70,6 @@ def _merge_multi_and_csv(multi: Optional[List[str]], csv: Optional[str]) -> Opti
     if csv:   out.extend([s.strip() for s in csv.split(",") if s.strip()])
     return out or None
 
-def _call_service_safely(svc, s: Session, kwargs: Dict[str, Any]):
-    sig = signature(svc)
-    accepted = set(sig.parameters.keys())
-    filtered = {k: v for k, v in kwargs.items() if k in accepted and v is not None}
-    return svc(s, **filtered)
-
 # -------- Endpoint --------
 @router.get("/places", response_model=PlacesResponse)
 def get_places(
@@ -97,15 +88,18 @@ def get_places(
 
     # search + filters
     q: Optional[str] = Query(None, description="free text: name/address/tags"),
-    pledge: Optional[List[str]] = Query(None, description="multi: ?pledge=starter&pledge=leader"),
-    pledge_csv: Optional[str] = Query(None, alias="pledge", description="CSV legacy"),
-    industry: Optional[List[str]] = Query(None, description="multi: ?industry=retail&industry=hospitality"),
-    industry_csv: Optional[str] = Query(None, alias="industry", description="CSV legacy"),
-    area: Optional[List[str]] = Query(None, description="multi: ?area=cbd&area=suburb"),
-    area_csv: Optional[str] = Query(None, alias="area", description="CSV legacy"),
 
-    # optional hours hint
-    open_now: Optional[bool] = None,
+    # IMPORTANT: no alias collisions anymore
+    pledge: Optional[List[str]] = Query(None, description="multi: ?pledge=starter&pledge=leader"),
+    pledge_csv: Optional[str] = Query(None, description="CSV legacy: ?pledge_csv=starter,leader"),
+
+    industry: Optional[List[str]] = Query(None, description="multi: ?industry=retail&industry=hospitality"),
+    industry_csv: Optional[str] = Query(None, description="CSV legacy: ?industry_csv=retail,hospitality"),
+
+    area: Optional[List[str]] = Query(None, description="multi: ?area=cbd&area=suburb"),
+    area_csv: Optional[str] = Query(None, description="CSV legacy: ?area_csv=cbd,suburb"),
+
+    open_now: Optional[bool] = None,  # hint only – not enforced unless you store hours
 
     # sorting + distance
     sort: Optional[str] = Query("name", pattern="^(distance|name|tier)$"),
@@ -122,74 +116,128 @@ def get_places(
     industries = _merge_multi_and_csv(industry, industry_csv)
     areas      = _merge_multi_and_csv(area, area_csv)
 
-    svc_kwargs: Dict[str, Any] = dict(
-        min_lat=bbox_tuple[0] if bbox_tuple else None,
-        min_lng=bbox_tuple[1] if bbox_tuple else None,
-        max_lat=bbox_tuple[2] if bbox_tuple else None,
-        max_lng=bbox_tuple[3] if bbox_tuple else None,
-        q=q,
-        pledges=pledges,
-        industries=industries,
-        areas=areas,
-        open_now=open_now,
-        sort=sort,
-        lat=lat, lng=lng, user_lat=lat, user_lng=lng,
-        page=page, page_size=page_size,
+    # ---- Build Cypher (no external service dependency) ----
+    # Only visible businesses by default.
+    # `has_offers` means: at least one active, in-stock offer with eco_price>0 and valid_until >= today (or null).
+    cypher = """
+      // base set
+      MATCH (b:BusinessProfile)
+      WHERE coalesce(b.visible_on_map, true) = true
+
+      // optional spatial bbox
+      WITH b
+      WHERE
+        $min_lat IS NULL OR $min_lng IS NULL OR $max_lat IS NULL OR $max_lng IS NULL OR
+        (b.lat IS NOT NULL AND b.lng IS NOT NULL AND
+         toFloat(b.lat) >= $min_lat AND toFloat(b.lat) <= $max_lat AND
+         toFloat(b.lng) >= $min_lng AND toFloat(b.lng) <= $max_lng)
+
+      // free-text search over a few properties (case-insensitive)
+      WITH b
+      WHERE
+        $q IS NULL OR
+        toLower(coalesce(b.name,'')) CONTAINS toLower($q) OR
+        toLower(coalesce(b.address,'')) CONTAINS toLower($q) OR
+        ($q IN coalesce([x IN coalesce(b.tags,[]) | toLower(x)], []))
+
+      // multi-filters
+      WITH b
+      WHERE
+        $pledges IS NULL OR toLower(coalesce(b.pledge_tier,'')) IN [x IN $pledges | toLower(x)]
+      WITH b
+      WHERE
+        $industries IS NULL OR toLower(coalesce(b.industry_group,'')) IN [x IN $industries | toLower(x)]
+      WITH b
+      WHERE
+        $areas IS NULL OR toLower(coalesce(b.area,'')) IN [x IN $areas | toLower(x)]
+
+      // compute has_offers flag
+      OPTIONAL MATCH (o:Offer)-[:OF]->(b)
+      WHERE coalesce(o.status,'active')='active'
+        AND toInteger(coalesce(o.eco_price,0)) > 0
+        AND (o.stock IS NULL OR toInteger(o.stock) > 0)
+        AND (o.valid_until IS NULL OR date(o.valid_until) >= date())
+
+      WITH b, count(o) AS offer_count
+
+      // collect rows for post-sorting/paging in Python (distance calc)
+      RETURN
+        b.id AS business_id,
+        coalesce(b.name,'') AS name,
+        toFloat(b.lat) AS lat,
+        toFloat(b.lng) AS lng,
+        toLower(coalesce(b.pledge_tier,'')) AS pledge_tier,
+        toLower(coalesce(b.industry_group,'')) AS industry_group,
+        toLower(coalesce(b.area,'')) AS area_type,
+        coalesce(b.address,'') AS address,
+        coalesce(b.website,'') AS url,
+        coalesce(b.tags, []) AS tags,
+        (offer_count > 0) AS has_offers
+    """
+
+    recs = s.run(
+        cypher,
+        {
+            "q": q,
+            "pledges": pledges,
+            "industries": industries,
+            "areas": areas,
+            "min_lat": bbox_tuple[0] if bbox_tuple else None,
+            "min_lng": bbox_tuple[1] if bbox_tuple else None,
+            "max_lat": bbox_tuple[2] if bbox_tuple else None,
+            "max_lng": bbox_tuple[3] if bbox_tuple else None,
+        },
     )
 
-    # Primary source: service
-    from site_backend.api.services.neo_places import list_places_with_offer_flag
-    raw = _call_service_safely(list_places_with_offer_flag, s, svc_kwargs)
+    rows = [r.data() for r in recs]  # list[dict]
+    items: List[PlaceOut] = []
+    for r in rows:
+        # Skip rows missing essentials
+        if not r.get("name") or r.get("lat") is None or r.get("lng") is None:
+            continue
 
-    # Normalize to PlacesResponse
-    if isinstance(raw, dict):
-        raw_items = raw.get("items", []) or []
-        items: List[PlaceOut] = []
-        for it in raw_items:
-            items.append(PlaceOut(**it) if isinstance(it, dict) else it)
-        total = int(raw.get("total", len(items)))
-        data = PlacesResponse(items=items, total=total, page=page, page_size=page_size)
-    else:
-        # If service returns a Pydantic-like object already
-        data = raw  # type: ignore
+        # Pydantic expects a separate "id"
+        item = PlaceOut(
+            id=r["business_id"],
+            business_id=r["business_id"],
+            name=r["name"],
+            lat=float(r["lat"]),
+            lng=float(r["lng"]),
+            pledge_tier=(r["pledge_tier"] or "starter"),  # default for safety
+            industry_group=(r["industry_group"] or None),
+            area_type=(r["area_type"] or None),
+            has_offers=bool(r.get("has_offers", False)),
+            address=(r["address"] or None),
+            url=(r["url"] or None),
+            tags=r.get("tags") or [],
+            open_now=None,
+            distance_km=None,
+        )
+        items.append(item)
 
-    # Backfill has_offers if not provided by the service or to enforce the new rule:
-    # active offers with eco_price>0 and (stock is None or stock>0)
-    missing = [p.business_id for p in data.items if p.has_offers is False]
-    if missing:
-        rows = s.run(
-            """
-            MATCH (b:BusinessProfile)
-            WHERE b.id IN $bids
-            OPTIONAL MATCH (b)<-[:OF]-(o:Offer)
-            WHERE coalesce(o.status,'active')='active'
-              AND toInteger(coalesce(o.eco_price,0)) > 0
-              AND (o.stock IS NULL OR toInteger(o.stock) > 0)
-            RETURN b.id AS bid, count(o) AS c
-            """,
-            bids=list(set(missing)),
-        ).data() or []
-        has_by_bid = {r["bid"]: (int(r["c"]) > 0) for r in rows}
-        for i, p in enumerate(data.items):
-            if not p.has_offers:
-                data.items[i].has_offers = bool(has_by_bid.get(p.business_id, False))
-
-    # Sort post-processing
+    # Sorting in Python (to support distance)
     if sort == "distance" and lat is not None and lng is not None:
-        for i, p in enumerate(data.items):
-            if p.distance_km is None:
-                try:
-                    data.items[i].distance_km = round(_haversine_km(lat, lng, p.lat, p.lng), 2)
-                except Exception:
-                    pass
-        data.items.sort(key=lambda x: (x.distance_km if x.distance_km is not None else 1e9, (x.name or "").lower()))
+        for it in items:
+            try:
+                it.distance_km = round(_haversine_km(lat, lng, it.lat, it.lng), 2)
+            except Exception:
+                it.distance_km = None
+        items.sort(key=lambda x: (x.distance_km if x.distance_km is not None else 1e9, x.name.lower()))
     elif sort == "name":
-        data.items.sort(key=lambda x: (x.name or "").lower())
+        items.sort(key=lambda x: x.name.lower())
     elif sort == "tier":
-        data.items.sort(key=lambda x: (-_tier_rank(x.pledge_tier), (x.name or "").lower()))
+        items.sort(key=lambda x: (-_tier_rank(x.pledge_tier), x.name.lower()))
 
-    if data.total is None:
-        data.total = len(data.items)
-    data.page = page
-    data.page_size = page_size
-    return data
+    total = len(items)
+
+    # Paging (1-based page)
+    start = (page - 1) * page_size
+    end = start + page_size
+    page_items = items[start:end]
+
+    return PlacesResponse(
+        items=page_items,
+        total=total,
+        page=page,
+        page_size=page_size,
+    )

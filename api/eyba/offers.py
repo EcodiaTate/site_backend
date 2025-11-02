@@ -168,10 +168,41 @@ class OfferIn(BaseModel):
     valid_until: Optional[date] = None
     tags: List[str] = Field(default_factory=list)
 
-class OfferOut(OfferIn):
+
+class OfferOut(BaseModel):
     id: str
-    business_id: str
-    claims: int | None = 0
+    business_id: Optional[str] = None
+    title: str
+    blurb: Optional[str] = None
+    status: Optional[str] = "active"
+    eco_price: Optional[int] = None
+    fiat_cost_cents: Optional[int] = None
+    stock: Optional[int] = None
+    url: Optional[str] = None
+    valid_until: Optional[str] = None
+    tags: Optional[List[str]] = None
+    createdAt: Optional[int] = None
+
+def _normalize_offer(o: Dict[str, Any]) -> Dict[str, Any]:
+    # prefer eco_price but fallback to redeem_eco
+    eco_price = o.get("eco_price")
+    if eco_price is None and o.get("redeem_eco") is not None:
+        eco_price = int(o["redeem_eco"])
+    return {
+        "id": o.get("id"),
+        "business_id": o.get("business_id"),
+        "title": o.get("title"),
+        "blurb": o.get("blurb"),
+        "status": o.get("status") or "active",
+        "eco_price": eco_price,
+        "fiat_cost_cents": o.get("fiat_cost_cents"),
+        "stock": o.get("stock"),
+        "url": o.get("url"),
+        "valid_until": o.get("valid_until"),
+        "tags": o.get("tags"),
+        "createdAt": o.get("createdAt"),
+    }
+
 
 class OfferPatch(BaseModel):
     title: Optional[str] = Field(None, min_length=2, max_length=120)
@@ -228,37 +259,53 @@ class SuggestPriceOut(BaseModel):
 # Offers (owner-scoped)
 # ============================================================
 
+def _is_visible(o: Dict[str, Any]) -> bool:
+    # visible means: active, eco_price>0, stock not exhausted, not expired
+    if (o.get("status") or "active") != "active":
+        return False
+    eco_price = o.get("eco_price") or 0
+    if int(eco_price) <= 0:
+        return False
+    stock = o.get("stock")
+    if stock is not None and int(stock) <= 0:
+        return False
+    vu = o.get("valid_until")
+    if vu:
+        try:
+            # accept YYYY-MM-DD or ISO date
+            d = datetime.fromisoformat(vu).date() if "T" in vu else date.fromisoformat(vu)
+            if d < date.today():
+                return False
+        except Exception:
+            # if bad date string, treat as not visible
+            return False
+    return True
+
 @router.get("/offers", response_model=List[OfferOut])
 def list_offers_api(
-    status: Optional[OfferStatus] = Query(None, description="Filter by status"),
-    visible_only: Optional[bool] = Query(None, description="Deprecated; owner scope only here"),
-    business_id: Optional[str] = Query(None, description="Optional if you own multiple"),
     s: Session = Depends(session_dep),
-    user_id: str = Depends(current_user_id),
+    business_id: Optional[str] = Query(None, alias="business_id"),
+    status: Optional[str] = Query(None, pattern="^(active|paused|hidden)$"),
+    visible_only: bool = Query(False),
 ):
-    bid = _resolve_user_business_id(s, user_id, business_id)
+    """
+    - Call the service with the required keyword-only `visible_only`.
+    - Then do API-layer filtering for `status` and visibility rules if requested.
+    """
+    # ✅ FIX: pass visible_only to satisfy service signature
+    raw = svc_list_offers(s, business_id=business_id, visible_only=visible_only)
 
-    # Prefer service if it supports new fields; else query directly.
-    if svc_list_offers:
-        arr = svc_list_offers(s, business_id=bid, status=status)
-        return [OfferOut(**o, business_id=bid) for o in arr]
+    offers = [_normalize_offer(dict(o) if not isinstance(o, dict) else o) for o in (raw or [])]
 
-    recs = s.run(
-        f"""
-        MATCH (b:BusinessProfile {{id:$bid}})<-[:OF]-(o:Offer)
-        WHERE ($status IS NULL OR o.status = $status)
-        RETURN o{{.*, business_id: $bid}} AS offer
-        ORDER BY coalesce(o.updated_at, o.created_at) DESC
-        """,
-        bid=bid,
-        status=status,
-    )
-    out: List[OfferOut] = []
-    for r in recs:
-        o = dict(r["offer"])
-        o.setdefault("claims", 0)
-        out.append(OfferOut(**o))
-    return out
+    # API-side status filtering (service may or may not support it)
+    if status:
+        offers = [o for o in offers if (o.get("status") or "active") == status]
+
+    # If the service returned more than "visible" despite visible_only, enforce again just in case
+    if visible_only:
+        offers = [o for o in offers if _is_visible(o)]
+
+    return [OfferOut(**o) for o in offers]
 
 @router.get("/offers/{offer_id}", response_model=OfferOut)
 def get_offer_api(
@@ -336,7 +383,8 @@ def create_offer_api(
         tags=payload.tags,
         now=now_ms(),
     )
-    return OfferOut(id=oid, business_id=bid, **payload.model_dump(), claims=0)
+    # Note: `claims` not in OfferOut schema; extra is ignored but we avoid passing it here.
+    return OfferOut(id=oid, business_id=bid, **payload.model_dump())
 
 @router.patch("/offers/{offer_id}", response_model=OfferOut)
 def patch_offer_api(

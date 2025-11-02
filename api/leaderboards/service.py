@@ -321,12 +321,17 @@ def top_youth_eco(
                       END AS eco_real_piece
                   WITH u2, my_eco, sum(eco_real_piece) AS eco_real2
 
-                  // B) Virtual for others
-                  OPTIONAL MATCH (u2)-[:SUBMITTED]->(sub2:Submission {{state:'approved'}})-[:FOR]->(:Sidequest)
-                  WITH u2, my_eco, eco_real2,
-                       toInteger(timestamp(coalesce(sub2.reviewed_at, sub2.created_at, datetime()))) AS sub2_ms
-                  WHERE sub2 IS NULL OR ($since IS NULL OR sub2_ms >= $since)
-                  WITH my_eco, toInteger(eco_real2) + toInteger(count(sub2)) AS eco2
+                  // B) Virtual for others (approved, no PROOF EcoTx) — windowed sum of reward_eco
+                  OPTIONAL MATCH (u2)-[:SUBMITTED]->(sub2:Submission {{state:'approved'}})-[:FOR]->(sq2:Sidequest)
+                  WHERE NOT (sub2)<-[:PROOF]-(:EcoTx)
+                  WITH u2, my_eco, eco_real2, sub2, sq2,
+                      toInteger(timestamp(coalesce(sub2.reviewed_at, sub2.created_at, datetime()))) AS sub2_ms,
+                      toInteger(coalesce(sq2.reward_eco,0)) AS reward_eco2
+                  WITH my_eco, eco_real2,
+                      CASE WHEN $since IS NULL OR sub2_ms >= $since THEN reward_eco2 ELSE 0 END AS eco_virtual_piece
+                  WITH my_eco, eco_real2, sum(eco_virtual_piece) AS eco_virtual2
+
+                  WITH my_eco, toInteger(eco_real2) + toInteger(eco_virtual2) AS eco2
                   WHERE eco2 > my_eco
                   RETURN count(*) AS higher
                 }}
@@ -358,6 +363,7 @@ def top_youth_eco(
             "my": meta_my,
         },
     }
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Youth ECO leaderboard (CONTRIBUTED → businesses)

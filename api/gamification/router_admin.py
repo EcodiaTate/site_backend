@@ -1,4 +1,6 @@
+# site_backend/api/gamification/router_admin.py
 from __future__ import annotations
+
 from fastapi import APIRouter, Depends
 from neo4j import Session
 
@@ -15,7 +17,7 @@ from site_backend.api.gamification.schema import (
 
 router = APIRouter(prefix="/admin/gamification", tags=["admin-gamification"])
 
-# Optional: swap with your real admin policy
+# TODO: replace with your real admin policy
 def _ensure_admin(uid: str) -> None:
     # if not user_is_admin(uid): raise HTTPException(403, "forbidden")
     return
