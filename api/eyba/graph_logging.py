@@ -29,7 +29,7 @@ class ClaimTx:
             self.tx_id = f"tx_{uuid4().hex[:16]}"
         return self
 
-def log_eyba_claim(session: Session, claim: ClaimTx) -> str:
+def log_eco_local_claim(session: Session, claim: ClaimTx) -> str:
     """
     Canonical logging into the unified EcoTx ledger.
 
@@ -95,7 +95,7 @@ def log_eyba_claim(session: Session, claim: ClaimTx) -> str:
         t.amount     = $eco,
         t.kind       = "scan",
         t.method     = $method,
-        t.source     = "eyba",
+        t.source     = "eco_local",
         t.status     = "settled",
         t.createdAt  = $created_ms,
         t.at         = datetime($at),

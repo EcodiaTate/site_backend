@@ -21,9 +21,9 @@ from neo4j import Session
 from pydantic import BaseModel
 
 from site_backend.core.neo_driver import session_dep
-from site_backend.core.user_guard import current_user_id  # strict, same as /eyba/wallet
+from site_backend.core.user_guard import current_user_id  # strict, same as /eco_local/wallet
 
-router = APIRouter(prefix="/eyba", tags=["eyba"])
+router = APIRouter(prefix="/eco_local", tags=["eco_local"])
 
 PledgeTier = Literal["starter", "builder", "leader"]
 
@@ -97,16 +97,16 @@ def _bypass_requested(req: Request, debug: int) -> bool:
     True if caller asked to bypass guard rails.
     - Query:   ?nocap=1
     - Query:   ?debug=2
-    - Header:  X-EYBA-Dev-Bypass: 1
-    - Env:     EYBA_DEV_DISABLE_GUARDS=1
+    - Header:  X-ECO Local-Dev-Bypass: 1
+    - Env:     ECO_LOCAL_DEV_DISABLE_GUARDS=1
     """
-    if os.getenv("EYBA_DEV_DISABLE_GUARDS") == "1":
+    if os.getenv("ECO_LOCAL_DEV_DISABLE_GUARDS") == "1":
         return True
     if debug and int(debug) >= 2:
         return True
     if req.query_params.get("nocap") == "1":
         return True
-    if req.headers.get("X-EYBA-Dev-Bypass") == "1":
+    if req.headers.get("X-ECO Local-Dev-Bypass") == "1":
         return True
     return False
 
@@ -114,17 +114,17 @@ def _bypass_geofence(req: Request, debug: int) -> bool:
     """
     True if caller asked to bypass geofence.
     - Query:  ?nogeo=1
-    - Header: X-EYBA-NoGeo: 1
-    - Env:    EYBA_DEV_DISABLE_GUARDS=1
+    - Header: X-ECO Local-NoGeo: 1
+    - Env:    ECO_LOCAL_DEV_DISABLE_GUARDS=1
     - Or debug>=2
     """
-    if os.getenv("EYBA_DEV_DISABLE_GUARDS") == "1":
+    if os.getenv("ECO_LOCAL_DEV_DISABLE_GUARDS") == "1":
         return True
     if debug and int(debug) >= 2:
         return True
     if req.query_params.get("nogeo") == "1":
         return True
-    if req.headers.get("X-EYBA-NoGeo") == "1":
+    if req.headers.get("X-ECO Local-NoGeo") == "1":
         return True
     return False
 
@@ -485,7 +485,7 @@ async def claim_eco(
           ON CREATE SET
             t.amount      = $eco,
             t.kind        = "CONTRIBUTE",
-            t.source      = "eyba",
+            t.source      = "eco_local",
             t.status      = "settled",
             t.createdAt   = $now_ms,
             t.at          = datetime($now_iso),
@@ -532,7 +532,7 @@ async def claim_eco(
 @router.post("/tx/{tx_id}/attach_offer", response_model=AttachOfferResponse)
 def attach_offer(tx_id: str, payload: AttachOfferRequest, s: Session = Depends(session_dep)):
     """
-    Deprecated under the new mechanics. EYBA claims are contributions to businesses.
+    Deprecated under the new mechanics. ECO Local claims are contributions to businesses.
     Offers redemption should be handled by separate endpoints if/when reintroduced.
     """
     raise HTTPException(

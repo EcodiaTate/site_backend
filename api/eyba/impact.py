@@ -1,4 +1,4 @@
-# api/eyba/impact.py
+# api/eco_local/impact.py
 from __future__ import annotations
 from typing import Optional, Dict, Any, List
 
@@ -15,9 +15,9 @@ from site_backend.api.services.impact import (
     enable_events_for_business,
     record_scan_mint,
 )
-from site_backend.api.eyba.onboard import _resolve_user_business_id
+from site_backend.api.eco_local.onboard import _resolve_user_business_id
 
-router = APIRouter(prefix="/eyba/impact", tags=["impact"])
+router = APIRouter(prefix="/eco_local/impact", tags=["impact"])
 
 # ----- Models -----
 class ImpactInputs(BaseModel):

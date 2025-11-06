@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id as _current_user_id
 
-router = APIRouter(prefix="/eyba", tags=["eyba"])
+router = APIRouter(prefix="/eco_local", tags=["eco_local"])
 
 # ---------- helpers ----------
 def _now_ms() -> int:

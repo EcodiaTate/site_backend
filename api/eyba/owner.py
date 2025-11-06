@@ -1,4 +1,4 @@
-# site_backend/api/eyba/owner.py
+# site_backend/api/eco_local/owner.py
 from __future__ import annotations
 
 from typing import List, Optional, Literal, Any, Dict
@@ -86,11 +86,11 @@ class PatchProfile(BaseModel):
     visible_on_map: Optional[bool] = None
     tags: Optional[List[str]] = None
 
-router = APIRouter(prefix="/eyba/owner", tags=["eyba.owner"])
-assets_router = APIRouter(prefix="/eyba/assets", tags=["eyba.assets"])
+router = APIRouter(prefix="/eco_local/owner", tags=["eco_local.owner"])
+assets_router = APIRouter(prefix="/eco_local/assets", tags=["eco_local.assets"])
 
 # Where to drop hero files (served by your StaticFiles mount)
-UPLOAD_DIR = os.getenv("EYBA_UPLOAD_DIR", "uploads/hero")
+UPLOAD_DIR = os.getenv("ECO_LOCAL_UPLOAD_DIR", "uploads/hero")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Small helpers for Neo4j session access
@@ -391,7 +391,7 @@ def business_recent_activity(
   // Inbound: contributions collected by the business
   MATCH (b)-[:COLLECTED]->(tin:EcoTx)
   WHERE coalesce(tin.status,'settled')='settled'
-    AND (coalesce(tin.kind,'')='CONTRIBUTE' OR tin.source='contribution' OR tin.source='eyba')
+    AND (coalesce(tin.kind,'')='CONTRIBUTE' OR tin.source='contribution' OR tin.source='eco_local')
   RETURN
     tin.id AS id,
     toString(datetime({epochMillis: toInteger(coalesce(tin.createdAt, timestamp(tin.at), timestamp()))})) AS createdAt,
@@ -621,7 +621,7 @@ def analytics_busy(
     MATCH (b)-[:COLLECTED]->(t:EcoTx {status:'settled'})
     WHERE (
       coalesce(t.kind,'')='MINT_ACTION'
-      OR coalesce(t.source,'') IN ['qr','contribution','sidequest','eyba']
+      OR coalesce(t.source,'') IN ['qr','contribution','sidequest','eco_local']
     ) AND coalesce(t.at, datetime({epochMillis:t.createdAt})) >= since
     WITH
       time(coalesce(t.at, datetime({epochMillis:t.createdAt}))).hour AS hr,

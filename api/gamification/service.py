@@ -239,7 +239,7 @@ def _eco_ledger_for_user(s: Session, uid: str) -> dict:
     """
     Returns:
       eco_earned_total: int (sum of EcoTx.eco)
-      eco_spent_total:  int (0 here; EYBA wallet burns are elsewhere)
+      eco_spent_total:  int (0 here; ECO Local wallet burns are elsewhere)
       eco_balance:      int (earned - spent)
       last_tx_at:       ISO str | None
     """
@@ -251,7 +251,7 @@ def _eco_ledger_for_user(s: Session, uid: str) -> dict:
     """, uid=uid).single()
 
     earned = int((rec and rec.get("earned")) or 0)
-    spent = 0  # EYBA burns live in the rewards/retire flow, not EcoTx
+    spent = 0  # ECO Local burns live in the rewards/retire flow, not EcoTx
     return {
         "eco_earned_total": earned,
         "eco_spent_total": spent,

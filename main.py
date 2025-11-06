@@ -41,7 +41,6 @@ from site_backend.core.admin_cookie import router as admin_cookie_router
 
 from site_backend.api import auth, profile, stats, launchpad, gamification, account
 from site_backend.api.eco_home import home_routes
-from site_backend.api.eyba import router as eyba_router
 from site_backend.api.sidequests import router as sidequest_router
 from site_backend.api.leaderboards import leaderboards
 from site_backend.api.account_delete import router as account_delete_router
@@ -226,7 +225,6 @@ def create_app() -> FastAPI:
             return await call_next(request)
    
     app.include_router(debug_router)
-    app.include_router(eyba_router)
     app.include_router(auth.router, prefix="/auth", tags=["auth"])
     app.include_router(profile.router, prefix="/youth", tags=["youth"])
     app.include_router(sidequest_router)

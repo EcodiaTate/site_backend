@@ -1,4 +1,4 @@
-# api/eyba/onboard.py
+# api/eco_local/onboard.py
 from __future__ import annotations
 
 from typing import Optional, Dict, Any
@@ -14,7 +14,7 @@ from site_backend.api.services.neo_business import (
     business_update_standards,
 )
 
-router = APIRouter(prefix="/eyba", tags=["onboarding"])
+router = APIRouter(prefix="/eco_local", tags=["onboarding"])
 
 # ---------------- Helpers (shared) ----------------
 def _resolve_user_business_id(s: Session, user_id: str, requested: Optional[str]) -> str:

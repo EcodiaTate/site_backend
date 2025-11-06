@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/eyba/business/public", tags=["eyba-business-public"])
+router = APIRouter(prefix="/eco_local/business/public", tags=["eco_local-business-public"])
 
 # ---------------------------------------------------------
 # Public business profile

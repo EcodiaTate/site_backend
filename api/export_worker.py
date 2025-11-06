@@ -63,7 +63,7 @@ def run_export(jobId: str, s: Session = Depends(session_dep)):
             "businessProfile": dict(bp) if bp else None,
             "projects": [dict(p) for p in projects],
             "launchpadItems": [dict(l) for l in launchpad],
-            # TODO: add EYBA redemptions, comments, messages, etc.
+            # TODO: add ECO Local redemptions, comments, messages, etc.
         }
 
         # ===== write to ZIP in memory =====

@@ -20,7 +20,7 @@ ROLE_CREATE_PROFILE_CYPHER: dict[str, str] = {
         MATCH (u:User {id:$uid})
         MERGE (p:YouthProfile { user_id:$uid })
           ON CREATE SET p.birth_year = coalesce(p.birth_year, 2006),
-                        p.eyba_points = 0,
+                        p.eco_local_points = 0,
                         p.actions_completed = 0
         MERGE (u)-[:HAS_PROFILE]->(p)
     """,

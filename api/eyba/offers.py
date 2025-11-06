@@ -1,4 +1,4 @@
-# api/routers/eyba_offers.py
+# api/routers/eco_local_offers.py
 from __future__ import annotations
 
 from datetime import date, timedelta, datetime, timezone
@@ -21,7 +21,7 @@ from site_backend.api.services.neo_business import (
     delete_offer as svc_delete_offer,
 )
 
-router = APIRouter(prefix="/eyba", tags=["eyba"])
+router = APIRouter(prefix="/eco_local", tags=["eco_local"])
 
 # ============================================================
 # Helpers

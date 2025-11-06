@@ -12,6 +12,7 @@ from .onboard import router as onboarding_router
 from .business_public import router as bizz_public_router
 from .owner import router as owner_router, assets_router as owner_assets_router
 from .qr import router as qr_router
+from .bizz_recruiting import router as bizz_recruiting_router
 from .youth_stats import public_router as youth_stats_router, admin_router as admin_youth_stats_router
 
 router= APIRouter()
@@ -31,3 +32,4 @@ router.include_router(admin_youth_stats_router)
 router.include_router(wallet_router)
 router.include_router(bizz_public_router)
 router.include_router(onboarding_router)
+router.include_router(bizz_recruiting_router, prefix="/eco_local/recruiting")

@@ -1,4 +1,4 @@
-# api/eyba/business.py
+# api/eco_local/business.py
 from __future__ import annotations
 
 from typing import Optional, List, Dict, Any
@@ -16,7 +16,7 @@ from site_backend.api.services.neo_business import (
     business_update_public_profile,
 )
 
-router = APIRouter(prefix="/eyba/business", tags=["eyba-business"])
+router = APIRouter(prefix="/eco_local/business", tags=["eco_local-business"])
 
 # --------- Schemas ----------
 class BusinessMineOut(BaseModel):

@@ -233,7 +233,7 @@ def record_scan_mint(
           ON CREATE SET
             t.amount     = $eco,
             t.kind       = 'scan',
-            t.source     = 'eyba',
+            t.source     = 'eco_local',
             t.status     = 'settled',
             t.event_key  = $ek,
             t.createdAt  = $now_ms,

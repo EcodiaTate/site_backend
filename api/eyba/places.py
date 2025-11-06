@@ -1,4 +1,4 @@
-# api/eyba/places.py
+# api/eco_local/places.py
 from __future__ import annotations
 
 from typing import Optional, List, Literal, Tuple, Dict, Any
@@ -9,7 +9,7 @@ from neo4j import Session
 
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/eyba", tags=["eyba"])
+router = APIRouter(prefix="/eco_local", tags=["eco_local"])
 
 AreaType = Literal["cbd", "suburb", "regional"]
 PledgeTier = Literal["starter", "builder", "leader"]

@@ -272,7 +272,7 @@ def get_business_activity(
              toInteger(coalesce(t.createdAt, timestamp())) AS created_ms,
              toInteger(coalesce(t.amount, t.eco, 0))      AS amt,
              coalesce(t.kind, 'scan')                      AS knd,
-             coalesce(t.source, 'eyba')                    AS src
+             coalesce(t.source, 'eco_local')                    AS src
         RETURN {
           id: t.id,
           kind: knd,

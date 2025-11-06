@@ -1,4 +1,4 @@
-# api/eyba/billing.py
+# api/eco_local/billing.py
 from __future__ import annotations
 
 import os
@@ -12,7 +12,7 @@ from neo4j import Session
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 
-router = APIRouter(prefix="/eyba", tags=["eyba-billing"])
+router = APIRouter(prefix="/eco_local", tags=["eco_local-billing"])
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
@@ -200,7 +200,7 @@ def create_checkout(
                     "price_data": {
                         "currency": "aud",
                         "product_data": {
-                            "name": "EYBA Monthly Sponsorship",
+                            "name": "ECO Local Monthly Sponsorship",
                             "metadata": {"business_id": bid},
                         },
                         "recurring": {"interval": "month"},

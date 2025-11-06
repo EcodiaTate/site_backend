@@ -1,4 +1,4 @@
-# api/eyba/youth_stats.py
+# api/eco_local/youth_stats.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -125,7 +125,7 @@ def _order_clause(order: OrderParam) -> str:
 # =========================================================
 
 public_router = APIRouter(prefix="/stats", tags=["youth_stats"])
-admin_router  = APIRouter(prefix="/eyba/admin/youth/stats", tags=["eyba_admin_stats"])
+admin_router  = APIRouter(prefix="/eco_local/admin/youth/stats", tags=["eco_local_admin_stats"])
 
 # =========================================================
 # Public endpoint - My Stats / By User
@@ -393,4 +393,4 @@ def youth_timeseries(
 # =========================================================
 # In your FastAPI app, include both:
 #   app.include_router(public_router)   # /stats/...
-#   app.include_router(admin_router)    # /eyba/admin/youth/stats/...
+#   app.include_router(admin_router)    # /eco_local/admin/youth/stats/...
