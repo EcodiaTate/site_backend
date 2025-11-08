@@ -22,7 +22,7 @@ class YouthProfileOut(BaseModel):
 @router.get("/profile/{user_id}", response_model=YouthProfileOut)
 def get_youth_profile(user_id: str, s: Session = Depends(session_dep)):
     """
-    Fetch a youth's profile with their ECO Local points, actions completed,
+    Fetch a youth's profile with their ECO_LOCAL points, actions completed,
     and derived stats from any linked nodes (eco actions, pledges, etc.)
     """
     cypher = """

@@ -1,4 +1,4 @@
-# site_backend/api/eco_local/owner.py
+# site_backend/api/eco-local/owner.py
 from __future__ import annotations
 
 from typing import List, Optional, Literal, Any, Dict

@@ -2,17 +2,14 @@
 from __future__ import annotations
 
 import io
-import os
 import re
-import time
-import hmac
-import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import qrcode
-from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File, Body
+from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -23,54 +20,33 @@ from PIL import Image, UnidentifiedImageError
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 
-router = APIRouter(prefix="/eco_local/assets", tags=["eco_local-assets"])
+router = APIRouter(prefix="/eco_local/assets", tags=["eco_local"])
 
-# --------------------------------------------------------------------
-# Config
-# --------------------------------------------------------------------
-PUBLIC_BASE = os.environ.get("ECODIA_PUBLIC_URL", "http://localhost:3001")
-QR_SIGNING_SECRET = os.environ.get("QR_SIGNING_SECRET", "dev-please-change-me")
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3000")
 
 # Brand palette (hex)
 BRAND_FOREST = "#396041"
-BRAND_SUN    = "#f4d35e"
-BRAND_MINT   = "#7fd069"
-BRAND_CREAM  = "#faf3e0"
-BRAND_BLACK  = "#000000"
-BRAND_WHITE  = "#ffffff"
+BRAND_SUN = "#f4d35e"
+BRAND_MINT = "#7fd069"
+BRAND_CREAM = "#faf3e0"
+BRAND_BLACK = "#000000"
+BRAND_WHITE = "#ffffff"
 
-# Storage roots (ABSOLUTE)
-# Try to infer repo root safely; fall back to CWD if path depth is shallow.
-_this_file = Path(__file__).resolve()
-_repo_parents = _this_file.parents
-REPO_ROOT = Path(os.getenv("REPO_ROOT") or (_repo_parents[3] if len(_repo_parents) >= 4 else Path.cwd()))
+router = APIRouter(prefix="/eco_local/assets", tags=["eco_local"])
 
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3000")
+
+# --- storage roots (ABSOLUTE) ---
+# Prefer an env var if you have one, else default to repo-root-relative ./storage/eco_local/hero
+# On your machine this should resolve to: D:\EcodiaOS\storage\eco_local\hero
+REPO_ROOT = Path(os.getenv("REPO_ROOT") or Path(__file__).resolve().parents[3] if len(Path(__file__).resolve().parents) >= 4 else Path.cwd())
 DEFAULT_HERO_DIR = REPO_ROOT / "storage" / "eco_local" / "hero"
 HERO_DIR = Path(os.getenv("HERO_DIR", str(DEFAULT_HERO_DIR))).resolve()
+
 HERO_DIR.mkdir(parents=True, exist_ok=True)  # safe in dev
-
-# --------------------------------------------------------------------
-# Helpers
-# --------------------------------------------------------------------
 def short_url_for_code(code: str) -> str:
-    """Next.js QR landing lives at /q/[code]."""
+    # Next.js QR landing lives at /q/[code]
     return f"{PUBLIC_BASE.rstrip('/')}/q/{code}"
-
-def app_payload_for_code(code: str) -> str:
-    # Simple scheme the modal can parse reliably.
-    # Examples: "eco_local:qr_abc123"  or for non-qr prefixed codes: "eco_local:biz_,783j28d3"
-    return f"eco_local:{code}"
-
-def _sign_qr_path(code: str, exp_ts: int) -> str:
-    # payload: "code|exp"
-    msg = f"{code}|{exp_ts}".encode("utf-8")
-    return hmac.new(QR_SIGNING_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
-
-def _verify_qr_signature(code: str, exp_ts: int, sig: str) -> bool:
-    if exp_ts < int(time.time()):
-        return False
-    expected = _sign_qr_path(code, exp_ts)
-    return hmac.compare_digest(expected, sig or "")
 
 def _assert_png_filename(fname: str) -> str:
     """
@@ -98,14 +74,16 @@ class QRMeta:
 def _get_owned_qr_meta(s: Session, *, user_id: str, code: str) -> QRMeta:
     """
     Ensure the QR code belongs to a business owned/managed by the current user.
+    Uses WHERE type(r) IN [...] to avoid deprecation warnings.
     """
     rec = s.run(
         """
-        MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile)
+        MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile)<-[:OF]-(q:QR {code:$code})
         WHERE type(r) IN ['OWNS','MANAGES']
-        MATCH (q:QR {code:$code})-[:OF]->(b)
-        RETURN b.id AS bid, coalesce(b.name,'ECO Local Partner') AS bname,
-               coalesce(b.area, b.location) AS loc, q.code AS code
+        RETURN b.id AS bid,
+               coalesce(b.name, 'ECO_LOCAL Partner') AS bname,
+               coalesce(b.area, b.location) AS loc,
+               q.code AS code
         LIMIT 1
         """,
         uid=user_id,
@@ -133,9 +111,10 @@ def _get_owned_business_id(s: Session, *, user_id: str) -> Optional[str]:
     ).single()
     return rec["id"] if rec else None
 
-# --------------------------------------------------------------------
+# ---------------------------
 # HERO: Upload & Serve
-# --------------------------------------------------------------------
+# ---------------------------
+
 @router.post("/hero_upload", response_model=dict)
 async def hero_upload(
     file: UploadFile = File(...),
@@ -146,34 +125,39 @@ async def hero_upload(
     Accept an image upload, validate it with Pillow, store as PNG,
     and return a *relative* URL like `/eco_local/assets/hero/<slug>.png`.
     """
-    # Ownership scope
+    # Make sure the user actually owns a business (basic scoping)
     bid = _get_owned_business_id(s, user_id=user_id)
     if not bid:
         raise HTTPException(status_code=403, detail="No business found for this account")
 
+    # Read bytes
     data = await file.read()
     if not data or len(data) < 16:
         raise HTTPException(status_code=400, detail="Empty or invalid file")
 
+    # Validate image with Pillow & convert to PNG
     try:
         img = Image.open(io.BytesIO(data))
-        img.verify()
+        img.verify()  # quick structural check
     except UnidentifiedImageError:
         raise HTTPException(status_code=400, detail="The uploaded file is not a valid image")
 
-    # Re-open after verify() to get a usable image object, normalize to RGB PNG
+    # Reopen to actually save (verify() leaves file in an unusable state)
     img = Image.open(io.BytesIO(data)).convert("RGB")
 
+    # Generate name and path
     import secrets
     slug = secrets.token_hex(8)
     filename = f"{slug}.png"
     abs_path = os.path.join(HERO_DIR, filename)
 
+    # Write PNG
     try:
         img.save(abs_path, format="PNG", optimize=True)
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to store image")
 
+    # Store relative path (no domain) on business profile (optional convenience)
     s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})
@@ -182,22 +166,26 @@ async def hero_upload(
         bid=bid,
         rel=f"/eco_local/assets/hero/{filename}",
     )
-    return {"url": f"/eco_local/assets/hero/{filename}"}
 
+    # Respond with relative URL only (Next/Image safe; your UI strips domain anyway)
+    return {"url": f"/eco_local/assets/hero/{filename}"}
 @router.get("/hero/{filename}")
 def serve_hero(filename: str):
+    """
+    Serve stored hero PNG by filename (we always store as .png).
+    """
     path = _abs_hero_path(filename)
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Not found")
-    # Allow browser caching; assets change by filename
-    return FileResponse(
-        str(path),
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=2592000, immutable"}  # 30d
-    )
+    # Return as image/png; let FileResponse set content-length/etag
+    return FileResponse(str(path), media_type="image/png")
 
 @router.get("/_debug/hero_exists")
 def hero_exists_debug(filename: str):
+    """
+    Quick dev aid: /eco_local/assets/_debug/hero_exists?filename=xxxx.png
+    Tells you the exact resolved directory and whether the file exists.
+    """
     try:
         path = _abs_hero_path(filename)
     except HTTPException as e:
@@ -211,26 +199,26 @@ def hero_exists_debug(filename: str):
         "dir_contents_sample": sorted([p.name for p in HERO_DIR.glob("*.png")])[:10],
     }
 
-# --------------------------------------------------------------------
-# QR: PNG + Poster (signed public)
-# --------------------------------------------------------------------
+
+# ---------------------------
+# PNG: simple square QR (SCOPED)
+# ---------------------------
 @router.get("/qr/{code}.png")
 def qr_png(
     code: str,
     size: int = Query(1024, ge=128, le=4096),
-    exp: int = Query(..., description="unix expiry"),
-    sig: str = Query(..., description="hmac signature"),
     s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
 ):
-    if not _verify_qr_signature(code, exp, sig):
-        raise HTTPException(status_code=401, detail="Invalid or expired signature")
+    meta = _get_owned_qr_meta(s, user_id=user_id, code=code)
+    link = short_url_for_code(meta.code)
 
-    rec = s.run("MATCH (q:QR {code:$code}) RETURN q.code AS code LIMIT 1", code=code).single()
-    if not rec:
-        raise HTTPException(status_code=404, detail="QR not found")
-
-    link = short_url_for_code(code)
-    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=10, border=3)
+    qr = qrcode.QRCode(
+        version=None,  # auto
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=3,
+    )
     qr.add_data(link)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white").resize((size, size))
@@ -238,42 +226,27 @@ def qr_png(
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="image/png",
-        headers={
-            "Cache-Control": "private, no-store",
-            "Content-Disposition": f'inline; filename="eco_local-qr-{code}.png"'
-        },
-    )
+    return StreamingResponse(buf, media_type="image/png")
 
+# ---------------------------
+# PDF: A4 poster (brand) (SCOPED)
+# ---------------------------
 @router.get("/qr/{code}/poster.pdf")
 def qr_poster_pdf(
     code: str,
-    exp: int = Query(..., description="unix expiry"),
-    sig: str = Query(..., description="hmac signature"),
     s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
 ):
-    if not _verify_qr_signature(code, exp, sig):
-        raise HTTPException(status_code=401, detail="Invalid or expired signature")
+    meta = _get_owned_qr_meta(s, user_id=user_id, code=code)
+    link = short_url_for_code(meta.code)
 
-    rec = s.run(
-        """
-        MATCH (q:QR {code:$code})<-[:OF]-(b:BusinessProfile)
-        RETURN coalesce(b.name, 'ECO Local Partner') AS bname,
-               coalesce(b.area, b.location) AS loc
-        LIMIT 1
-        """,
-        code=code,
-    ).single()
-    if not rec:
-        raise HTTPException(status_code=404, detail="QR not found")
-
-    business_name = rec["bname"]
-    location_name = rec["loc"]
-    link = short_url_for_code(code)
-
-    qr = qrcode.QRCode(version=None, error_correction=qrcode.constants.ERROR_CORRECT_Q, box_size=10, border=2)
+    # Generate QR image in-memory (hi-res)
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_Q,
+        box_size=10,
+        border=2,
+    )
     qr.add_data(link)
     qr.make(fit=True)
     qr_img = qr.make_image(fill_color="black", back_color="white")
@@ -281,45 +254,51 @@ def qr_poster_pdf(
     qr_img.save(png_bytes, format="PNG")
     png_bytes.seek(0)
 
+    # Build PDF
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=A4)
     W, H = A4
+
+    # Margins / layout
     margin = 18 * mm
     inner_w = W - 2 * margin
     inner_h = H - 2 * margin
 
-    # Cream sheet with forest header band
+    # Cream background panel
     c.setFillColor(BRAND_CREAM)
     c.roundRect(margin, margin, inner_w, inner_h, 12, fill=1, stroke=0)
+
+    # Header strip
     c.setFillColor(BRAND_FOREST)
     c.roundRect(margin, H - margin - 28 * mm, inner_w, 28 * mm, 10, fill=1, stroke=0)
 
-    # Header text
+    # ECO_LOCAL title
     c.setFillColor(BRAND_WHITE)
     c.setFont("Helvetica-Bold", 26)
-    c.drawString(margin + 12 * mm, H - margin - 12 * mm, "Earn ECO here")
+    c.drawString(margin + 12 * mm, H - margin - 12 * mm, "ECO_LOCAL - Earn eco here")
 
+    # Business name (with optional area)
     c.setFont("Helvetica", 13)
-    line2 = f"{business_name}" + (f" · {location_name}" if location_name else "")
+    line2 = f"{meta.business_name}" + (f" · {meta.location_name}" if meta.location_name else "")
     c.drawString(margin + 12 * mm, H - margin - 19 * mm, line2)
 
-    # QR centered
+    # QR placement
     qr_size = 90 * mm
     qr_x = margin + (inner_w - qr_size) / 2
     qr_y = margin + (inner_h - qr_size) / 2 - 8 * mm
     c.drawImage(png_bytes, qr_x, qr_y, qr_size, qr_size, mask="auto")
 
-    # Caption pill under QR
+    # Call-to-action box
     c.setFillColor(BRAND_WHITE)
     c.roundRect(qr_x - 8 * mm, qr_y - 22 * mm, qr_size + 16 * mm, 18 * mm, 8, fill=1, stroke=0)
     c.setFillColor(BRAND_BLACK)
     c.setFont("Helvetica-Bold", 14)
-    c.drawCentredString(qr_x + qr_size / 2, qr_y - 10 * mm, "Scan with your phone")
+    c.drawCentredString(qr_x + qr_size / 2, qr_y - 10 * mm, "Scan to claim eco")
 
-    # Footer copy + short URL
+    # Footer notes
     c.setFont("Helvetica", 10)
     c.setFillColor(BRAND_BLACK)
-    c.drawCentredString(W / 2, margin + 10 * mm, "Young people earn ECO for visiting, learning, and acting.")
+    c.drawCentredString(W / 2, margin + 10 * mm, "Young people earn eco for visiting, learning, and acting.")
     c.setFont("Helvetica", 9)
     c.setFillColor(BRAND_FOREST)
     c.drawCentredString(W / 2, margin + 6 * mm, link)
@@ -327,33 +306,4 @@ def qr_poster_pdf(
     c.showPage()
     c.save()
     buf.seek(0)
-    return StreamingResponse(
-        buf,
-        media_type="application/pdf",
-        headers={
-            "Cache-Control": "private, no-store",
-            "Content-Disposition": f'inline; filename="eco_local-qr-poster-{code}.pdf"'
-        },
-    )
-
-@router.post("/qr_signed_url")
-def qr_signed_url(
-    code: str = Body(..., embed=True),
-    minutes_valid: int = Body(30, embed=True),  # default 30 minutes
-    s: Session = Depends(session_dep),
-    user_id: str = Depends(current_user_id),
-):
-    """
-    Generate signed, time-limited URLs for QR PNG and Poster.
-    Ensures the caller owns the QR/business.
-    """
-    # ensure caller owns this QR before minting a signed URL
-    _get_owned_qr_meta(s, user_id=user_id, code=code)
-
-    exp = int(time.time()) + (minutes_valid * 60)
-    sig = _sign_qr_path(code, exp)
-    return {
-        "png": f"/eco_local/assets/qr/{code}.png?exp={exp}&sig={sig}",
-        "pdf": f"/eco_local/assets/qr/{code}/poster.pdf?exp={exp}&sig={sig}",
-        "exp": exp,
-    }
+    return StreamingResponse(buf, media_type="application/pdf")

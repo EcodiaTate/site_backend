@@ -1,18 +1,15 @@
+# site_backend/api/auth/admin_cookie.py
 from __future__ import annotations
 from fastapi import APIRouter, Depends, Response, HTTPException, status
 from datetime import datetime, timedelta
 from jose import jwt
-from neo4j import Session
-import os
 
 from site_backend.core.user_guard import current_user_id
 from site_backend.core.neo_driver import session_dep
-from site_backend.core.admin_guard import JWT_SECRET, JWT_ALGO, is_admin_email
-from site_backend.core.cookies import set_scoped_cookie, delete_scoped_cookie, ADMIN_COOKIE_NAME
+from neo4j import Session
+from site_backend.core.admin_guard import JWT_SECRET, JWT_ALGO, ADMIN_EMAIL
 
 router = APIRouter(prefix="/auth", tags=["auth"])
-
-ADMIN_TTL_DAYS = int(os.getenv("ADMIN_TTL_DAYS", "7"))
 
 def _mint_admin_token(email: str) -> str:
     now = datetime.utcnow()
@@ -20,35 +17,34 @@ def _mint_admin_token(email: str) -> str:
         "sub": email,
         "scope": "admin",
         "iat": int(now.timestamp()),
-        "exp": int((now + timedelta(days=ADMIN_TTL_DAYS)).timestamp()),
+        "exp": int((now + timedelta(days=7)).timestamp()),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
 @router.post("/admin-cookie")
 def r_admin_cookie(
     response: Response,
     session: Session = Depends(session_dep),
     uid: str = Depends(current_user_id),
 ):
-    rec = session.run(
-        "MATCH (u:User {id:$id}) RETURN toLower(coalesce(u.email,'')) AS email",
-        {"id": uid},
-    ).single()
+    # look up email by uid (adjust to your user model)
+    rec = session.run("MATCH (u:User {id:$id}) RETURN toLower(coalesce(u.email,'')) AS email", {"id": uid}).single()
     email = (rec["email"] or "").lower() if rec else ""
 
-    if not is_admin_email(email):
-        delete_scoped_cookie(response, name=ADMIN_COOKIE_NAME)
+    if email != ADMIN_EMAIL:
+        # clear cookie if present
+        response.delete_cookie("admin_token", path="/", httponly=True, secure=False, samesite="lax")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin only")
 
     token = _mint_admin_token(email)
-
-    # still set the cookie (works in prod same-site), but we'll ALSO return the token
-    set_scoped_cookie(
-        response,
-        name=ADMIN_COOKIE_NAME,
+    # Set HttpOnly cookie (adjust secure=True if behind HTTPS)
+    response.set_cookie(
+        key="admin_token",
         value=token,
-        max_age=ADMIN_TTL_DAYS * 24 * 3600,
-        http_only=True,
+        path="/",
+        httponly=True,
+        secure=False,   # set True in prod over HTTPS
+        samesite="lax",
+        max_age=7*24*3600,
     )
-
-    # 👇 return token so FE can Bearer it for cross-site POSTs in dev
-    return {"ok": True, "admin_token": token}
+    return {"ok": True}

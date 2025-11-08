@@ -1089,7 +1089,7 @@ def _award_on_approval(session: Session, submission_id: str) -> None:
 
     uid        = rec["uid"];      mid = rec["mid"]
     eco        = rec["eco"];      # base ECO on the sidequest
-    # NOTE: we won't trust 'rec["xp"]' when writing — see step (3)
+    # NOTE: we won't trust 'rec["xp"]' when writing - see step (3)
     max_c      = rec["max_c"];    cd  = rec["cd"]
     streak_period = rec["streak_period"]
     streak_bonus  = rec["streak_bonus"]

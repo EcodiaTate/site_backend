@@ -93,7 +93,7 @@ def _safe_date(s: Optional[str]) -> date:
         return datetime.now().date()
 
 # ─────────────────────────────────────────────────────────
-# GET /api/eco_local/recruiting/overview
+# GET /api/eco-local/recruiting/overview
 # ─────────────────────────────────────────────────────────
 @router.get("/overview")
 def overview() -> Dict[str, Any]:
@@ -150,7 +150,7 @@ def overview() -> Dict[str, Any]:
     return {"totals": totals, "outreach": outreach, "success": success, "holds": holds, "inbox": inbox}
 
 # ─────────────────────────────────────────────────────────
-# GET /api/eco_local/recruiting/prospects
+# GET /api/eco-local/recruiting/prospects
 # ─────────────────────────────────────────────────────────
 @router.get("/prospects")
 def list_prospects(
@@ -186,7 +186,7 @@ def list_prospects(
     return {"items": items, "next_cursor": None}
 
 # ─────────────────────────────────────────────────────────
-# GET /api/eco_local/recruiting/threads/:email
+# GET /api/eco-local/recruiting/threads/:email
 # ─────────────────────────────────────────────────────────
 @router.get("/threads/{email}")
 def get_thread(email: str) -> Dict[str, Any]:
@@ -210,7 +210,7 @@ def get_thread(email: str) -> Dict[str, Any]:
     return {"thread": thread, "inbound": inbound, "replies": replies, "holds": holds}
 
 # ─────────────────────────────────────────────────────────
-# GET /api/eco_local/recruiting/runs
+# GET /api/eco-local/recruiting/runs
 # ─────────────────────────────────────────────────────────
 @router.get("/runs")
 def get_runs() -> Dict[str, Any]:
@@ -218,7 +218,7 @@ def get_runs() -> Dict[str, Any]:
     return {"runs": [r["r"] for r in rows]}
 
 # ─────────────────────────────────────────────────────────
-# GET /api/eco_local/recruiting/runs/:dateISO/drafts
+# GET /api/eco-local/recruiting/runs/:dateISO/drafts
 # ─────────────────────────────────────────────────────────
 @router.get("/runs/{dateISO}/drafts")
 def get_run_drafts(dateISO: str) -> Dict[str, Any]:
@@ -226,7 +226,7 @@ def get_run_drafts(dateISO: str) -> Dict[str, Any]:
     return {"drafts": [r["m"] for r in rows]}
 
 # ─────────────────────────────────────────────────────────
-# GET /api/eco_local/recruiting/activity
+# GET /api/eco-local/recruiting/activity
 # ─────────────────────────────────────────────────────────
 @router.get("/activity")
 def activity() -> Dict[str, Any]:
@@ -245,14 +245,14 @@ def activity() -> Dict[str, Any]:
     return {"items": items}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/inbox/poll  (no external deps)
+# POST /api/eco-local/recruiting/inbox/poll  (no external deps)
 # ─────────────────────────────────────────────────────────
 @router.post("/inbox/poll")
 def inbox_poll() -> Dict[str, int]:
     return {"processed": 0}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/prospects/:id/mark-won
+# POST /api/eco-local/recruiting/prospects/:id/mark-won
 # ─────────────────────────────────────────────────────────
 @router.post("/prospects/{pid}/mark-won")
 def set_won(pid: str) -> Dict[str, Any]:
@@ -263,7 +263,7 @@ def set_won(pid: str) -> Dict[str, Any]:
     return {"ok": True}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/prospects/:id/unsubscribe
+# POST /api/eco-local/recruiting/prospects/:id/unsubscribe
 # ─────────────────────────────────────────────────────────
 @router.post("/prospects/{pid}/unsubscribe")
 def set_unsub(pid: str) -> Dict[str, Any]:
@@ -274,12 +274,12 @@ def set_unsub(pid: str) -> Dict[str, Any]:
     return {"ok": True}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/threads/:email/nudge
+# POST /api/eco-local/recruiting/threads/:email/nudge
 # (graph-only placeholder: records a Reply; no email send)
 # ─────────────────────────────────────────────────────────
 @router.post("/threads/{email}/nudge")
 def nudge(email: str) -> Dict[str, Any]:
-    subject = "Quick follow-up — Ecodia"
+    subject = "Quick follow-up - Ecodia"
     html = "<p>Just checking in to see if you had a moment to chat about Ecodia’s local value loops.</p>"
     mid = f"nudged-{datetime.utcnow().isoformat()}"
     cy = """
@@ -295,7 +295,7 @@ def nudge(email: str) -> Dict[str, Any]:
     return {"ok": True, "message_id": mid}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/threads/:email/cancel-holds
+# POST /api/eco-local/recruiting/threads/:email/cancel-holds
 # (graph-only: detaches HAS_HOLD and marks holds canceled)
 # ─────────────────────────────────────────────────────────
 @router.post("/threads/{email}/cancel-holds")
@@ -310,7 +310,7 @@ def cancel_holds(email: str) -> Dict[str, Any]:
     return {"ok": True, "touched": touched}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/runs/:date/create
+# POST /api/eco-local/recruiting/runs/:date/create
 # ─────────────────────────────────────────────────────────
 @router.post("/runs/{dateISO}/create")
 def runs_create(dateISO: str) -> Dict[str, Any]:
@@ -324,7 +324,7 @@ def runs_create(dateISO: str) -> Dict[str, Any]:
     return {"run": row}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/runs/:date/freeze
+# POST /api/eco-local/recruiting/runs/:date/freeze
 # ─────────────────────────────────────────────────────────
 @router.post("/runs/{dateISO}/freeze")
 def runs_freeze(dateISO: str) -> Dict[str, Any]:
@@ -333,7 +333,7 @@ def runs_freeze(dateISO: str) -> Dict[str, Any]:
     return {"ok": True}
 
 # ─────────────────────────────────────────────────────────
-# POST /api/eco_local/recruiting/runs/:date/send
+# POST /api/eco-local/recruiting/runs/:date/send
 # (graph-only: mark drafts as sent; bump thread/prospect)
 # ─────────────────────────────────────────────────────────
 @router.post("/runs/{dateISO}/send")

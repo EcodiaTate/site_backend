@@ -1,0 +1,129 @@
+# api/routers/eco_local_wallet.py
+from __future__ import annotations
+
+from datetime import datetime, timezone
+from typing import Optional, List, Literal, Dict, Any
+
+from fastapi import APIRouter, Depends, Query, Request
+from neo4j import Session
+from pydantic import BaseModel, Field
+
+from site_backend.core.neo_driver import session_dep
+
+router = APIRouter(prefix="/eco_local", tags=["eco_local"])
+
+# ---------- helpers ----------
+def _now_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+def _device_hash(ip: str, ua: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    h.update((ip or "-").encode())
+    h.update((ua or "-").encode())
+    return h.hexdigest()[:16]
+
+def get_youth_id(req: Request) -> str:
+    ip = req.client.host if req.client else "0.0.0.0"
+    ua = req.headers.get("user-agent", "")
+    return f"y_{_device_hash(ip, ua)}"
+
+# ---------- models ----------
+class WalletTx(BaseModel):
+    id: str
+    kind: Optional[str] = None
+    direction: Literal["earned", "spent"]
+    amount: int
+    createdAt: int
+    source: Optional[str] = None
+    business: Optional[dict] = None  # {id,name} if available
+
+class WalletOut(BaseModel):
+    balance: int
+    earned_total: int
+    spent_total: int
+    txs: List[WalletTx] = Field(default_factory=list)
+    next_before_ms: Optional[int] = None  # for paging
+
+# ---------- internal queries ----------
+def _youth_totals(s: Session, uid: str) -> tuple[int, int]:
+    """
+    Always returns a row, even if the user does not exist yet.
+    """
+    rec = s.run(
+        """
+        WITH $uid AS uid
+        OPTIONAL MATCH (u:User {id: uid})
+        WITH u
+        OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx)
+          WHERE coalesce(te.status,'settled')='settled'
+        WITH u, coalesce(sum(toInteger(te.amount)), 0) AS earned
+        OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx)
+          WHERE coalesce(ts.status,'settled')='settled'
+        RETURN toInteger(earned) AS earned,
+               toInteger(coalesce(sum(toInteger(ts.amount)), 0)) AS spent
+        """,
+        uid=uid,
+    ).single()
+
+    if not rec:
+        return 0, 0
+
+    # Defensive casts
+    earned = int((rec.get("earned") or 0))
+    spent  = int((rec.get("spent") or 0))
+    return earned, spent
+
+def _youth_txs(s: Session, uid: str, limit: int, before_ms: Optional[int]) -> list[WalletTx]:
+    recs = s.run(
+        """
+        MATCH (u:User {id:$uid})-[r:EARNED|SPENT]->(t:EcoTx)
+        WHERE coalesce(t.status,'settled')='settled'
+          AND ($before IS NULL OR toInteger(coalesce(t.createdAt,0)) < toInteger($before))
+        OPTIONAL MATCH (b:BusinessProfile)-[:TRIGGERED]->(t)
+        WITH t, r, b
+        RETURN
+          t.id AS id,
+          t.kind AS kind,
+          CASE type(r) WHEN 'EARNED' THEN 'earned' ELSE 'spent' END AS direction,
+          toInteger(coalesce(t.amount,0)) AS amount,
+          toInteger(coalesce(t.createdAt,0)) AS createdAt,
+          t.source AS source,
+          CASE WHEN b IS NULL THEN NULL ELSE {id: b.id, name: b.name} END AS business
+        ORDER BY createdAt DESC
+        LIMIT $limit
+        """,
+        uid=uid, before=before_ms, limit=limit,
+    )
+    out: list[WalletTx] = []
+    for r in recs:
+        d: Dict[str, Any] = r.data()
+        # Ensure required fields are safe
+        d["amount"] = int(d.get("amount") or 0)
+        d["createdAt"] = int(d.get("createdAt") or 0)
+        out.append(WalletTx(**d))
+    return out
+
+# ---------- endpoint ----------
+@router.get("/wallet", response_model=WalletOut)
+def get_wallet(
+    req: Request,
+    s: Session = Depends(session_dep),
+    limit: int = Query(25, ge=1, le=100),
+    before_ms: Optional[int] = Query(None),
+):
+    uid = get_youth_id(req)
+
+    earned_total, spent_total = _youth_totals(s, uid)
+    balance = earned_total - spent_total
+
+    txs = _youth_txs(s, uid, limit=limit, before_ms=before_ms)
+    next_before = txs[-1].createdAt if txs else None
+
+    return WalletOut(
+        balance=balance,
+        earned_total=earned_total,
+        spent_total=spent_total,
+        txs=txs,
+        next_before_ms=next_before,
+    )

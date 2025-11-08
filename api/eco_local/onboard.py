@@ -1,4 +1,4 @@
-# api/eco_local/onboard.py
+# api/routers/eco_local_onboard.py
 from __future__ import annotations
 
 from typing import Optional, Dict, Any
@@ -9,49 +9,12 @@ from neo4j import Session
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
-from site_backend.api.services.neo_business import (
+from site_backend.api.eco_local.neo_business import (
     business_init,
     business_update_standards,
 )
 
 router = APIRouter(prefix="/eco_local", tags=["onboarding"])
-
-# ---------------- Helpers (shared) ----------------
-def _resolve_user_business_id(s: Session, user_id: str, requested: Optional[str]) -> str:
-    """
-    Ownership check supporting OWNS or MANAGES without relying on schema-specific
-    relationship names elsewhere (no deprecated rel-syntax).
-    """
-    if requested:
-        ok = s.run(
-            """
-            MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile {id:$bid})
-            WHERE type(r) IN ['OWNS','MANAGES']
-            RETURN 1 AS ok
-            """,
-            uid=user_id, bid=requested,
-        ).single()
-        if not ok:
-            raise HTTPException(status_code=403, detail="You don't have access to that business")
-        return requested
-
-    ids = [r["id"] for r in s.run(
-        """
-        MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile)
-        WHERE type(r) IN ['OWNS','MANAGES']
-        RETURN b.id AS id
-        ORDER BY id
-        """,
-        uid=user_id,
-    )]
-    if not ids:
-        raise HTTPException(status_code=404, detail="You don't have a business yet")
-    if len(ids) > 1:
-        raise HTTPException(
-            status_code=400,
-            detail={"message": "Multiple businesses; specify ?business_id=...", "your_business_ids": ids},
-        )
-    return ids[0]
 
 # ---------------- Models ----------------
 class InitIn(BaseModel):
@@ -90,6 +53,43 @@ class StatusOut(BaseModel):
     business_id: str
     completed: bool
 
+# ---------------- Helpers ----------------
+def _resolve_user_business_id(s: Session, user_id: str, requested: Optional[str]) -> str:
+    """
+    Ownership check supporting OWNS or MANAGES without referencing a missing rel type
+    (avoids UnknownRelationshipTypeWarning and deprecated syntax).
+    """
+    if requested:
+        ok = s.run(
+            """
+            MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile {id:$bid})
+            WHERE type(r) IN ['OWNS','MANAGES']
+            RETURN 1 AS ok
+            """,
+            uid=user_id, bid=requested,
+        ).single()
+        if not ok:
+            raise HTTPException(status_code=403, detail="You don't have access to that business")
+        return requested
+
+    ids = [r["id"] for r in s.run(
+        """
+        MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile)
+        WHERE type(r) IN ['OWNS','MANAGES']
+        RETURN b.id AS id
+        ORDER BY id
+        """,
+        uid=user_id,
+    )]
+    if not ids:
+        raise HTTPException(status_code=404, detail="You don't have a business yet")
+    if len(ids) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": "Multiple businesses; specify ?business_id=...", "your_business_ids": ids},
+        )
+    return ids[0]
+
 # ---------------- Endpoints ----------------
 @router.post("/business/init", response_model=InitOut, status_code=201)
 def business_init_api(
@@ -97,6 +97,7 @@ def business_init_api(
     s: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
+    # Create business + default QR via canonical service (1:1 ECO model; no ratio)
     out = business_init(
         s,
         user_id=user_id,
@@ -108,7 +109,7 @@ def business_init_api(
     )
     bid = out["business_id"]
 
-    # Ensure owner link (service already links owner; harmless to MERGE again)
+    # Optional duplicate (service already links owner); harmless if kept.
     s.run(
         """
         MERGE (u:User {id:$uid})
@@ -148,8 +149,7 @@ def business_profile_api(
 @router.post("/business/recommend", response_model=RecommendOut)
 def business_recommend_api(payload: RecommendIn):
     """
-    Recommend a monthly AUD pledge only.
-    Policy reference: 1 AUD = 1 ECO; scan rewards mint as needed.
+    Recommend a monthly AUD pledge only (1 AUD = 1 ECO policy; scans can mint as needed).
     """
     base_by_size = {"1-5": 25, "6-20": 49, "21-50": 99, "50+": 149}
     area_mult = {"cbd": 1.15, "suburb": 1.0, "regional": 0.85}
@@ -211,6 +211,7 @@ def onboarding_complete_api(
 # ---- Dev helper: mock checkout to simulate pledge (optional) ----
 @router.post("/dev/mock_checkout", response_model=dict)
 def dev_mock_checkout_api(
+    # Accept monthly_aud from JSON body or querystring to avoid 422s
     payload: Optional[dict] = Body(default=None),
     monthly_aud: Optional[int] = Query(default=None),
     s: Session = Depends(session_dep),
@@ -233,6 +234,7 @@ def dev_mock_checkout_api(
     if amt < 5:
         raise HTTPException(status_code=400, detail="Min $5")
 
+    # Simulate success
     s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})

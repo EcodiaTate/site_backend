@@ -5,7 +5,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, EmailStr
 from neo4j import Session
 import json
-import os
 from jose import jwt
 
 from site_backend.core.neo_driver import session_dep
@@ -101,17 +100,6 @@ def sso_login(p: SsoLoginIn, s: Session = Depends(session_dep)):
         "profile": profile,
         "user_token": u["id"],  # your SPA uses this as a bearer for dev APIs
     }
-    # Append a short-lived access so FE can use it immediately
-    from time import time as _t
-    from jose import jwt as _jwt
-    ACCESS_JWT_SECRET = os.getenv("ACCESS_JWT_SECRET", os.getenv("JWT_SECRET", "dev-secret-change-me"))
-    ACCESS_JWT_ALGO   = os.getenv("ACCESS_JWT_ALGO", "HS256")
-    ACCESS_JWT_TTL_S  = int(os.getenv("ACCESS_JWT_TTL_S", "900"))
-
-    _now = int(_t())
-    _exp = _now + ACCESS_JWT_TTL_S
-    out["token"] = _jwt.encode({"sub": out["id"], "iat": _now, "exp": _exp}, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO)
-    out["exp"] = _exp
 
     if ADMIN_EMAIL and email == ADMIN_EMAIL:
         out["admin_token"] = _mint_admin_token(email)
