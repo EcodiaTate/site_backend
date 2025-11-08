@@ -44,9 +44,12 @@ from site_backend.api.eco_home import home_routes
 from site_backend.api.eco_local import router as eco_local_router
 from site_backend.api.missions import missions
 from site_backend.api.leaderboards import leaderboards
+from site_backend.api.recruiter_unsub import router as unsub_router
 from site_backend.api import launchpad
+from site_backend.api import sidequests
 from site_backend.api import gamification
 from site_backend.api import auth
+from site_backend.api import account
 
 API_PORT = int(os.getenv("API_PORT", "8000"))
 NEO4J_URI = os.getenv("NEO4J_URI") # This will now be correctly loaded
@@ -124,11 +127,14 @@ def create_app() -> FastAPI:
     app.include_router(missions.router)
     app.include_router(home_routes.router)
     app.include_router(stats.router)
+    app.include_router(account.router)
+    app.include_router(sidequests.router)
     app.include_router(admin_cookie.router)
     app.include_router(launchpad.router)
     app.include_router(leaderboards.router)
     app.include_router(gamification.router)
     app.include_router(auth.router)
+    app.include_router(unsub_router)
     
 
     # ---------------- Friendlier error messages ----------------

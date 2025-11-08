@@ -82,7 +82,7 @@ def _run(cy: str, params: Dict[str, Any] | None = None):
 # ─────────────────────────────────────────────────────────
 # Router
 # ─────────────────────────────────────────────────────────
-router = APIRouter()
+router = APIRouter(prefix="/eco-local")
 
 def _safe_date(s: Optional[str]) -> date:
     if not s:
