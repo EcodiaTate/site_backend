@@ -1,4 +1,4 @@
-# api/routers/eco_local_onboard.py
+# api/routers/eco-local_onboard.py
 from __future__ import annotations
 
 from typing import Optional, Dict, Any
@@ -14,7 +14,7 @@ from site_backend.api.eco_local.neo_business import (
     business_update_standards,
 )
 
-router = APIRouter(prefix="/eco_local", tags=["onboarding"])
+router = APIRouter(prefix="/eco-local", tags=["onboarding"])
 
 # ---------------- Models ----------------
 class InitIn(BaseModel):

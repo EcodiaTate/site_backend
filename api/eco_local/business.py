@@ -1,4 +1,4 @@
-# api/routers/eco_local_business.py
+# api/routers/eco-local_business.py
 from __future__ import annotations
 
 from typing import Optional, List
@@ -16,7 +16,7 @@ from site_backend.api.eco_local.neo_business import (
     get_business_activity,
 )
 
-router = APIRouter(prefix="/eco_local/business", tags=["eco_local-business"])
+router = APIRouter(prefix="/eco-local/business", tags=["eco_local-business"])
 
 # --------- Schemas ----------
 class BusinessMineOut(BaseModel):

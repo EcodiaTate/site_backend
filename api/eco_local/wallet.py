@@ -1,4 +1,4 @@
-# api/routers/eco_local_wallet.py
+# api/routers/eco-local_wallet.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/eco_local", tags=["eco_local"])
+router = APIRouter(prefix="/eco-local", tags=["eco-local"])
 
 # ---------- helpers ----------
 def _now_ms() -> int:

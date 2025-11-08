@@ -1,4 +1,4 @@
-# api/routers/eco_local_business_public.py
+# api/routers/eco-local_business_public.py
 from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -6,7 +6,7 @@ from typing import Optional, List
 from neo4j import Session
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/eco_local/business/public", tags=["eco_local-business-public"])
+router = APIRouter(prefix="/eco-local/business/public", tags=["eco_local-business-public"])
 
 class BusinessPublicOut(BaseModel):
   id: str

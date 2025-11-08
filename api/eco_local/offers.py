@@ -1,4 +1,4 @@
-# api/routers/eco_local_offers.py
+# api/routers/eco-local_offers.py
 from __future__ import annotations
 
 from datetime import date
@@ -19,7 +19,7 @@ from site_backend.api.eco_local.neo_business import (
     stripe_record_contribution,
 )
 
-router = APIRouter(prefix="/eco_local", tags=["eco_local"])
+router = APIRouter(prefix="/eco-local", tags=["eco-local"])
 
 # ------------------------------------------------------------
 # Helpers: user → business scoping (+ ownership checks)

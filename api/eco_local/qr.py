@@ -1,4 +1,4 @@
-# api/eco_local/qr.py
+# api/eco-local/qr.py
 from __future__ import annotations
 
 import io
@@ -10,7 +10,7 @@ from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 from site_backend.api.eco_local.assets import short_url_for_code, app_payload_for_code
 
-router = APIRouter(prefix="/eco_local/qr", tags=["eco_local-qr"])
+router = APIRouter(prefix="/eco-local/qr", tags=["eco_local-qr"])
 
 def _owned_qr_code(s: Session, *, user_id: str, business_id: str) -> str:
     """

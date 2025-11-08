@@ -60,7 +60,7 @@ def get_youth_stats(user_id: str, s: Session = Depends(session_dep)):
         WITH u,
              sum(coalesce(t.eco,0)) AS total_eco,
              sum(CASE WHEN t.source = "mission" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
-             sum(CASE WHEN t.source = "eco_local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
+             sum(CASE WHEN t.source = "eco-local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
              max(t.at) AS last_earn_at
         OPTIONAL MATCH (u)-[:SUBMITTED]->(s:Submission {state:"approved"})
         RETURN {

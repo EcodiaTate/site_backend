@@ -86,8 +86,8 @@ class PatchProfile(BaseModel):
     visible_on_map: Optional[bool] = None
     tags: Optional[List[str]] = None
 
-router = APIRouter(prefix="/eco_local/owner", tags=["eco_local.owner"])
-assets_router = APIRouter(prefix="/eco_local/assets", tags=["eco_local.assets"])
+router = APIRouter(prefix="/eco-local/owner", tags=["eco_local.owner"])
+assets_router = APIRouter(prefix="/eco-local/assets", tags=["eco_local.assets"])
 
 # Where to drop hero files (served by your StaticFiles mount)
 UPLOAD_DIR = os.getenv("ECO_LOCAL_UPLOAD_DIR", "uploads/hero")

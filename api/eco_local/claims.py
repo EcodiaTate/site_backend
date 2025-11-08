@@ -1,4 +1,4 @@
-# api/routers/eco_local_claims.py
+# api/routers/eco-local_claims.py
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 from site_backend.core.neo_driver import session_dep
 from site_backend.api.eco_local.neo_business import new_id  # id helper
 
-router = APIRouter(prefix="/eco_local", tags=["eco_local"])
+router = APIRouter(prefix="/eco-local", tags=["eco-local"])
 
 PledgeTier = Literal["starter", "builder", "leader"]
 
@@ -228,7 +228,7 @@ def claim_eco(
           ON CREATE SET
             t.amount      = $eco,
             t.kind        = "scan",
-            t.source      = "eco_local",
+            t.source      = "eco-local",
             t.status      = "settled",
             t.createdAt   = $now,
             t.qr_code     = $qr

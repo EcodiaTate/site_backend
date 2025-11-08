@@ -1,4 +1,4 @@
-# api/routers/eco_local_billing.py
+# api/routers/eco-local_billing.py
 from __future__ import annotations
 
 import os
@@ -13,7 +13,7 @@ from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 from site_backend.api.eco_local.neo_business import stripe_record_contribution  # webhook path uses UNSCOPED mint
 
-router = APIRouter(prefix="/eco_local", tags=["billing"])
+router = APIRouter(prefix="/eco-local", tags=["billing"])
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")

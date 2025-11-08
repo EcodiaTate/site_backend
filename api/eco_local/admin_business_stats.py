@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/eco_local/admin/business/stats", tags=["eco_local-admin-stats"])
+router = APIRouter(prefix="/eco-local/admin/business/stats", tags=["eco_local-admin-stats"])
 
 # ---------- Helpers ----------
 def _month_bounds(iso_month: str) -> tuple[str, str]:

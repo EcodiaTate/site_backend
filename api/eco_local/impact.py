@@ -1,4 +1,4 @@
-# api/routers/eco_local_impact.py
+# api/routers/eco-local_impact.py
 from __future__ import annotations
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -13,7 +13,7 @@ from api.services.impact import (
 )
 from .onboard import _resolve_user_business_id
 
-router = APIRouter(prefix="/eco_local/impact", tags=["impact"])
+router = APIRouter(prefix="/eco-local/impact", tags=["impact"])
 
 # ----- Models -----
 class ImpactInputs(BaseModel):

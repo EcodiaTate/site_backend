@@ -1,4 +1,4 @@
-# site_backend/api/routers/eco_local_business_stats.py
+# site_backend/api/routers/eco-local_business_stats.py
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
@@ -11,7 +11,7 @@ from pydantic import BaseModel, Field
 
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/eco_local/admin/business/stats", tags=["eco_local_admin_stats"])
+router = APIRouter(prefix="/eco-local/admin/business/stats", tags=["eco_local_admin_stats"])
 
 
 # ---------- Helpers ----------

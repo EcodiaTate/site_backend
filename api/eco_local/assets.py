@@ -1,4 +1,4 @@
-# api/eco_local/assets.py
+# api/eco-local/assets.py
 from __future__ import annotations
 
 import io
@@ -20,7 +20,7 @@ from PIL import Image, UnidentifiedImageError
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 
-router = APIRouter(prefix="/eco_local/assets", tags=["eco_local"])
+router = APIRouter(prefix="/eco-local/assets", tags=["eco-local"])
 
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3000")
 
@@ -32,15 +32,15 @@ BRAND_CREAM = "#faf3e0"
 BRAND_BLACK = "#000000"
 BRAND_WHITE = "#ffffff"
 
-router = APIRouter(prefix="/eco_local/assets", tags=["eco_local"])
+router = APIRouter(prefix="/eco-local/assets", tags=["eco-local"])
 
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3000")
 
 # --- storage roots (ABSOLUTE) ---
-# Prefer an env var if you have one, else default to repo-root-relative ./storage/eco_local/hero
+# Prefer an env var if you have one, else default to repo-root-relative ./storage/eco-local/hero
 # On your machine this should resolve to: D:\EcodiaOS\storage\eco_local\hero
 REPO_ROOT = Path(os.getenv("REPO_ROOT") or Path(__file__).resolve().parents[3] if len(Path(__file__).resolve().parents) >= 4 else Path.cwd())
-DEFAULT_HERO_DIR = REPO_ROOT / "storage" / "eco_local" / "hero"
+DEFAULT_HERO_DIR = REPO_ROOT / "storage" / "eco-local" / "hero"
 HERO_DIR = Path(os.getenv("HERO_DIR", str(DEFAULT_HERO_DIR))).resolve()
 
 HERO_DIR.mkdir(parents=True, exist_ok=True)  # safe in dev
@@ -123,7 +123,7 @@ async def hero_upload(
 ):
     """
     Accept an image upload, validate it with Pillow, store as PNG,
-    and return a *relative* URL like `/eco_local/assets/hero/<slug>.png`.
+    and return a *relative* URL like `/eco-local/assets/hero/<slug>.png`.
     """
     # Make sure the user actually owns a business (basic scoping)
     bid = _get_owned_business_id(s, user_id=user_id)
@@ -164,11 +164,11 @@ async def hero_upload(
         SET b.hero_url = $rel
         """,
         bid=bid,
-        rel=f"/eco_local/assets/hero/{filename}",
+        rel=f"/eco-local/assets/hero/{filename}",
     )
 
     # Respond with relative URL only (Next/Image safe; your UI strips domain anyway)
-    return {"url": f"/eco_local/assets/hero/{filename}"}
+    return {"url": f"/eco-local/assets/hero/{filename}"}
 @router.get("/hero/{filename}")
 def serve_hero(filename: str):
     """
@@ -183,7 +183,7 @@ def serve_hero(filename: str):
 @router.get("/_debug/hero_exists")
 def hero_exists_debug(filename: str):
     """
-    Quick dev aid: /eco_local/assets/_debug/hero_exists?filename=xxxx.png
+    Quick dev aid: /eco-local/assets/_debug/hero_exists?filename=xxxx.png
     Tells you the exact resolved directory and whether the file exists.
     """
     try:

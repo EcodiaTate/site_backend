@@ -1,4 +1,4 @@
-# api/routers/eco_local_qr.py
+# api/routers/eco-local_qr.py
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from neo4j import Session
 import qrcode
@@ -7,7 +7,7 @@ import io
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 
-router = APIRouter(prefix="/eco_local/qr", tags=["qr"])
+router = APIRouter(prefix="/eco-local/qr", tags=["qr"])
 
 @router.get("/business.png")
 def business_qr_png(

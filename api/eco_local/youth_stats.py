@@ -131,7 +131,7 @@ def _order_clause(order: OrderParam) -> str:
 # =========================================================
 
 public_router = APIRouter(prefix="/stats", tags=["youth_stats"])
-admin_router  = APIRouter(prefix="/eco_local/admin/youth/stats", tags=["eco_local_admin_stats"])
+admin_router  = APIRouter(prefix="/eco-local/admin/youth/stats", tags=["eco_local_admin_stats"])
 
 
 # =========================================================
@@ -149,7 +149,7 @@ def get_youth_stats(user_id: str, s: Session = Depends(session_dep)):
     WITH u,
          sum(coalesce(t.eco,0)) AS total_eco,
          sum(CASE WHEN t.source = "mission" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
-         sum(CASE WHEN t.source = "eco_local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
+         sum(CASE WHEN t.source = "eco-local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
          max(t.at) AS last_earn_at
 
     // 2) do the second aggregation separately, then freeze all values
@@ -195,7 +195,7 @@ def list_youth_stats(
       WITH u,
            sum(coalesce(t.eco,0)) AS total_eco,
            sum(CASE WHEN t.source = "mission" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
-           sum(CASE WHEN t.source = "eco_local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
+           sum(CASE WHEN t.source = "eco-local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
            max(t.at) AS last_earn_at
       OPTIONAL MATCH (u)-[:SUBMITTED]->(s:Submission {state:"approved"})
       WITH u, total_eco, eco_from_missions, eco_from_eco_local, last_earn_at, count(s) AS missions_completed
@@ -416,7 +416,7 @@ def get_my_youth_stats(
     WITH u,
          sum(coalesce(t.eco,0)) AS total_eco,
          sum(CASE WHEN t.source = "mission" THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_missions,
-         sum(CASE WHEN t.source = "eco_local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
+         sum(CASE WHEN t.source = "eco-local"    THEN coalesce(t.eco,0) ELSE 0 END) AS eco_from_eco_local,
          max(t.at) AS last_earn_at
 
     // 2) do the second aggregation separately, then freeze all values
@@ -446,4 +446,4 @@ def get_my_youth_stats(
 # =========================================================
 # In your FastAPI app, include both:
 #   app.include_router(public_router)  # /stats/...
-#   app.include_router(admin_router)   # /eco_local/admin/youth/stats/...
+#   app.include_router(admin_router)   # /eco-local/admin/youth/stats/...

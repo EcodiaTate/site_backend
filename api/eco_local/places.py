@@ -1,4 +1,4 @@
-# api/routers/eco_local_places.py
+# api/routers/eco-local_places.py
 from __future__ import annotations
 
 from typing import Optional, List, Literal, Tuple, Dict, Any
@@ -10,7 +10,7 @@ from inspect import signature
 
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/eco_local", tags=["eco_local"])
+router = APIRouter(prefix="/eco-local", tags=["eco-local"])
 
 AreaType = Literal["cbd", "suburb", "regional"]
 PledgeTier = Literal["starter", "builder", "leader"]

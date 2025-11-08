@@ -95,7 +95,7 @@ def log_eco_local_claim(session: Session, claim: ClaimTx) -> str:
         t.amount     = $eco,
         t.kind       = "scan",
         t.method     = $method,
-        t.source     = "eco_local",
+        t.source     = "eco-local",
         t.status     = "settled",
         t.createdAt  = $created_ms,
         t.at         = datetime($at),
