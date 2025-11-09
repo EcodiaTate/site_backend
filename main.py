@@ -2,13 +2,7 @@ from __future__ import annotations
 import os # <-- Import os first
 from dotenv import load_dotenv
 
-# --- THIS IS THE FIX ---
-#
-# Try loading the .env file from the SAME directory as main.py
-# __file__ is D:\EcodiaOS\site_backend\main.py
-# os.path.dirname(__file__) is D:\EcodiaOS\site_backend
-# This will look for D:\EcodiaOS\site_backend\.env
-#
+
 dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
 load_dotenv(dotenv_path=dotenv_path)
 
@@ -19,7 +13,7 @@ print(f"Loading .env from: {dotenv_path}")
 print(f"NEO4J_URI loaded: {os.getenv('NEO4J_URI')}")
 print(f"JWT_SECRET length: {len(os.getenv('JWT_SECRET', ''))}")
 print("------------------------")
-# --------------------------
+from site_backend.core.paths import UPLOAD_ROOT  # ADD THIS
 
 
 from contextlib import asynccontextmanager
@@ -55,7 +49,7 @@ API_PORT = int(os.getenv("API_PORT", "8000"))
 NEO4J_URI = os.getenv("NEO4J_URI") # This will now be correctly loaded
 NEO4J_USER = os.getenv("NEO4J_USER") # This will now be correctly loaded
 NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD") # This will now be correctly loaded
-ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3001").split(",") if o.strip()]
 debug_router = APIRouter()
 
 @debug_router.get("/debug/secret-hash")
@@ -112,6 +106,8 @@ def create_app() -> FastAPI:
     if not os.path.exists(static_img_dir):
         os.makedirs(static_img_dir, exist_ok=True)
     app.mount("/img", StaticFiles(directory=static_img_dir), name="img")
+    app.mount("/uploads", StaticFiles(directory=str(UPLOAD_ROOT)), name="uploads")
+
     # add in your FastAPI app (e.g., launchpad router file or main)
     from fastapi import APIRouter, Depends
     from site_backend.core.admin_guard import require_admin
@@ -122,7 +118,7 @@ def create_app() -> FastAPI:
 
     # Routers
     app.include_router(eco_local_router)
-    app.include_router(auth.router, prefix="/auth", tags=["auth"])
+    app.include_router(auth.router)
     app.include_router(profile.router, prefix="/youth", tags=["youth"])
     app.include_router(missions.router)
     app.include_router(home_routes.router)

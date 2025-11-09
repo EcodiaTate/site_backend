@@ -41,47 +41,52 @@ def _with_google_size(href: str, size: int) -> str:
         u = u._replace(query=urlencode(qs))
         return urlunparse(u)
     return href
+# site_backend/api/account/__init__ (or wherever your avatar route lives)
+from site_backend.core.paths import UPLOAD_ROOT  # import this
 
 @router.get("/u/{user_id}/avatar/{size}")
 def public_user_avatar(user_id: str, size: int = 80, s: Session = Depends(session_dep)):
-    """
-    Stable avatar endpoint for ANY user:
-    - if profile has external https image → 302 (normalizes Google ?sz=)
-    - if profile has local path under /uploads → 302 to that path
-    - else → on-brand initials SVG (no 404s)
-    """
-    # clamp size a touch
     size = max(24, min(size, 256))
 
-    prof = get_public_profile(s, user_id)  # {display_name, avatar_url} or None
+    prof = get_public_profile(s, user_id)
     display = (prof or {}).get("display_name") or user_id
     avatar_url: Optional[str] = (prof or {}).get("avatar_url")
 
-    headers = {"Cache-Control": "public, max-age=600"}  # 10 min for redirects / initials
+    headers = {"Cache-Control": "public, max-age=600"}
 
-    # No avatar → initials SVG (cache 1 day; safe to keep 10 min too)
     if not avatar_url:
-        return Response(_initials_svg(display, size), media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+        return Response(_initials_svg(display, size), media_type="image/svg+xml",
+                        headers={"Cache-Control": "public, max-age=86400"})
 
-    # External https → normalize and redirect
     if re.match(r"^https?://", avatar_url, re.I):
         return RedirectResponse(_with_google_size(avatar_url, size), status_code=302, headers=headers)
 
-    # Local path (accept "uploads/..." or "/uploads/..."):
+    # Normalize local path → always starts with /uploads/…
     local_path = avatar_url if avatar_url.startswith("/") else f"/{avatar_url}"
-    # If you also keep size buckets (e.g. /uploads/avatars/80/..), try them
-    p = Path(local_path.lstrip("/"))
+    p = Path(local_path.lstrip("/"))  # e.g. uploads/avatars/59/76/<sha>.webp
+
+    # Map URL path → filesystem path rooted at UPLOAD_ROOT
+    def to_fs(path_under_uploads: Path) -> Path:
+        parts = path_under_uploads.parts
+        if parts and parts[0] == "uploads":
+            # /uploads/<...> → UPLOAD_ROOT/<...>
+            return UPLOAD_ROOT / Path(*parts[1:])
+        # fallback (shouldn’t really happen)
+        return UPLOAD_ROOT / path_under_uploads
 
     # Try exact path first
-    if (Path.cwd() / p).is_file():
+    fs_exact = to_fs(p)
+    if fs_exact.is_file():
         return RedirectResponse(local_path, status_code=302, headers=headers)
 
-    # Try injecting a size bucket after /uploads/avatars/
+    # Try size bucket variant: /uploads/avatars/{size}/…
     parts = p.parts
     if len(parts) >= 2 and parts[0] == "uploads" and parts[1] == "avatars":
         candidate = Path("uploads/avatars") / str(size) / Path(*parts[2:])
-        if (Path.cwd() / candidate).is_file():
+        fs_candidate = to_fs(candidate)
+        if fs_candidate.is_file():
             return RedirectResponse("/" + str(candidate).replace("\\", "/"), status_code=302, headers=headers)
 
-    # Fallback: initials SVG
-    return Response(_initials_svg(display, size), media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+    # Fallback → initials
+    return Response(_initials_svg(display, size), media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})

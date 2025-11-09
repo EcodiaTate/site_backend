@@ -1,76 +1,105 @@
+# site_backend/api/leaderboards/router.py
 from __future__ import annotations
-from typing import List, Optional
+from typing import Literal, Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from neo4j import Session
 
 from site_backend.core.neo_driver import session_dep
-from .service import top_youth_eco, top_business_eco, top_youth_actions
+from .service import (  # ← your provided service file (top_youth_eco, etc.)
+    top_youth_eco,
+    top_youth_contributed,
+    top_business_eco,
+    top_youth_actions,
+)
+
+Period = Literal["total", "weekly", "monthly"]
 
 router = APIRouter(prefix="/leaderboards", tags=["leaderboards"])
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Schemas
-# ───────────────────────────────────────────────────────────────────────────────
+# ---------- Pydantic shapes (unified across endpoints) ----------
 
-class LBYouthEcoRow(BaseModel):
+class LBMetaMy(BaseModel):
+    id: str
+    value: int
+    rank: int
+    display_name: str
+    avatar_url: Optional[str] = None
+
+class LBMeta(BaseModel):
+    period: Period
+    since_ms: Optional[int] = None
+    limit: int
+    offset: int
+    has_more: bool
+    total_estimate: int
+    top_value: int
+    my: Optional[LBMetaMy] = None
+
+class LBUserEcoItem(BaseModel):
     user_id: str
-    eco: int = 0
+    display_name: str
+    eco: int
+    avatar_url: Optional[str] = None
 
-class LBBusinessEcoRow(BaseModel):
+class LBBusinessEcoItem(BaseModel):
     business_id: str
-    name: str
-    eco: int = 0
+    display_name: str
+    eco: int
 
-class LBYouthActionsRow(BaseModel):
+class LBUserActionsItem(BaseModel):
     user_id: str
-    completed: int = 0
+    display_name: str
+    completed: int
+    avatar_url: Optional[str] = None
 
-# ───────────────────────────────────────────────────────────────────────────────
-# Endpoints
-# ───────────────────────────────────────────────────────────────────────────────
+class LBResponse(BaseModel):
+    items: List[Dict[str, Any]] = Field(default_factory=list)
+    meta: LBMeta
 
-@router.get("/youth/eco", response_model=List[LBYouthEcoRow])
-def leaderboard_youth_eco(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    limit: int = Query(20, ge=1, le=200),
+# ---------- Routes ----------
+
+@router.get("/youth/eco", response_model=LBResponse)
+def lb_youth_eco(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    session: Session = Depends(session_dep),
+    me_user_id: Optional[str] = Query(None),
 ):
-    """Youth ECO leaderboard (sum of EcoTx earned)."""
-    return top_youth_eco(session, period=period, limit=limit, offset=offset)
+    data = top_youth_eco(s, period=period, limit=limit, offset=offset, me_user_id=me_user_id)
+    return data
 
-@router.get("/business/eco", response_model=List[LBBusinessEcoRow])
-def leaderboard_business_eco(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    limit: int = Query(20, ge=1, le=200),
+@router.get("/youth/contributed", response_model=LBResponse)
+def lb_youth_contributed(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    session: Session = Depends(session_dep),
+    me_user_id: Optional[str] = Query(None),
 ):
-    """Business ECO leaderboard (sum of EcoTx minted FROM each business)."""
-    return top_business_eco(session, period=period, limit=limit, offset=offset)
+    data = top_youth_contributed(s, period=period, limit=limit, offset=offset, me_user_id=me_user_id)
+    return data
 
-@router.get("/youth/actions", response_model=List[LBYouthActionsRow])
-def leaderboard_youth_actions(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    type: Optional[str] = Query(None, pattern="^(eco_action|sidequest|all)?$"),
-    limit: int = Query(20, ge=1, le=200),
+@router.get("/business/eco", response_model=LBResponse)
+def lb_business_eco(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    session: Session = Depends(session_dep),
+    me_business_id: Optional[str] = Query(None),
 ):
-    """
-    Youth mission completions (approved submissions) leaderboard.
-    - period: total | weekly | monthly
-    - type: eco_action | sidequest | all (default all)
-    """
-    return top_youth_actions(session, period=period, mission_type=type, limit=limit, offset=offset)
+    data = top_business_eco(s, period=period, limit=limit, offset=offset, me_business_id=me_business_id)
+    return data
 
-# Convenience alias
-@router.get("/youth/sidequests", response_model=List[LBYouthActionsRow])
-def leaderboard_youth_sidequests(
-    period: str = Query("total", pattern="^(total|weekly|monthly)$"),
-    limit: int = Query(20, ge=1, le=200),
+@router.get("/youth/actions", response_model=LBResponse)
+def lb_youth_actions(
+    s: Session = Depends(session_dep),
+    period: Period = Query("monthly", regex="^(total|weekly|monthly)$"),
+    kind: Optional[str] = Query(None),  # 'eco_action' | 'sidequest' | 'all' | None
+    limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
-    session: Session = Depends(session_dep),
+    me_user_id: Optional[str] = Query(None),
 ):
-    return top_youth_actions(session, period=period, mission_type="sidequest", limit=limit, offset=offset)
+    data = top_youth_actions(s, period=period, mission_type=kind, limit=limit, offset=offset, me_user_id=me_user_id)
+    return data

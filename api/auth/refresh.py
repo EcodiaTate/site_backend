@@ -16,7 +16,8 @@ REFRESH_JWT_SECRET = os.getenv("REFRESH_JWT_SECRET", os.getenv("JWT_SECRET", "de
 REFRESH_JWT_ALGO   = os.getenv("REFRESH_JWT_ALGO", "HS256")
 REFRESH_TTL_DAYS   = int(os.getenv("REFRESH_TTL_DAYS", "90"))
 
-def _now_s() -> int: return int(time.time())
+def _now_s() -> int: 
+    return int(time.time())
 
 def _mint_access(uid: str, email: str | None = None) -> tuple[str, int]:
     now = _now_s()
@@ -39,15 +40,29 @@ def refresh(request: Request, response: Response):
     if not raw:
         raise HTTPException(status_code=401, detail="No refresh token")
     try:
-        claims = jwt.decode(raw, REFRESH_JWT_SECRET, algorithms=[REFRESH_JWT_ALGO])
+        # small leeway helps around clock skew in dev/prod
+        claims = jwt.decode(
+            raw, REFRESH_JWT_SECRET, algorithms=[REFRESH_JWT_ALGO], options={"leeway": 10}
+        )
+        if claims.get("typ") not in (None, "refresh"):
+            delete_scoped_cookie(response, name=REFRESH_COOKIE_NAME, request=request)
+            raise HTTPException(status_code=401, detail="Wrong token type")
         uid = str(claims.get("sub") or "")
         if not uid:
+            delete_scoped_cookie(response, name=REFRESH_COOKIE_NAME, request=request)
             raise HTTPException(status_code=401, detail="Refresh missing subject")
     except JWTError:
-        delete_scoped_cookie(response, name=REFRESH_COOKIE_NAME)
+        delete_scoped_cookie(response, name=REFRESH_COOKIE_NAME, request=request)
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
+    # rotate refresh and return fresh access
     new_refresh = _mint_refresh(uid)
-    set_scoped_cookie(response, name=REFRESH_COOKIE_NAME, value=new_refresh, max_age=REFRESH_TTL_DAYS * 24 * 3600)
+    set_scoped_cookie(
+        response,
+        name=REFRESH_COOKIE_NAME,
+        value=new_refresh,
+        max_age=REFRESH_TTL_DAYS * 24 * 3600,
+        request=request,  # ← localhost-aware flags
+    )
     access, exp = _mint_access(uid)
     return {"access": access, "exp": exp}

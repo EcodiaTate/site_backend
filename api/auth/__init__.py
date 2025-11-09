@@ -2,7 +2,7 @@ from fastapi import APIRouter
 
 from .logout import router as logout_router
 from .sso_login import router as sso_router
-from .main import router as main_router
+from .auth_main import router as main_router
 from .set_role import router as set_role_router
 from .refresh import router as refresh_router
 
