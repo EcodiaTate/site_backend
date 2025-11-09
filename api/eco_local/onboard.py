@@ -1,6 +1,5 @@
 # api/routers/eco-local_onboard.py
 from __future__ import annotations
-
 from typing import Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
@@ -55,10 +54,6 @@ class StatusOut(BaseModel):
 
 # ---------------- Helpers ----------------
 def _resolve_user_business_id(s: Session, user_id: str, requested: Optional[str]) -> str:
-    """
-    Ownership check supporting OWNS or MANAGES without referencing a missing rel type
-    (avoids UnknownRelationshipTypeWarning and deprecated syntax).
-    """
     if requested:
         ok = s.run(
             """
@@ -97,7 +92,6 @@ def business_init_api(
     s: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
-    # Create business + default QR via canonical service (1:1 ECO model; no ratio)
     out = business_init(
         s,
         user_id=user_id,
@@ -109,20 +103,12 @@ def business_init_api(
     )
     bid = out["business_id"]
 
-    # Optional duplicate (service already links owner); harmless if kept.
+    # Mark onboarding not completed yet (idempotent)
     s.run(
         """
-        MERGE (u:User {id:$uid})
-        MERGE (b:BusinessProfile {id:$bid})
-        MERGE (u)-[:OWNS]->(b)
+        MATCH (b:BusinessProfile {id:$bid})
+        SET b.onboarding_completed = coalesce(b.onboarding_completed,false)
         """,
-        uid=user_id, bid=bid,
-    )
-
-    # Mark onboarding not completed yet
-    s.run(
-        "MATCH (b:BusinessProfile {id:$bid}) "
-        "SET b.onboarding_completed = coalesce(b.onboarding_completed,false)",
         bid=bid,
     )
     return InitOut(business_id=bid, qr_code=out["qr_code"])
@@ -148,9 +134,6 @@ def business_profile_api(
 
 @router.post("/business/recommend", response_model=RecommendOut)
 def business_recommend_api(payload: RecommendIn):
-    """
-    Recommend a monthly AUD pledge only (1 AUD = 1 ECO policy; scans can mint as needed).
-    """
     base_by_size = {"1-5": 25, "6-20": 49, "21-50": 99, "50+": 149}
     area_mult = {"cbd": 1.15, "suburb": 1.0, "regional": 0.85}
     pledge_mult = {"starter": 0.9, "builder": 1.0, "leader": 1.15}
@@ -208,10 +191,9 @@ def onboarding_complete_api(
     )
     return {"ok": True, "business_id": bid}
 
-# ---- Dev helper: mock checkout to simulate pledge (optional) ----
+# ---- Dev helper: mock checkout ----
 @router.post("/dev/mock_checkout", response_model=dict)
 def dev_mock_checkout_api(
-    # Accept monthly_aud from JSON body or querystring to avoid 422s
     payload: Optional[dict] = Body(default=None),
     monthly_aud: Optional[int] = Query(default=None),
     s: Session = Depends(session_dep),
@@ -226,7 +208,6 @@ def dev_mock_checkout_api(
             pass
     if amt is None and monthly_aud is not None:
         amt = int(monthly_aud)
-
     if amt is None:
         raise HTTPException(status_code=400, detail="monthly_aud is required")
 
@@ -234,7 +215,6 @@ def dev_mock_checkout_api(
     if amt < 5:
         raise HTTPException(status_code=400, detail="Min $5")
 
-    # Simulate success
     s.run(
         """
         MATCH (b:BusinessProfile {id:$bid})

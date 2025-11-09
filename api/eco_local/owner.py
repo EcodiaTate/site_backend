@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import List, Optional, Literal, Any, Dict
 from uuid import uuid4
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from pydantic import BaseModel
@@ -11,9 +11,6 @@ import os
 import shutil
 import json
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Auth / DB deps... use your real ones
-# ─────────────────────────────────────────────────────────────────────────────
 from site_backend.core.neo_driver import session_dep   # yields a neo4j.Session
 from site_backend.core.user_guard import current_user_id  # validates Bearer or legacy cookie
 from neo4j import Session
@@ -58,6 +55,14 @@ class BusinessMine(BaseModel):
     tags: Optional[List[str]] = None
     qr_code: Optional[str] = None
 
+    # NEW — rule/config fields used by the FE autosave
+    pledge_tier: Optional[Literal["starter", "builder", "leader"]] = None
+    rules_first_visit: Optional[int] = None
+    rules_return_visit: Optional[int] = None
+    rules_cooldown_hours: Optional[int] = None
+    rules_daily_cap_per_user: Optional[int] = None
+    rules_geofence_radius_m: Optional[int] = None
+
 class Metrics(BaseModel):
     minted_eco: float = 0
     eco_contributed_total: float = 0
@@ -72,8 +77,8 @@ class ActivityRow(BaseModel):
     amount: float
     offer_id: Optional[str] = None   # ← add
 
-
 class PatchProfile(BaseModel):
+    # Existing editable fields
     name: Optional[str] = None
     tagline: Optional[str] = None
     website: Optional[str] = None
@@ -85,6 +90,15 @@ class PatchProfile(BaseModel):
     lng: Optional[float] = None
     visible_on_map: Optional[bool] = None
     tags: Optional[List[str]] = None
+
+    # NEW — accept rule/config fields from FE to avoid 422
+    pledge_tier: Optional[Literal["starter", "builder", "leader"]] = None
+    rules_first_visit: Optional[int] = None
+    rules_return_visit: Optional[int] = None
+    rules_cooldown_hours: Optional[int] = None
+    rules_daily_cap_per_user: Optional[int] = None
+    # FE sends "" to disable; we normalize in handler but type stays Optional[int]
+    rules_geofence_radius_m: Optional[int] = None
 
 router = APIRouter(prefix="/eco-local/owner", tags=["eco_local.owner"])
 assets_router = APIRouter(prefix="/eco-local/assets", tags=["eco_local.assets"])
@@ -104,11 +118,7 @@ def _all(s: Session, cypher: str, params: Dict[str, Any]) -> List[Dict[str, Any]
     return [r.data() for r in s.run(cypher, **params)]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Graph helpers – aligned to your constraints:
-# - BusinessProfile has unique (id) and unique (user_id)
-# - We also connect a User node for relationships, but source of truth
-#   for ownership is BusinessProfile.user_id = <uid>.
-# - Canonical QR relation is (:QR)-[:OF]->(b) with q.code.
+# Graph helpers – aligned to your constraints
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ensure_owner_business(s: Session, user_id: str) -> str:
@@ -135,7 +145,9 @@ def _get_business(s: Session, user_id: str) -> Optional[BusinessMine]:
     OPTIONAL MATCH (q:QR)-[:OF]->(b)
     RETURN b {
       .id, .name, .tagline, .website, .address, .hours, .description,
-      .hero_url, .lat, .lng, .visible_on_map, .tags
+      .hero_url, .lat, .lng, .visible_on_map, .tags,
+      .pledge_tier, .rules_first_visit, .rules_return_visit, .rules_cooldown_hours,
+      .rules_daily_cap_per_user, .rules_geofence_radius_m
     } AS b, q.code AS qr
     """
     rec = _one(s, cy, {"uid": user_id})
@@ -156,6 +168,12 @@ def _get_business(s: Session, user_id: str) -> Optional[BusinessMine]:
         visible_on_map=b.get("visible_on_map", True),
         tags=b.get("tags") or [],
         qr_code=rec.get("qr"),
+        pledge_tier=b.get("pledge_tier"),
+        rules_first_visit=b.get("rules_first_visit"),
+        rules_return_visit=b.get("rules_return_visit"),
+        rules_cooldown_hours=b.get("rules_cooldown_hours"),
+        rules_daily_cap_per_user=b.get("rules_daily_cap_per_user"),
+        rules_geofence_radius_m=b.get("rules_geofence_radius_m"),
     )
 
 def _offer_record_to_out(rec: Dict[str, Any]) -> OfferOut:
@@ -174,96 +192,160 @@ def _offer_record_to_out(rec: Dict[str, Any]) -> OfferOut:
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
-
-@router.get("/mine", response_model=BusinessMine)
-def get_mine(
-    user_id: str = Depends(current_user_id),
-    s: Session = Depends(session_dep),
-):
-    _ensure_owner_business(s, user_id)
-    b = _get_business(s, user_id)
-    if not b:
-        raise HTTPException(status_code=404, detail="Business not found")
-    return b
+@router.get("/mine")
+def owner_mine(uid: str = Depends(current_user_id),
+               s: Session = Depends(session_dep)):
+    cy = """
+    MATCH (b:BusinessProfile {user_id: $uid})
+    OPTIONAL MATCH (q:QR)-[:OF]->(b)
+    RETURN {
+      id: b.id,
+      name: b.name,
+      tagline: coalesce(b.tagline, ''),
+      website: coalesce(b.website, ''),
+      address: coalesce(b.address, ''),
+      hours: coalesce(b.hours, {}),
+      description: coalesce(b.description, ''),
+      hero_url: coalesce(b.hero_url, ''),
+      lat: coalesce(b.lat, 0.0),
+      lng: coalesce(b.lng, 0.0),
+      visible_on_map: coalesce(b.visible_on_map, true),
+      tags: coalesce(b.tags, []),
+      pledge_tier: coalesce(b.pledge_tier, 'starter'),
+      rules_first_visit: coalesce(b.rules_first_visit, ''),
+      rules_return_visit: coalesce(b.rules_return_visit, ''),
+      rules_cooldown_hours: toInteger(coalesce(b.rules_cooldown_hours, 0)),
+      rules_daily_cap_per_user: toInteger(coalesce(b.rules_daily_cap_per_user, 0)),
+      rules_geofence_radius_m: toInteger(coalesce(b.rules_geofence_radius_m, 0)),
+      qr: q.code
+    } AS result
+    """
+    rec = s.run(cy, uid=uid).single()
+    if not rec:
+        return {"result": None}
+    return rec["result"]
 @router.get("/metrics", response_model=Dict[str, Any])
 def get_metrics(
     user_id: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
     _ensure_owner_business(s, user_id)
+
     cy = """
     MATCH (b:BusinessProfile {user_id:$uid})
-    WITH b, datetime() - duration({days:30}) AS d30
+    WITH b, toInteger(timestamp(datetime() - duration({days:30}))) AS cutoff_ms
 
-    // inbound collected
-    OPTIONAL MATCH (b)-[:COLLECTED]->(tin:EcoTx {status:'settled'})
-    WITH b, d30, collect(tin) AS ins
+    // -------- scans triggered at this business (QR check-ins) --------
+    OPTIONAL MATCH (b)-[:TRIGGERED]->(tscan:EcoTx {status:'settled'})
+    WHERE coalesce(tscan.kind,'')='scan'
+    WITH b, cutoff_ms,
+         collect({
+           ms:  toInteger(coalesce(tscan.createdAt, timestamp(tscan.at), timestamp())),
+           eco: toInteger(coalesce(tscan.eco, tscan.amount, 0)),
+           uid: tscan.user_id
+         }) AS scans
 
-    // outbound spent
+    WITH b, cutoff_ms,
+         reduce(s=0, r IN scans | s + r.eco) AS eco_triggered_total,
+         [r IN scans WHERE r.ms >= cutoff_ms] AS scans30
+    WITH b, cutoff_ms, eco_triggered_total, scans30,
+         size(scans30) AS claims_30d,
+         reduce(s=0, r IN scans30 | s + r.eco) AS eco_triggered_30d,
+         // make a scalar max(ms) without APOC:
+         reduce(mx = -1, r IN scans30 | CASE WHEN r.ms > mx THEN r.ms ELSE mx END) AS last_ms_raw,
+         reduce(acc=[], r IN scans30 |
+            CASE WHEN r.uid IS NULL OR r.uid IN acc THEN acc ELSE acc + r.uid END
+         ) AS uniqs
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d,
+         CASE WHEN last_ms_raw < 0 THEN NULL ELSE last_ms_raw END AS last_ms,
+         size(uniqs) AS unique_claimants_30d
+
+    // -------- inbound contributions to the business --------
+    OPTIONAL MATCH (b)-[:COLLECTED|EARNED]->(tin:EcoTx {status:'settled'})
+    WHERE coalesce(tin.kind,'') IN ['CONTRIBUTE','SPONSOR_DEPOSIT']
+       OR coalesce(tin.source,'')='contribution'
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d, unique_claimants_30d, last_ms,
+         collect({
+           ms:  toInteger(coalesce(tin.createdAt, timestamp(tin.at), timestamp())),
+           eco: toInteger(coalesce(tin.eco, tin.amount, 0))
+         }) AS ins
+
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d, unique_claimants_30d, last_ms,
+         reduce(s=0, r IN ins | s + r.eco) AS contributions_total,
+         [r IN ins WHERE r.ms >= cutoff_ms] AS ins30
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d, unique_claimants_30d, last_ms,
+         contributions_total,
+         reduce(s=0, r IN ins30 | s + r.eco) AS contributions_30d
+
+    // -------- retirements via offer redemptions --------
     OPTIONAL MATCH (b)-[:SPENT]->(tout:EcoTx {status:'settled'})
-    WITH b, d30, ins, collect(tout) AS outs
+    WHERE coalesce(tout.kind,'')='BURN_REWARD'
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d, unique_claimants_30d, last_ms,
+         contributions_total, contributions_30d,
+         collect({
+           ms:  toInteger(coalesce(tout.createdAt, timestamp(tout.at), timestamp())),
+           eco: toInteger(coalesce(tout.eco, tout.amount, 0))
+         }) AS outs
 
-    // Build 30d slices with robust timestamp coercion
-    WITH b, d30, ins, outs,
-         [t IN ins  WHERE coalesce(t.at,  datetime({epochMillis: toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp()))})) >= d30] AS ins30,
-         [t IN outs WHERE coalesce(t.at,  datetime({epochMillis: toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp()))})) >= d30] AS outs30
-
-    // Totals
-    WITH b, ins, outs, ins30, outs30,
-         reduce(s=0, t IN ins    | s + toInteger(coalesce(t.eco, t.amount, 0))) AS minted_total,
-         reduce(s=0, t IN ins30  | s + toInteger(coalesce(t.eco, t.amount, 0))) AS minted_30d,
-         reduce(s=0, t IN [t IN outs WHERE coalesce(t.kind,'')='BURN_REWARD']
-                         | s + toInteger(coalesce(t.eco, t.amount, 0))) AS retired_total,
-         reduce(s=0, t IN [t IN outs30 WHERE coalesce(t.kind,'')='BURN_REWARD']
-                         | s + toInteger(coalesce(t.eco, t.amount, 0))) AS retired_30d,
-         size(ins30) AS claims_30d,
-         [t IN ins30 WHERE t.user_id IS NOT NULL | t.user_id] AS claimants30_raw
-
-    // Last claim: UNWIND then max(datetime)
-    UNWIND ins30 AS tlast
-    WITH b, outs30, minted_30d, retired_30d, claims_30d, claimants30_raw,
-         max(coalesce(tlast.at, datetime({epochMillis: toInteger(coalesce(tlast.createdAt, timestamp(tlast.at), timestamp()))}))) AS last_claim_dt
-
-    // Unique claimants (pure Cypher distinct)
-    WITH b, outs30, minted_30d, retired_30d, claims_30d, last_claim_dt, claimants30_raw
-    UNWIND claimants30_raw AS c
-    WITH b, outs30, minted_30d, retired_30d, claims_30d, last_claim_dt, collect(DISTINCT c) AS uniqs
-    WITH b, outs30, minted_30d, retired_30d, claims_30d, last_claim_dt,
-         size([u IN uniqs WHERE u IS NOT NULL | u]) AS unique_30d
-
-    // Redemptions count (30d)
-    WITH b, minted_30d, retired_30d, claims_30d, last_claim_dt, unique_30d,
-         size([t IN outs30 WHERE coalesce(t.kind,'')='BURN_REWARD' | 1]) AS redemptions_30d
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d, unique_claimants_30d, last_ms,
+         contributions_total, contributions_30d,
+         reduce(s=0, r IN outs | s + r.eco) AS eco_retired_total,
+         [r IN outs WHERE r.ms >= cutoff_ms] AS outs30
 
     RETURN {
       business_id: b.id,
-      minted_eco_30d: minted_30d,
-      eco_retired_30d: retired_30d,
-      unique_claimants_30d: unique_30d,
-      claims_30d: claims_30d,
-      last_claim_at: (CASE WHEN last_claim_dt IS NULL THEN NULL ELSE toString(last_claim_dt) END),
-      redemptions_30d: redemptions_30d,
-      sponsor_balance_cents: toInteger(coalesce(b.sponsor_balance_cents, 0))
+      sponsor_balance_cents: toInteger(coalesce(b.sponsor_balance_cents,0)),
+
+      // scans
+      eco_triggered_total: toInteger(coalesce(eco_triggered_total,0)),
+      eco_triggered_30d:   toInteger(coalesce(eco_triggered_30d,0)),
+      claims_30d:          toInteger(coalesce(claims_30d,0)),
+      unique_claimants_30d:toInteger(coalesce(unique_claimants_30d,0)),
+      last_claim_at:       (CASE WHEN last_ms IS NULL THEN NULL ELSE toString(datetime({epochMillis:last_ms})) END),
+
+      // inbound contributions
+      contributions_total: toInteger(coalesce(contributions_total,0)),
+      contributions_30d:   toInteger(coalesce(contributions_30d,0)),
+
+      // retirements (offers)
+      eco_retired_total:   toInteger(coalesce(eco_retired_total,0)),
+      eco_retired_30d:     toInteger(coalesce(reduce(s=0, r IN outs30 | s + r.eco),0)),
+      redemptions_30d:     toInteger(size(outs30))
     } AS m
     """
-    rec = _one(s, cy, {"uid": user_id}) or {"m": {}}
-    m = rec.get("m") or {}
 
-    return {
-        "business_id": m.get("business_id"),
-        "sponsor_balance_cents": int(m.get("sponsor_balance_cents") or 0),
-        "eco_retired_30d": int(m.get("eco_retired_30d") or 0),
-        "redemptions_30d": int(m.get("redemptions_30d") or 0),
-        "unique_claimants_30d": int(m.get("unique_claimants_30d") or 0),
-        "minted_eco_30d": int(m.get("minted_eco_30d") or 0),
-        "claims_30d": int(m.get("claims_30d") or 0),
-        "last_claim_at": m.get("last_claim_at"),
-        # compat placeholders
-        "name": None,
-        "pledge_tier": None,
-        "eco_retired_total": 0,
-        "minted_eco_month": 0,
-    }
+    try:
+        rec = _one(s, cy, {"uid": user_id}) or {"m": {}}
+        m = rec["m"] or {}
+
+        eco_velocity_30d = (m.get("eco_triggered_30d") or 0) / 30.0
+
+        return {
+            "business_id": m.get("business_id"),
+            "sponsor_balance_cents": int(m.get("sponsor_balance_cents") or 0),
+
+            # Triggered (scans)
+            "eco_triggered_total": int(m.get("eco_triggered_total") or 0),
+            "eco_triggered_30d": int(m.get("eco_triggered_30d") or 0),
+            "claims_30d": int(m.get("claims_30d") or 0),
+            "unique_claimants_30d": int(m.get("unique_claimants_30d") or 0),
+            "last_claim_at": m.get("last_claim_at"),
+
+            # Contributions in
+            "contributions_total": int(m.get("contributions_total") or 0),
+            "contributions_30d": int(m.get("contributions_30d") or 0),
+
+            # Retirements (offers)
+            "eco_retired_total": int(m.get("eco_retired_total") or 0),
+            "eco_retired_30d": int(m.get("eco_retired_30d") or 0),
+            "redemptions_30d": int(m.get("redemptions_30d") or 0),
+
+            # Derived rate
+            "eco_velocity_30d": round(float(eco_velocity_30d), 2),
+        }
+    except Exception as e:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=500, detail=f"/owner/metrics failed: {e}")
 
 @router.get("/offers", response_model=List[OfferOut])
 def list_offers(
@@ -372,7 +454,6 @@ def delete_offer(
     s.run(cy, uid=user_id, oid=offer_id).consume()
     return {"ok": True}
 
-
 def _all(s: Session, cypher: str, params: Dict[str, Any]) -> list[Dict[str, Any]]:
     return [r.data() for r in s.run(cypher, **params)]
 
@@ -382,7 +463,6 @@ def business_recent_activity(
     user_id: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
-    # If you need to ensure the business node exists for this user, do it here.
     cy = """
     MATCH (b:BusinessProfile {user_id:$uid})
 
@@ -398,7 +478,7 @@ def business_recent_activity(
     tin.user_id AS user_id,
     coalesce(tin.kind,'CONTRIBUTE') AS kind,
     toFloat(coalesce(tin.eco, tin.amount)) AS amount,
-    NULL AS offer_id                                     // ← new
+    NULL AS offer_id
   UNION ALL
   WITH b
   // Outbound: rewards/payouts initiated by the business
@@ -412,12 +492,11 @@ def business_recent_activity(
     tout.user_id AS user_id,
     coalesce(tout.kind,'BURN_REWARD') AS kind,
     toFloat(coalesce(tout.eco, tout.amount)) AS amount,
-    tout.offer_id AS offer_id                              // ← new
+    tout.offer_id AS offer_id
 }
 RETURN id, createdAt, user_id, kind, amount, offer_id
 ORDER BY datetime(createdAt) DESC
 LIMIT $limit
-
     """
     rows = _all(s, cy, {"uid": user_id, "limit": int(limit)})
 
@@ -429,7 +508,7 @@ LIMIT $limit
             user_id=r.get("user_id"),
             kind=r.get("kind") or "event",
             amount=float(r.get("amount") or 0.0),
-            offer_id=r.get("offer_id"),                            # ← new
+            offer_id=r.get("offer_id"),
         ))
 
     return out
@@ -441,12 +520,17 @@ def patch_profile(
     s: Session = Depends(session_dep),
 ):
     """
-    No APOC: explicitly SET only provided fields.
+    No APOC: explicitly SET only provided fields (accepts rule fields to avoid 422).
     """
     _ensure_owner_business(s, user_id)
 
     # Build dynamic SETs based on provided keys
     fields_map = patch.dict(exclude_unset=True)
+
+    # Normalise FE "disable" semantics for geofence: FE may send null/""; if "", drop it.
+    if "rules_geofence_radius_m" in fields_map and fields_map["rules_geofence_radius_m"] in ("", None):
+        fields_map["rules_geofence_radius_m"] = None
+
     if not fields_map:
         b = _get_business(s, user_id)
         if not b:
@@ -464,7 +548,9 @@ def patch_profile(
     SET {", ".join(set_lines)}
     RETURN b {{
       .id, .name, .tagline, .website, .address, .hours, .description,
-      .hero_url, .lat, .lng, .visible_on_map, .tags
+      .hero_url, .lat, .lng, .visible_on_map, .tags,
+      .pledge_tier, .rules_first_visit, .rules_return_visit, .rules_cooldown_hours,
+      .rules_daily_cap_per_user, .rules_geofence_radius_m
     }} AS b
     """
     rec = _one(s, cy, params)
@@ -494,6 +580,12 @@ def patch_profile(
         visible_on_map=b.get("visible_on_map", True),
         tags=b.get("tags") or [],
         qr_code=qr,
+        pledge_tier=b.get("pledge_tier"),
+        rules_first_visit=b.get("rules_first_visit"),
+        rules_return_visit=b.get("rules_return_visit"),
+        rules_cooldown_hours=b.get("rules_cooldown_hours"),
+        rules_daily_cap_per_user=b.get("rules_daily_cap_per_user"),
+        rules_geofence_radius_m=b.get("rules_geofence_radius_m"),
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -524,13 +616,13 @@ def hero_upload(
 
     return {"path": public_path, "url": public_path}
 
-# ── Analytics models (append near existing models) ─────────────────────────────
+# ── Analytics models (unchanged) ─────────────────────────────
 
 class DayPoint(BaseModel):
-    day: str          # YYYY-MM-DD (UTC)
-    minted: int       # ECO minted to this business that day
-    retired: int      # ECO retired by this business that day
-    net: int          # minted - retired
+    day: str
+    minted: int
+    retired: int
+    net: int
 
 class DailySeriesOut(BaseModel):
     points: list[DayPoint]
@@ -545,7 +637,7 @@ class BusyOut(BaseModel):
     by_weekday: list[BusyBucket]
 
 class VisitorRow(BaseModel):
-    id: str               # user_id or device hash
+    id: str
     first_at: int
     last_at: int
     claims: int
@@ -557,8 +649,6 @@ class VisitorsOut(BaseModel):
 class AbuseOut(BaseModel):
     cooldown_hits: int
     daily_cap_hits: int
-
-from datetime import timedelta
 
 def _utc_day(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).date().isoformat()

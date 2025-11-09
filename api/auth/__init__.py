@@ -13,3 +13,6 @@ router.include_router(sso_router)
 router.include_router(main_router)
 router.include_router(set_role_router)
 router.include_router(refresh_router)
+# site_backend/api/auth/__init__.py (or wherever you mount routes)
+from .role_snapshot import router as role_snapshot_router
+router.include_router(role_snapshot_router)

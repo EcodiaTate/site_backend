@@ -1,8 +1,8 @@
-# site_backend/api/auth/auth_routes.py  (example path for your big file)
+# site_backend/api/auth/auth_routes.py
 from __future__ import annotations
 from uuid import uuid4
 from typing import Any, Optional
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status, Request # 1. Import Request
 from pydantic import BaseModel, EmailStr, Field
 from argon2 import PasswordHasher
 from neo4j import Session
@@ -90,8 +90,9 @@ class UserOut(BaseModel):
     role: str
     caps: dict[str, Any]
     profile: dict[str, Any] = {}
+
 @router.post("/login")
-def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
+def login(p: LoginIn, response: Response, request: Request, s: Session = Depends(session_dep)): # 2. Add request
     cypher = """
     MATCH (u:User {email:$email})
     OPTIONAL MATCH (u)-[:HAS_PROFILE]->(yp:YouthProfile)
@@ -137,7 +138,15 @@ def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
 
     access, exp = _mint_access(u["id"], u["email"])
     refresh = _mint_refresh(u["id"])
-    set_scoped_cookie(response, name=REFRESH_COOKIE_NAME, value=refresh, max_age=REFRESH_TTL_DAYS * 24 * 3600)
+    
+    # 3. Pass request object to set_scoped_cookie
+    set_scoped_cookie(
+        response,
+        name=REFRESH_COOKIE_NAME,
+        value=refresh,
+        max_age=REFRESH_TTL_DAYS * 24 * 3600,
+        request=request
+    )
 
     resp = {
         "id": u["id"],
@@ -161,6 +170,7 @@ def login(p: LoginIn, response: Response, s: Session = Depends(session_dep)):
 @router.post("/admin-cookie")
 def r_admin_cookie_here(
     response: Response,
+    request: Request, # 4. Add request
     s: Session = Depends(session_dep),
     uid: str = Depends(current_user_id),
 ):
@@ -171,5 +181,13 @@ def r_admin_cookie_here(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not an admin")
 
     token = mint_admin_token(email, ttl_secs=6*60*60)
-    set_scoped_cookie(response, name=ADMIN_COOKIE_NAME, value=token, max_age=6*60*60)
+    
+    # 5. Pass request object
+    set_scoped_cookie(
+        response,
+        name=ADMIN_COOKIE_NAME,
+        value=token,
+        max_age=6*60*60,
+        request=request
+    )
     return {"ok": True}

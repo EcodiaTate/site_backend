@@ -45,24 +45,29 @@ def refresh(request: Request, response: Response):
             raw, REFRESH_JWT_SECRET, algorithms=[REFRESH_JWT_ALGO], options={"leeway": 10}
         )
         if claims.get("typ") not in (None, "refresh"):
+            # 1. Pass request to delete
             delete_scoped_cookie(response, name=REFRESH_COOKIE_NAME, request=request)
             raise HTTPException(status_code=401, detail="Wrong token type")
         uid = str(claims.get("sub") or "")
         if not uid:
+            # 2. Pass request to delete
             delete_scoped_cookie(response, name=REFRESH_COOKIE_NAME, request=request)
             raise HTTPException(status_code=401, detail="Refresh missing subject")
     except JWTError:
+        # 3. Pass request to delete
         delete_scoped_cookie(response, name=REFRESH_COOKIE_NAME, request=request)
         raise HTTPException(status_code=401, detail="Invalid refresh token")
 
     # rotate refresh and return fresh access
     new_refresh = _mint_refresh(uid)
+    
+    # 4. Pass request to set
     set_scoped_cookie(
         response,
         name=REFRESH_COOKIE_NAME,
         value=new_refresh,
         max_age=REFRESH_TTL_DAYS * 24 * 3600,
-        request=request,  # ← localhost-aware flags
+        request=request,
     )
     access, exp = _mint_access(uid)
     return {"access": access, "exp": exp}

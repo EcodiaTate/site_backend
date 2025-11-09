@@ -15,7 +15,7 @@ from site_backend.core.user_guard import current_user_id
 
 # If you keep service wrappers, you can still import them.
 # This router mostly uses Cypher directly to ensure atomicity.
-from site_backend.api.services.neo_business import (
+from site_backend.api.eco_local.neo_business import (
     create_offer as svc_create_offer,
     list_offers as svc_list_offers,
     patch_offer as svc_patch_offer,

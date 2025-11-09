@@ -13,6 +13,8 @@ from .eco_local_business_public import router as referrals_router
 from .referrals import router as bizz_public_router
 from .youth_stats import public_router as youth_stats_router, admin_router as admin_youth_stats_router
 from .bizz_recruiting import router as bizz_recruiting_router
+from .owner import router as owner_router
+from .qr import router as qr_router
 
 router= APIRouter()
 
@@ -30,3 +32,5 @@ router.include_router(bizz_public_router)
 router.include_router(referrals_router)
 router.include_router(onboarding_router)
 router.include_router(bizz_recruiting_router)
+router.include_router(owner_router)
+router.include_router(qr_router)
