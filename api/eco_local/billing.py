@@ -17,7 +17,11 @@ router = APIRouter(prefix="/eco-local", tags=["billing"])
 
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
-PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3000")
+PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3001")
+import logging
+log = logging.getLogger("eco_local.billing")
+log.setLevel("INFO")
+log.info("Stripe key loaded: %s", ("YES (len=%d)" % len(stripe.api_key)) if stripe.api_key else "NO")
 
 # --------------------------------------------------------------------
 # Ownership helpers (user → business)
@@ -185,10 +189,6 @@ class BillingStatusOut(BaseModel):
     eco_mint_ratio: int
     latest_unit_amount_aud: Optional[int] = None  # last known monthly amount we stored
 
-
-# --------------------------------------------------------------------
-# Create Checkout Session (SCOPED)
-# --------------------------------------------------------------------
 @router.post("/billing/checkout", response_model=CheckoutOut)
 def create_checkout(
     payload: CheckoutIn,
@@ -197,31 +197,48 @@ def create_checkout(
     business_id: Optional[str] = Query(None, description="Optional if you own multiple"),
 ):
     bid = _resolve_user_business_id(s, user_id=user_id, requested_business_id=business_id)
+
+    # (Optional) pull existing customer so you don't create dup customers
+    biz = _get_business(s, bid)
+    kwargs = dict(
+        mode="subscription",
+        success_url=_hosted_return_url("/my-eco-bizz/billing?success=1"),
+        cancel_url=_hosted_return_url("/my-eco-bizz/billing?canceled=1"),
+        line_items=[{
+            "price_data": {
+                "currency": "aud",
+                "product_data": {"name": "ECO_LOCAL Monthly Contribution", "metadata": {"business_id": bid}},
+                "recurring": {"interval": "month"},
+                "unit_amount": int(payload.monthly_aud * 100),
+            },
+            "quantity": 1,
+        }],
+        metadata={"business_id": bid},
+        client_reference_id=bid,
+    )
+    if biz.get("stripe_customer_id"):
+        kwargs["customer"] = biz["stripe_customer_id"]
+    else:
+        # fall back to email if provided
+        if payload.email:
+            kwargs["customer_email"] = payload.email
+
     try:
-        session = stripe.checkout.Session.create(
-            mode="subscription",
-            success_url=_hosted_return_url("/my-eco-bizz/billing?success=1"),
-            cancel_url=_hosted_return_url("/my-eco-bizz/billing?canceled=1"),
-            customer_email=payload.email,
-            line_items=[
-                {
-                    "price_data": {
-                        "currency": "aud",
-                        "product_data": {
-                            "name": "ECO_LOCAL Monthly Contribution",
-                            "metadata": {"business_id": bid},
-                        },
-                        "recurring": {"interval": "month"},
-                        "unit_amount": int(payload.monthly_aud * 100),
-                    },
-                    "quantity": 1,
-                }
-            ],
-            metadata={"business_id": bid},
-        )
+        session = stripe.checkout.Session.create(**kwargs)
         return CheckoutOut(url=session.url)
+    except stripe.error.StripeError as e:
+        # Bubble up useful info
+        err = getattr(e, "user_message", None) or str(e)
+        code = getattr(e, "code", None)
+        status = getattr(e, "http_status", None)
+        # Log server-side so you see it in your console
+        import logging
+        logging.getLogger("eco_local.billing").error("Stripe error (status=%s, code=%s): %s", status, code, err)
+        raise HTTPException(status_code=500, detail=f"Stripe error [{code or 'unknown'}]: {err}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
+        import logging
+        logging.getLogger("eco_local.billing").exception("Unexpected checkout error")
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 
 # --------------------------------------------------------------------

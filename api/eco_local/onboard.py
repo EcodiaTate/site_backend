@@ -140,7 +140,7 @@ def business_recommend_api(payload: RecommendIn):
 
     base = base_by_size.get(payload.size, 49)
     amt = int(round(base * area_mult.get(payload.area, 1.0) * pledge_mult.get(payload.pledge, 1.0)))
-    amt = max(10, min(999, amt))
+    amt = max(0, min(999, amt))
 
     breakdown = {
         "size_base": base,
@@ -153,7 +153,7 @@ def business_recommend_api(payload: RecommendIn):
         recommended_monthly_aud=amt,
         breakdown=breakdown,
         pay_what_you_want=True,
-        min_aud=10,
+        min_aud=0,
         max_aud=999,
     )
 
