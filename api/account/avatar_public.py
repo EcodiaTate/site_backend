@@ -1,92 +1,116 @@
 from __future__ import annotations
 
-import os
-import re
-from pathlib import Path
 from typing import Optional
-
-from fastapi import APIRouter, Depends, Response
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from neo4j import Session
-from urllib.parse import urlparse, urlencode, parse_qsl, urlunparse
 
 from site_backend.core.neo_driver import session_dep
 
-from .service import get_public_profile
+router = APIRouter(tags=["account-avatars"])
 
-router = APIRouter(tags=["account"])
+CY_Q = """
+MATCH (u:User {id:$uid})
+RETURN
+  u.avatar_url        AS avatar_url,
+  u.avatar_sha        AS avatar_sha,
+  u.avatar_rev        AS avatar_rev,
+  u.avatar_updated_at AS avatar_updated_at
+LIMIT 1
+"""
 
-# If you store avatars locally under /uploads/avatars/aa/bb/<sha>.webp, this just works.
-# If you serve from S3/CDN, make sure your stored avatar_url is a public https URL; we 302 to it.
+# ---- helpers ---------------------------------------------------------------
 
-def _initials_svg(text: str, size: int = 80) -> bytes:
-    import re as _re
-    initials = "".join([p[0] for p in _re.split(r"[^\w]+", text) if p][:2]).upper() or "U"
-    return f"""<svg xmlns="http://www.w3.org/2000/svg" width="{size}" height="{size}">
-  <defs>
-    <linearGradient id="g" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0" stop-color="#E3F7DE"/>
-      <stop offset="1" stop-color="#FDF0C6"/>
-    </linearGradient>
-  </defs>
-  <rect width="100%" height="100%" rx="{size//2}" fill="url(#g)"/>
-  <text x="50%" y="55%" text-anchor="middle" font-family="Inter, system-ui" font-size="{int(size*0.42)}" font-weight="800" fill="#396041">{initials}</text>
-</svg>""".encode("utf-8")
+def _normalize_upload_url(raw: Optional[str]) -> Optional[str]:
+    """
+    Accepts:
+      - http(s) absolute → pass through
+      - '/uploads/avatars/...', 'uploads/avatars/...' (plural)
+      - '/uploads/avatar/...',  'uploads/avatar/...'  (singular, legacy)
+      - other relative → return '/<raw>'
+    Ensures leading slash; preserves query (?v=...).
+    """
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
 
-def _with_google_size(href: str, size: int) -> str:
-    u = urlparse(href)
-    if u.hostname and (u.hostname.endswith("googleusercontent.com") or u.hostname.endswith("ggpht.com")):
-        qs = dict(parse_qsl(u.query))
-        qs.setdefault("sz", str(size))
-        u = u._replace(query=urlencode(qs))
-        return urlunparse(u)
-    return href
-# site_backend/api/account/__init__ (or wherever your avatar route lives)
-from site_backend.core.paths import UPLOAD_ROOT  # import this
+    # ensure leading slash for relative
+    if not s.startswith("/"):
+        s = "/" + s
+
+    # normalize legacy singular → plural
+    if s.startswith("/uploads/avatar/"):
+        s = s.replace("/uploads/avatar/", "/uploads/avatars/", 1)
+
+    # accept both plural and (if it slips in) singular
+    if s.startswith("/uploads/avatars/") or s.startswith("/uploads/avatar/"):
+        return s
+
+    # unknown relative path – still return normalized absolute-ish
+    return s
+
+def _build_from_sha(sha: str, rev: Optional[str]) -> str:
+    """
+    Canonical sharded path:
+      /uploads/avatars/aa/bb/<sha>.webp[?v=<rev>]
+    """
+    aa, bb = sha[0:2], sha[2:4]
+    path = f"/uploads/avatars/{aa}/{bb}/{sha}.webp"
+    if rev:
+        join = "&" if "?" in path else "?"
+        path = f"{path}{join}v={rev}"
+    return path
+
+def _cache_headers(resp: RedirectResponse, rev: Optional[str]) -> None:
+    if rev:
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    else:
+        resp.headers["Cache-Control"] = "public, max-age=3600"
+
+# ---- routes ----------------------------------------------------------------
 
 @router.get("/u/{user_id}/avatar/{size}")
-def public_user_avatar(user_id: str, size: int = 80, s: Session = Depends(session_dep)):
-    size = max(24, min(size, 256))
+@router.head("/u/{user_id}/avatar/{size}")
+def user_avatar_redirect(
+    user_id: str,
+    size: int,  # kept for URL parity/caching, not used server-side
+    session: Session = Depends(session_dep),
+):
+    """
+    Resolves a user's avatar to a concrete asset URL via 307 redirect.
+    - Prefer explicit u.avatar_url (handles flat/sharded, singular/plural, and http(s)).
+    - Fallback to u.avatar_sha → canonical sharded path.
+    """
+    rec = session.run(CY_Q, {"uid": user_id}).single()
+    if not rec:
+        raise HTTPException(status_code=404, detail="User not found")
 
-    prof = get_public_profile(s, user_id)
-    display = (prof or {}).get("display_name") or user_id
-    avatar_url: Optional[str] = (prof or {}).get("avatar_url")
+    row = rec.data()  # <-- IMPORTANT: get dict
+    url: Optional[str] = row.get("avatar_url")
+    sha: Optional[str] = row.get("avatar_sha")
+    rev: Optional[str] = row.get("avatar_rev")
 
-    headers = {"Cache-Control": "public, max-age=600"}
+    # 1) Use explicit URL if present
+    u = _normalize_upload_url(url)
+    if u:
+        # ensure rev is appended for immutable caching if not present
+        if u.startswith("/uploads/") and rev and "v=" not in u:
+            sep = "&" if "?" in u else "?"
+            u = f"{u}{sep}v={rev}"
+        resp = RedirectResponse(u, status_code=307)
+        _cache_headers(resp, rev)
+        return resp
 
-    if not avatar_url:
-        return Response(_initials_svg(display, size), media_type="image/svg+xml",
-                        headers={"Cache-Control": "public, max-age=86400"})
+    # 2) Derive from sha (supports sharded layout)
+    if sha:
+        path = _build_from_sha(sha, rev)
+        resp = RedirectResponse(path, status_code=307)
+        _cache_headers(resp, rev)
+        return resp
 
-    if re.match(r"^https?://", avatar_url, re.I):
-        return RedirectResponse(_with_google_size(avatar_url, size), status_code=302, headers=headers)
-
-    # Normalize local path → always starts with /uploads/…
-    local_path = avatar_url if avatar_url.startswith("/") else f"/{avatar_url}"
-    p = Path(local_path.lstrip("/"))  # e.g. uploads/avatars/59/76/<sha>.webp
-
-    # Map URL path → filesystem path rooted at UPLOAD_ROOT
-    def to_fs(path_under_uploads: Path) -> Path:
-        parts = path_under_uploads.parts
-        if parts and parts[0] == "uploads":
-            # /uploads/<...> → UPLOAD_ROOT/<...>
-            return UPLOAD_ROOT / Path(*parts[1:])
-        # fallback (shouldn’t really happen)
-        return UPLOAD_ROOT / path_under_uploads
-
-    # Try exact path first
-    fs_exact = to_fs(p)
-    if fs_exact.is_file():
-        return RedirectResponse(local_path, status_code=302, headers=headers)
-
-    # Try size bucket variant: /uploads/avatars/{size}/…
-    parts = p.parts
-    if len(parts) >= 2 and parts[0] == "uploads" and parts[1] == "avatars":
-        candidate = Path("uploads/avatars") / str(size) / Path(*parts[2:])
-        fs_candidate = to_fs(candidate)
-        if fs_candidate.is_file():
-            return RedirectResponse("/" + str(candidate).replace("\\", "/"), status_code=302, headers=headers)
-
-    # Fallback → initials
-    return Response(_initials_svg(display, size), media_type="image/svg+xml",
-                    headers={"Cache-Control": "public, max-age=86400"})
+    # 3) No avatar set
+    raise HTTPException(status_code=404, detail="Avatar not set")

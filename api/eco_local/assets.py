@@ -1,4 +1,4 @@
-# api/eco_local/assets.py
+# api/eco-local/assets.py
 from __future__ import annotations
 
 import io
@@ -23,7 +23,7 @@ from PIL import Image, UnidentifiedImageError
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
 
-router = APIRouter(prefix="/eco-local/assets", tags=["eco_local-assets"])
+router = APIRouter(prefix="/eco-local/assets", tags=["eco-local-assets"])
 
 # --------------------------------------------------------------------
 # Config
@@ -45,7 +45,7 @@ _this_file = Path(__file__).resolve()
 _repo_parents = _this_file.parents
 REPO_ROOT = Path(os.getenv("REPO_ROOT") or (_repo_parents[3] if len(_repo_parents) >= 4 else Path.cwd()))
 
-DEFAULT_HERO_DIR = REPO_ROOT / "storage" / "eco_local" / "hero"
+DEFAULT_HERO_DIR = REPO_ROOT / "storage" / "eco-local" / "hero"
 HERO_DIR = Path(os.getenv("HERO_DIR", str(DEFAULT_HERO_DIR))).resolve()
 HERO_DIR.mkdir(parents=True, exist_ok=True)  # safe in dev
 
@@ -58,8 +58,8 @@ def short_url_for_code(code: str) -> str:
 
 def app_payload_for_code(code: str) -> str:
     # Simple scheme the modal can parse reliably.
-    # Examples: "eco_local:qr_abc123"  or for non-qr prefixed codes: "eco_local:biz_,783j28d3"
-    return f"eco_local:{code}"
+    # Examples: "eco-local:qr_abc123"  or for non-qr prefixed codes: "eco-local:biz_,783j28d3"
+    return f"eco-local:{code}"
 
 def _sign_qr_path(code: str, exp_ts: int) -> str:
     # payload: "code|exp"
@@ -144,7 +144,7 @@ async def hero_upload(
 ):
     """
     Accept an image upload, validate it with Pillow, store as PNG,
-    and return a *relative* URL like `/eco_local/assets/hero/<slug>.png`.
+    and return a *relative* URL like `/eco-local/assets/hero/<slug>.png`.
     """
     # Ownership scope
     bid = _get_owned_business_id(s, user_id=user_id)
@@ -180,9 +180,9 @@ async def hero_upload(
         SET b.hero_url = $rel
         """,
         bid=bid,
-        rel=f"/eco_local/assets/hero/{filename}",
+        rel=f"/eco-local/assets/hero/{filename}",
     )
-    return {"url": f"/eco_local/assets/hero/{filename}"}
+    return {"url": f"/eco-local/assets/hero/{filename}"}
 
 @router.get("/hero/{filename}")
 def serve_hero(filename: str):
@@ -243,7 +243,7 @@ def qr_png(
         media_type="image/png",
         headers={
             "Cache-Control": "private, no-store",
-            "Content-Disposition": f'inline; filename="eco_local-qr-{code}.png"'
+            "Content-Disposition": f'inline; filename="eco-local-qr-{code}.png"'
         },
     )
 
@@ -332,7 +332,7 @@ def qr_poster_pdf(
         media_type="application/pdf",
         headers={
             "Cache-Control": "private, no-store",
-            "Content-Disposition": f'inline; filename="eco_local-qr-poster-{code}.pdf"'
+            "Content-Disposition": f'inline; filename="eco-local-qr-poster-{code}.pdf"'
         },
     )
 
@@ -353,7 +353,7 @@ def qr_signed_url(
     exp = int(time.time()) + (minutes_valid * 60)
     sig = _sign_qr_path(code, exp)
     return {
-        "png": f"/eco_local/assets/qr/{code}.png?exp={exp}&sig={sig}",
-        "pdf": f"/eco_local/assets/qr/{code}/poster.pdf?exp={exp}&sig={sig}",
+        "png": f"/eco-local/assets/qr/{code}.png?exp={exp}&sig={sig}",
+        "pdf": f"/eco-local/assets/qr/{code}/poster.pdf?exp={exp}&sig={sig}",
         "exp": exp,
     }
