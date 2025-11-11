@@ -1,4 +1,3 @@
-# api/routers/eco-local_billing.py
 from __future__ import annotations
 
 import os
@@ -18,6 +17,7 @@ router = APIRouter(prefix="/eco-local", tags=["billing"])
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
 PUBLIC_BASE = os.environ.get("PUBLIC_BASE_URL", "http://localhost:3001")
+
 import logging
 log = logging.getLogger("eco_local.billing")
 log.setLevel("INFO")
@@ -93,7 +93,8 @@ def _get_business(s: Session, business_id: str) -> Dict[str, Any]:
           stripe_subscription_id:  p['stripe_subscription_id'],
           stripe_subscription_item_id: p['stripe_subscription_item_id'],
           subscription_status:     p['subscription_status'],
-          latest_unit_amount_aud:  p['latest_unit_amount_aud']
+          latest_unit_amount_aud:  p['latest_unit_amount_aud'],
+          current_period_end:      p['current_period_end']
         } AS b
         """,
         bid=business_id,
@@ -112,6 +113,7 @@ def _attach_stripe_to_business(
     subscription_item_id: Optional[str],
     subscription_status: Optional[str],
     latest_unit_amount_aud: Optional[int] = None,
+    current_period_end: Optional[int] = None,  # epoch seconds
 ) -> None:
     s.run(
         """
@@ -121,7 +123,8 @@ def _attach_stripe_to_business(
              b.stripe_subscription_item_id = $siid,
              b.subscription_status         = $status
         WITH b
-        SET  b.latest_unit_amount_aud      = coalesce($latest, b.latest_unit_amount_aud)
+        SET  b.latest_unit_amount_aud      = coalesce($latest, b.latest_unit_amount_aud),
+             b.current_period_end          = coalesce($cpe, b.current_period_end)
         """,
         bid=business_id,
         cid=customer_id,
@@ -129,6 +132,7 @@ def _attach_stripe_to_business(
         siid=subscription_item_id,
         status=subscription_status,
         latest=latest_unit_amount_aud,
+        cpe=current_period_end,
     )
 
 
@@ -151,7 +155,7 @@ def _hosted_return_url(path: str) -> str:
 # Models (scoped: no business_id in bodies; pass via query if multi-biz)
 # --------------------------------------------------------------------
 class CheckoutIn(BaseModel):
-    monthly_aud: int = Field(..., ge=5, le=999)
+    monthly_aud: int = Field(..., ge=0, le=999)
     email: Optional[str] = None
 
 
@@ -171,7 +175,7 @@ class PortalOut(BaseModel):
 
 
 class UpdateAmountIn(BaseModel):
-    monthly_aud: int = Field(..., ge=5, le=999)  # set new monthly in Stripe
+    monthly_aud: int = Field(..., ge=0, le=999)  # set new monthly in Stripe
 
 
 class UpdateAmountOut(BaseModel):
@@ -188,7 +192,27 @@ class BillingStatusOut(BaseModel):
     pledge_tier: Optional[str] = None
     eco_mint_ratio: int
     latest_unit_amount_aud: Optional[int] = None  # last known monthly amount we stored
+    current_period_end: Optional[int] = None      # epoch seconds (end of current cycle)
 
+
+class UpcomingOut(BaseModel):
+    next_amount_aud: int
+    next_period_end: Optional[int] = None
+
+
+class TopUpIn(BaseModel):
+    aud: int = Field(..., ge=1, le=999)
+
+
+class TopUpOut(BaseModel):
+    ok: bool
+    invoice_id: str
+    paid: bool
+
+
+# --------------------------------------------------------------------
+# Checkout (SCOPED)
+# --------------------------------------------------------------------
 @router.post("/billing/checkout", response_model=CheckoutOut)
 def create_checkout(
     payload: CheckoutIn,
@@ -207,7 +231,7 @@ def create_checkout(
         line_items=[{
             "price_data": {
                 "currency": "aud",
-                "product_data": {"name": "ECO_LOCAL Monthly Contribution", "metadata": {"business_id": bid}},
+                "product_data": {"name": "ECO Local Monthly Contribution", "metadata": {"business_id": bid}},
                 "recurring": {"interval": "month"},
                 "unit_amount": int(payload.monthly_aud * 100),
             },
@@ -231,13 +255,10 @@ def create_checkout(
         err = getattr(e, "user_message", None) or str(e)
         code = getattr(e, "code", None)
         status = getattr(e, "http_status", None)
-        # Log server-side so you see it in your console
-        import logging
-        logging.getLogger("eco_local.billing").error("Stripe error (status=%s, code=%s): %s", status, code, err)
+        log.error("Stripe error (status=%s, code=%s): %s", status, code, err)
         raise HTTPException(status_code=500, detail=f"Stripe error [{code or 'unknown'}]: {err}")
     except Exception as e:
-        import logging
-        logging.getLogger("eco_local.billing").exception("Unexpected checkout error")
+        log.exception("Unexpected checkout error")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {e}")
 
 
@@ -313,23 +334,88 @@ def update_amount(
                 }
             ],
         )
+        # Re-fetch to capture the (possibly changed) period_end/status
+        sub2 = stripe.Subscription.retrieve(sub_id)
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Stripe error: {e}")
 
-    # Persist the new amount to Neo for UI convenience
+    # Persist the new amount + current_period_end to Neo for UI convenience
     _attach_stripe_to_business(
         s,
         business_id=bid,
         customer_id=biz.get("stripe_customer_id"),
         subscription_id=biz.get("stripe_subscription_id"),
         subscription_item_id=biz.get("stripe_subscription_item_id"),
-        subscription_status=biz.get("subscription_status"),
+        subscription_status=sub2.get("status"),
         latest_unit_amount_aud=int(payload.monthly_aud),
+        current_period_end=int(sub2.get("current_period_end") or 0) or None,
     )
 
     return UpdateAmountOut(ok=True, business_id=bid, monthly_aud=int(payload.monthly_aud))
+
+
+# --------------------------------------------------------------------
+# Upcoming invoice preview (SCOPED) — optional helper for UI/emails
+# --------------------------------------------------------------------
+@router.get("/billing/upcoming", response_model=UpcomingOut)
+def upcoming_invoice(
+    s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
+    business_id: Optional[str] = Query(None, description="Optional if you own multiple"),
+):
+    bid = _resolve_user_business_id(s, user_id=user_id, requested_business_id=business_id)
+    b = _get_business(s, bid)
+    sid = b.get("stripe_subscription_id")
+    if not sid:
+        raise HTTPException(status_code=400, detail="No active subscription")
+    inv = stripe.Invoice.upcoming(subscription=sid)
+    # Try read first line's period end; fallback None
+    line0 = (inv.get("lines", {}) or {}).get("data", [{}])
+    line0 = line0[0] if line0 else {}
+    period_end = (line0.get("period") or {}).get("end")
+    return UpcomingOut(
+        next_amount_aud=int((inv.get("amount_due") or 0) // 100),
+        next_period_end=int(period_end or 0) or None,
+    )
+
+
+# --------------------------------------------------------------------
+# One-off top-up (SCOPED) — optional, charge immediately
+# --------------------------------------------------------------------
+@router.post("/billing/topup_now", response_model=TopUpOut)
+def topup_now(
+    payload: TopUpIn,
+    s: Session = Depends(session_dep),
+    user_id: str = Depends(current_user_id),
+    business_id: Optional[str] = Query(None, description="Optional if you own multiple"),
+):
+    bid = _resolve_user_business_id(s, user_id=user_id, requested_business_id=business_id)
+    b = _get_business(s, bid)
+    cust = b.get("stripe_customer_id")
+    if not cust:
+        raise HTTPException(status_code=400, detail="No Stripe customer")
+
+    # Create invoice item and charge an invoice immediately
+    item = stripe.InvoiceItem.create(
+        customer=cust,
+        currency="aud",
+        unit_amount=payload.aud * 100,
+        quantity=1,
+        description=f"ECO Local one-off top-up ({bid})",
+        metadata={"business_id": bid, "kind": "topup"},
+    )
+    inv = stripe.Invoice.create(customer=cust, collection_method="charge_automatically")
+    inv = stripe.Invoice.pay(inv["id"])
+
+    # Optionally mint ECO for top-ups the same as monthly
+    try:
+        stripe_record_contribution(s, business_id=bid, aud_cents=payload.aud * 100)
+    except Exception:
+        pass
+
+    return TopUpOut(ok=True, invoice_id=inv["id"], paid=(inv.get("paid") is True))
 
 
 # --------------------------------------------------------------------
@@ -351,6 +437,7 @@ def billing_status(
         pledge_tier=b.get("pledge_tier"),
         eco_mint_ratio=int(b.get("eco_mint_ratio", 10)),
         latest_unit_amount_aud=(int(b["latest_unit_amount_aud"]) if b.get("latest_unit_amount_aud") is not None else None),
+        current_period_end=b.get("current_period_end"),
     )
 
 
@@ -396,12 +483,13 @@ async def stripe_webhook(
                     subscription_item_id=item_id,
                     subscription_status=status_str,
                     latest_unit_amount_aud=(unit_amount // 100 if unit_amount else None),
+                    current_period_end=int(sub.get("current_period_end") or 0) or None,
                 )
             except Exception:
                 # swallow and still 200, Stripe will retry if needed
                 pass
 
-    # Invoice paid → mint ECO contribution
+    # Invoice paid → mint ECO contribution + update latest amount
     if t == "invoice.paid":
         subscription_id = data.get("subscription")
         amount_paid_cents = int(data.get("amount_paid") or 0)
@@ -415,15 +503,20 @@ async def stripe_webhook(
                 try:
                     # Mint ECO into unified ledger (UNSCOPED canonical path)
                     stripe_record_contribution(s, business_id=bid, aud_cents=amount_paid_cents)
-                    # Also store latest amount on business for UI
+                    # Also store latest amount & status & period end
+                    try:
+                        sub = stripe.Subscription.retrieve(subscription_id)
+                    except Exception:
+                        sub = {}
                     _attach_stripe_to_business(
                         s,
                         business_id=bid,
                         customer_id=None,
                         subscription_id=subscription_id,
                         subscription_item_id=None,
-                        subscription_status=data.get("status") or "active",
+                        subscription_status=(data.get("status") or sub.get("status") or "active"),
                         latest_unit_amount_aud=amount_paid_cents // 100,
+                        current_period_end=int(sub.get("current_period_end") or 0) or None,
                     )
                 except Exception:
                     pass  # keep webhook idempotent-friendly
@@ -440,5 +533,39 @@ async def stripe_webhook(
         status_str = sub.get("status")
         if subscription_id and status_str:
             _set_subscription_status_by_sid(s, subscription_id, status_str)
+            _attach_stripe_to_business(
+                s,
+                business_id=s.run(
+                    "MATCH (b:BusinessProfile {stripe_subscription_id:$sid}) RETURN b.id AS bid",
+                    sid=subscription_id,
+                ).single().get("bid"),
+                customer_id=None,
+                subscription_id=subscription_id,
+                subscription_item_id=None,
+                subscription_status=status_str,
+                latest_unit_amount_aud=None,
+                current_period_end=int(sub.get("current_period_end") or 0) or None,
+            )
+
+    # Upcoming invoice (reminder email hook)
+    if t == "invoice.upcoming":
+        subscription_id = data.get("subscription")
+        if subscription_id:
+            rec = s.run(
+                "MATCH (b:BusinessProfile {stripe_subscription_id:$sid}) RETURN b.id AS bid, b.name AS name",
+                sid=subscription_id,
+            ).single()
+            if rec and rec.get("bid"):
+                bid = rec["bid"]
+                # TODO: trigger SES/Gmail reminder to owner(s). Include link to /my-eco-bizz/billing?business_id={bid}
+                pass
+
+    # Payment failed (notify + grace rules)
+    if t == "invoice.payment_failed":
+        subscription_id = data.get("subscription")
+        if subscription_id:
+            _set_subscription_status_by_sid(s, subscription_id, "past_due")
+            # TODO: email with “update card / retry” CTA via SES/Gmail
+            pass
 
     return {"ok": True, "received": t}

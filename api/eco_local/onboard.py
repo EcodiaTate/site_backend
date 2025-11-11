@@ -134,9 +134,9 @@ def business_profile_api(
 
 @router.post("/business/recommend", response_model=RecommendOut)
 def business_recommend_api(payload: RecommendIn):
-    base_by_size = {"1-5": 25, "6-20": 49, "21-50": 99, "50+": 149}
-    area_mult = {"cbd": 1.15, "suburb": 1.0, "regional": 0.85}
-    pledge_mult = {"starter": 0.9, "builder": 1.0, "leader": 1.15}
+    base_by_size = {"1-5": 25, "6-20": 49, "21-50": 150, "50+": 200}
+    area_mult = {"cbd": 1.35, "suburb": 1.0, "regional": 0.85}
+    pledge_mult = {"starter": 1, "builder": 1.3, "leader": 1.5}
 
     base = base_by_size.get(payload.size, 49)
     amt = int(round(base * area_mult.get(payload.area, 1.0) * pledge_mult.get(payload.pledge, 1.0)))
