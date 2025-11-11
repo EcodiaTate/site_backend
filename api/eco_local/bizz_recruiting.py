@@ -273,7 +273,7 @@ def get_thread(email: str) -> Dict[str, Any]:
 def get_runs() -> Dict[str, Any]:
     rows = _run(
         """
-        MATCH (r:ECO:LocalRun)
+        MATCH (r:ECOLocalRun)
         RETURN r
         ORDER BY r.date DESC
         LIMIT 90
@@ -414,7 +414,7 @@ def runs_create(dateISO: str) -> Dict[str, Any]:
     d = _safe_date(dateISO).isoformat()
     row = _run(
         """
-        MERGE (r:ECO:LocalRun {date: date($d)})
+        MERGE (r:ECOLocalRun {date: date($d)})
           ON CREATE SET r.created_at = datetime()
         RETURN r
         """,
@@ -430,7 +430,7 @@ def runs_create(dateISO: str) -> Dict[str, Any]:
 def runs_freeze(dateISO: str) -> Dict[str, Any]:
     d = _safe_date(dateISO).isoformat()
     _run(
-        "MERGE (r:ECO:LocalRun {date: date($d)}) SET r.frozen = true, r.frozen_at = datetime()",
+        "MERGE (r:ECOLocalRun {date: date($d)}) SET r.frozen = true, r.frozen_at = datetime()",
         {"d": d},
     )
     return {"ok": True}

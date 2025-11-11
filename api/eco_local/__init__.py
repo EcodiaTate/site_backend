@@ -9,8 +9,8 @@ from .assets import router as assets_router
 from .business_stats import router as business_stats_router
 from .wallet import router as wallet_router
 from .onboard import router as onboarding_router
-from .eco_local_business_public import router as referrals_router
-from .referrals import router as bizz_public_router
+from .business_public import router as bizz_public_router
+from .referrals import router as referrals_router
 from .youth_stats import public_router as youth_stats_router, admin_router as admin_youth_stats_router
 from .bizz_recruiting import router as bizz_recruiting_router
 from .owner import router as owner_router

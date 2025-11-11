@@ -39,6 +39,7 @@ from site_backend.api.eco_local import router as eco_local_router
 from site_backend.api.missions import missions
 from site_backend.api.leaderboards import leaderboards
 from site_backend.api.recruiter_unsub import router as unsub_router
+from site_backend.api.tournaments.router_public import router as tournament_router
 from site_backend.api.teams.router_public import router as teams_router
 from site_backend.api import launchpad
 from site_backend.api import sidequests
@@ -131,6 +132,7 @@ def create_app() -> FastAPI:
     app.include_router(admin_cookie.router)
     app.include_router(launchpad.router)
     app.include_router(social_router)
+    app.include_router(tournament_router)
     app.include_router(leaderboards.router)
     app.include_router(gamification.router)
     app.include_router(auth.router)

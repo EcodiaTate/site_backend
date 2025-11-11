@@ -12,7 +12,7 @@ from site_backend.core.neo_driver import session_dep
 router = APIRouter(prefix="/eco-local/business/public", tags=["eco_local-business-public"])
 
 # ---------------------------------------------------------
-# Public business profile
+# Models
 # ---------------------------------------------------------
 
 class BusinessPublicOut(BaseModel):
@@ -23,39 +23,20 @@ class BusinessPublicOut(BaseModel):
     address: Optional[str] = None
     hours: Optional[str] = None
     description: Optional[str] = None
+    # media
     hero_url: Optional[str] = None
+    avatar_url: Optional[str] = None
+    logo_url: Optional[str] = None
+    photo_url: Optional[str] = None
+    image_small: Optional[str] = None
+    # owner hint
+    owner_user_id: Optional[str] = None
+    # geo + tags
     lat: Optional[float] = None
     lng: Optional[float] = None
     tags: Optional[List[str]] = None
-
-@router.get("/{business_id}", response_model=BusinessPublicOut)
-def public_profile(business_id: str, s: Session = Depends(session_dep)):
-    rec = s.run(
-        """
-        MATCH (b:BusinessProfile {id:$bid})
-        // remove this WHERE if you want to expose all businesses
-        WHERE coalesce(b.visible_on_map, true) = true
-        RETURN b.id AS id,
-               b.name AS name,
-               b.tagline AS tagline,
-               b.website AS website,
-               b.address AS address,
-               b.hours AS hours,
-               b.description AS description,
-               b.hero_url AS hero_url,
-               b.lat AS lat,
-               b.lng AS lng,
-               coalesce(b.tags, []) AS tags
-        """,
-        bid=business_id,
-    ).single()
-    if not rec:
-        raise HTTPException(status_code=404, detail="Business not found")
-    return BusinessPublicOut(**rec.data())
-
-# ---------------------------------------------------------
-# Public stats (unilateral model: businesses COLLECT ECO)
-# ---------------------------------------------------------
+    # optional runtime info
+    open_now: Optional[bool] = None
 
 class BusinessPublicStatsOut(BaseModel):
     business_id: str
@@ -64,17 +45,77 @@ class BusinessPublicStatsOut(BaseModel):
     contributions_30d: int
     last_collected_at: Optional[str] = None  # ISO datetime
 
+OfferStatus = Literal["active", "paused", "hidden"]
+
+class OfferPublicOut(BaseModel):
+    id: str
+    business_id: str
+    title: str
+    blurb: Optional[str] = None
+    status: OfferStatus = "active"
+    eco_price: Optional[int] = None
+    fiat_cost_cents: Optional[int] = None
+    stock: Optional[int] = None
+    url: Optional[str] = None
+    valid_until: Optional[str] = None
+    tags: Optional[List[str]] = None
+    createdAt: Optional[int] = None
+
+# ---------------------------------------------------------
+# Public business profile (with avatar fields!)
+# ---------------------------------------------------------
+
+@router.get("/{business_id}", response_model=BusinessPublicOut)
+def public_profile(business_id: str, s: Session = Depends(session_dep)):
+    rec = s.run(
+        """
+        MATCH (b:BusinessProfile {id:$bid})
+        // comment out the next line to expose all businesses
+        WHERE coalesce(b.visible_on_map, true) = true
+
+        // Optional owner relation fallback for avatar route
+        OPTIONAL MATCH (u:User)-[r:OWNS|MANAGES]->(b)
+
+        RETURN
+          b.id                         AS id,
+          b.name                       AS name,
+          b.tagline                    AS tagline,
+          b.website                    AS website,
+          b.address                    AS address,
+          b.hours                      AS hours,
+          b.description                AS description,
+
+          // media fields (as stored; frontend will absolutize)
+          b.hero_url                   AS hero_url,
+          b.avatar_url                 AS avatar_url,
+          b.logo_url                   AS logo_url,
+          b.photo_url                  AS photo_url,
+          b.image_small                AS image_small,
+
+          // if business node doesn’t have owner_user_id, use related user id
+          coalesce(b.owner_user_id, u.id) AS owner_user_id,
+
+          b.lat                        AS lat,
+          b.lng                        AS lng,
+          coalesce(b.tags, [])         AS tags,
+
+          // if you track store hours → expose "open_now" if present
+          coalesce(b.open_now, NULL)   AS open_now
+        """,
+        bid=business_id,
+    ).single()
+
+    if not rec:
+        raise HTTPException(status_code=404, detail="Business not found")
+
+    return BusinessPublicOut(**rec.data())
+
+# ---------------------------------------------------------
+# Public stats (unchanged)
+# ---------------------------------------------------------
+
 @router.get("/{business_id}/stats", response_model=BusinessPublicStatsOut)
 def business_public_stats(business_id: str, s: Session = Depends(session_dep)):
-    """
-    Aggregates all EcoTx that represent youth CONTRIBUTIONS to this business.
-    We treat EcoTx.kind/type in {'CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT'} as contributions.
-
-    Timestamp precedence:
-      - tx.at (datetime)
-      - datetime({epochMillis: toInteger(tx.createdAt)})
-      - datetime(tx.created_at)  // string fallback if present
-    """
     end_dt = datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=30)
 
@@ -85,7 +126,6 @@ def business_public_stats(business_id: str, s: Session = Depends(session_dep)):
         """
         MATCH (b:BusinessProfile {id:$bid})
 
-        // All contribution txns to this business
         OPTIONAL MATCH (tx:EcoTx)-[:TO]->(b)
         WHERE coalesce(tx.kind, tx.type) IN ['CONTRIBUTE_TO_BIZ','CONTRIBUTION','BIZ_COLLECT']
 
@@ -95,10 +135,9 @@ def business_public_stats(business_id: str, s: Session = Depends(session_dep)):
                WHEN tx.at IS NOT NULL THEN tx.at
                WHEN tx.createdAt IS NOT NULL THEN datetime({epochMillis: toInteger(tx.createdAt)})
                WHEN tx.created_at IS NOT NULL THEN datetime(tx.created_at)
-               ELSE datetime.transaction()  // fallback so max() works; will not be used if eco_val is 0
+               ELSE datetime.transaction()
              END AS tat
 
-        // Global aggregates + last 30 days slice
         WITH b,
              sum(eco_val) AS collected_total,
              max(tat)     AS lastTat,
@@ -128,24 +167,8 @@ def business_public_stats(business_id: str, s: Session = Depends(session_dep)):
     )
 
 # ---------------------------------------------------------
-# Public offers (marketing/display only; no wallet semantics)
+# Public offers (unchanged)
 # ---------------------------------------------------------
-
-OfferStatus = Literal["active", "paused", "hidden"]
-
-class OfferPublicOut(BaseModel):
-    id: str
-    business_id: str
-    title: str
-    blurb: Optional[str] = None
-    status: OfferStatus = "active"
-    eco_price: Optional[int] = None
-    fiat_cost_cents: Optional[int] = None
-    stock: Optional[int] = None
-    url: Optional[str] = None
-    valid_until: Optional[str] = None
-    tags: Optional[List[str]] = None
-    createdAt: Optional[int] = None
 
 @router.get("/{business_id}/offers", response_model=List[OfferPublicOut])
 def public_offers_for_business(business_id: str, s: Session = Depends(session_dep)):
@@ -172,7 +195,6 @@ def public_offers_for_business(business_id: str, s: Session = Depends(session_de
     for r in recs:
         o: Dict[str, Any] = dict(r["offer"])
         o.setdefault("status", "active")
-        # Ensure business_id is a concrete string
         if o.get("business_id") is None:
             o["business_id"] = business_id
         out.append(OfferPublicOut(**o))
