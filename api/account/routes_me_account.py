@@ -1,20 +1,14 @@
+# api/me/routes_me_account.py
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
 from pydantic import BaseModel, EmailStr, Field
-from typing import Optional, Tuple, Dict
+from typing import Optional
 from neo4j import Session
 
-import io, os, time, hashlib
-from pathlib import Path
-from PIL import Image
-
-# HEIC/AVIF support (safe no-op if not installed)
-try:
-    from pillow_heif import register_heif
-    register_heif()
-except Exception:
-    pass
+import io
+import os
+import logging
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
@@ -27,12 +21,14 @@ from .service import (
     trigger_verify_email,
     change_password as svc_change_password,
     trigger_password_reset,
+    set_user_avatar_from_bytes,  # keep existing storage path/versioning logic
     clear_user_avatar,
 )
 
 router = APIRouter(prefix="/me/account", tags=["account"])
+log = logging.getLogger("account.avatar")
 
-# -------------------- Schemas --------------------
+# ==================== Schemas ====================
 
 class MeAccount(BaseModel):
     id: str
@@ -40,7 +36,7 @@ class MeAccount(BaseModel):
     display_name: str | None = None
     role: str = Field(default="public")
     email_verified: bool = False
-    avatar_url: Optional[str] = None  # absolute (via abs_media)
+    avatar_url: Optional[str] = None  # absolute via abs_media
 
 class DisplayNameIn(BaseModel):
     display_name: str = Field(min_length=1, max_length=80)
@@ -67,19 +63,61 @@ class PasswordResetOut(BaseModel):
 class AvatarOut(BaseModel):
     avatar_url: Optional[str] = None
 
-# -------------------- Constants / helpers --------------------
 
-# GCSFuse mount root; app serves /uploads -> {UPLOAD_ROOT}/uploads
-UPLOAD_ROOT = Path(os.getenv("UPLOAD_ROOT", "/data/uploads"))
-MEDIA_UPLOADS_ROOT = UPLOAD_ROOT / "uploads"           # .../uploads
-AVATARS_ROOT = MEDIA_UPLOADS_ROOT / "avatars"          # .../uploads/avatars
+# ==================== Upload helpers ====================
 
-def _ensure_dirs(p: Path) -> None:
-    p.mkdir(parents=True, exist_ok=True)
+# Max avatar size (MB) -> bytes (defaults to 15 MB)
+_AVATAR_MAX_MB = float(os.getenv("AVATAR_MAX_MB", "15"))
+_AVATAR_MAX_BYTES = int(_AVATAR_MAX_MB * 1024 * 1024)
 
-def _normalize_orientation(im: Image.Image) -> Image.Image:
+# Content-type / extension sets
+_HEIC_CTS = {"image/heic", "image/heif", "image/avif"}
+_BASIC_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+_HEIC_EXTS = (".heic", ".heif", ".avif")
+
+def _register_heif_plugins() -> bool:
+    """
+    Try all known pillow-heif registration entry points across versions.
+    Returns True if any registration succeeded.
+    """
     try:
-        exif = im.getexif()
+        import pillow_heif  # type: ignore
+    except Exception as e:
+        log.info("pillow-heif not importable: %s", e)
+        return False
+
+    registered = False
+    for fn_name in ("register_heif", "register_heif_opener", "register_avif_opener"):
+        try:
+            fn = getattr(pillow_heif, fn_name, None)
+            if callable(fn):
+                fn()
+                registered = True
+                log.info("pillow-heif: %s() succeeded", fn_name)
+        except Exception as e:
+            log.warning("pillow-heif: %s() failed: %s", fn_name, e)
+    if not registered:
+        log.warning("pillow-heif present but no registration function succeeded")
+    return registered
+
+def _lazy_pillow():
+    """
+    Import PIL lazily so the app still starts if Pillow isn't installed.
+    Also attempt to register HEIF/AVIF openers if pillow-heif is present.
+    Returns the PIL Image module or None.
+    """
+    try:
+        from PIL import Image as PILImage  # type: ignore
+    except Exception as e:
+        log.info("Pillow not importable: %s", e)
+        return None
+    _register_heif_plugins()
+    return PILImage
+
+def _normalize_orientation_pil(im):
+    # EXIF orientation normalization; safe no-op if no EXIF
+    try:
+        exif = getattr(im, "getexif", lambda: {})()
         orientation = exif.get(274)
         if orientation == 3:
             return im.rotate(180, expand=True)
@@ -91,63 +129,29 @@ def _normalize_orientation(im: Image.Image) -> Image.Image:
         pass
     return im
 
-def _atomic_write(path: Path, data: bytes) -> None:
-    _ensure_dirs(path.parent)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-def _guess_orig_ext(fmt: Optional[str], content_type: Optional[str], filename: Optional[str]) -> str:
-    ct = (content_type or "").lower()
-    fn = (filename or "").lower()
-    f = (fmt or "").upper()
-    # prefer explicit types
-    if "png" in ct or fn.endswith(".png") or f == "PNG":
-        return ".png"
-    if "webp" in ct or fn.endswith(".webp") or f == "WEBP":
-        return ".webp"
-    if "jpeg" in ct or "jpg" in ct or fn.endswith(".jpg") or fn.endswith(".jpeg") or f in ("JPEG", "JPG"):
-        return ".jpg"
-    # HEIC/AVIF → store original as .jpg alongside webp
-    if "heic" in ct or "heif" in ct or "avif" in ct or f in ("HEIC", "HEIF", "AVIF"):
-        return ".jpg"
-    return ".jpg"
-
-def _to_webp_bytes(im: Image.Image) -> bytes:
-    im = _normalize_orientation(im)
+def _to_webp_bytes_pil(PILImage, im) -> bytes:
+    im = _normalize_orientation_pil(im)
     if im.mode not in ("RGB", "RGBA"):
         im = im.convert("RGB")
     buf = io.BytesIO()
     im.save(buf, "WEBP", quality=85, method=6)
     return buf.getvalue()
 
-def _encode_as(im: Image.Image, ext: str) -> bytes:
-    im = _normalize_orientation(im)
-    if ext == ".png":
-        if im.mode not in ("RGB", "RGBA"):
-            im = im.convert("RGB")
-        buf = io.BytesIO()
-        im.save(buf, "PNG", optimize=True)
-        return buf.getvalue()
-    # default to JPEG
-    if im.mode not in ("RGB", "RGBA"):
-        im = im.convert("RGB")
-    buf = io.BytesIO()
-    im.save(buf, "JPEG", quality=90, optimize=True)
-    return buf.getvalue()
+def _guess_ext_from_ct_or_name(content_type: Optional[str], filename: Optional[str]) -> str:
+    ct = (content_type or "").lower()
+    fn = (filename or "").lower()
+    if "png" in ct or fn.endswith(".png"):
+        return ".png"
+    if "webp" in ct or fn.endswith(".webp"):
+        return ".webp"
+    if "jpeg" in ct or "jpg" in ct or fn.endswith(".jpg") or fn.endswith(".jpeg"):
+        return ".jpg"
+    if fn.endswith(_HEIC_EXTS):
+        return ".heic"  # marker; we won't passthrough this without conversion
+    return ".jpg"
 
-def _shard_dir_for_sha(sha: str) -> Path:
-    aa, bb = sha[:2], sha[2:4]
-    return AVATARS_ROOT / aa / bb
 
-def _build_avatar_url(sha: str, rev: str) -> str:
-    aa, bb = sha[:2], sha[2:4]
-    return f"/uploads/avatars/{aa}/{bb}/{sha}.webp?v={rev}"
-
-# -------------------- Routes --------------------
+# ==================== Routes ====================
 
 @router.get("", response_model=MeAccount)
 def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
@@ -156,6 +160,7 @@ def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(s
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     acc["avatar_url"] = abs_media(acc.get("avatar_url"))
     return acc
+
 
 @router.patch("/display-name", response_model=dict)
 def r_update_display_name(
@@ -166,6 +171,7 @@ def r_update_display_name(
     update_display_name(s, uid, p.display_name.strip())
     return {"ok": True}
 
+
 @router.post("/change-email", response_model=ChangeEmailOut)
 def r_change_email(
     p: ChangeEmailIn,
@@ -175,10 +181,12 @@ def r_change_email(
     begin_change_email(s, uid, p.new_email)
     return ChangeEmailOut(pending_verification=True)
 
+
 @router.post("/send-verify-email", response_model=VerifyEmailOut)
 def r_send_verify_email(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
     sent = trigger_verify_email(s, uid)
     return VerifyEmailOut(sent=sent)
+
 
 @router.post("/change-password", response_model=ChangePasswordOut)
 def r_change_password(
@@ -189,74 +197,81 @@ def r_change_password(
     svc_change_password(s, uid, p.current_password, p.new_password)
     return ChangePasswordOut(ok=True)
 
+
 @router.post("/send-password-reset", response_model=PasswordResetOut)
 def r_send_password_reset(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
     sent = trigger_password_reset(s, uid)
     return PasswordResetOut(sent=sent)
 
-# -------- Avatar upload/remove (HEIC-safe) --------
 
+# -------- Avatar upload/remove (HEIC-safe, tolerant, lazy Pillow) --------
 @router.post("/avatar", response_model=AvatarOut)
 def r_upload_avatar(
     f: UploadFile = File(...),
     uid: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
-    # Basic type guard
-    if not f.content_type or not f.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Please upload an image.")
+    # Tolerant: allow empty/odd content-types if filename looks like an image
+    ct = (f.content_type or "").lower()
+    fn = (f.filename or "").lower()
+    looks_like_image = (
+        ct.startswith("image/")
+        or fn.endswith(_BASIC_EXTS)
+        or fn.endswith(_HEIC_EXTS)
+    )
+    if not looks_like_image:
+        raise HTTPException(status_code=400, detail="Please upload an image (PNG/JPG/WebP/HEIC/AVIF).")
 
-    # 1) read bytes and decode any format (HEIC/AVIF supported via pillow-heif)
     data = f.file.read()
-    try:
-        im = Image.open(io.BytesIO(data))
-        im.load()  # force decode
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty upload.")
+    if len(data) > _AVATAR_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Image too large (max {int(_AVATAR_MAX_MB)} MB).",
+        )
 
-    # 2) produce canonical WEBP
-    try:
-        webp_bytes = _to_webp_bytes(im)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not convert to WEBP: {e}")
+    # Try Pillow first regardless of provided content-type.
+    PILImage = _lazy_pillow()
+    if PILImage is not None:
+        try:
+            im = PILImage.open(io.BytesIO(data))
+            im.load()  # force decode; works for HEIC/AVIF if pillow-heif registered
+        except Exception as e:
+            # If decode failed, fall back to passthrough for basic types; otherwise explain.
+            ext = _guess_ext_from_ct_or_name(ct, f.filename)
+            if ext in (".jpg", ".png", ".webp"):
+                rel = set_user_avatar_from_bytes(s, uid, data, ext)
+                return AvatarOut(avatar_url=abs_media(rel))
+            if ext in (".heic",):
+                raise HTTPException(
+                    status_code=415,
+                    detail="HEIC/AVIF not supported by the running server. Ensure pillow-heif is registered and libheif is available; then restart the server."
+                )
+            raise HTTPException(status_code=415, detail=f"Unsupported image format: {e}")
 
-    # 3) sha from webp (stable key) + rev for cache busting
-    sha = hashlib.sha256(webp_bytes).hexdigest()
-    rev = str(int(time.time()))
+        # With a decoded image, normalize and convert to WEBP
+        try:
+            webp_bytes = _to_webp_bytes_pil(PILImage, im)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not convert to WEBP: {e}")
 
-    # 4) compute shard paths and write atomically
-    shard_dir = _shard_dir_for_sha(sha)
-    webp_path = shard_dir / f"{sha}.webp"
+        rel = set_user_avatar_from_bytes(s, uid, webp_bytes, ".webp")
+        return AvatarOut(avatar_url=abs_media(rel))
 
-    # original ext (store alongside webp: .jpg for HEIC/AVIF)
-    orig_ext = _guess_orig_ext(getattr(im, "format", None), f.content_type, f.filename)
-    orig_path = shard_dir / f"{sha}{orig_ext}"
+    # No Pillow available → allow passthrough for PNG/JPG/WebP; block HEIC/AVIF with a clear message.
+    if ct in _HEIC_CTS or fn.endswith(_HEIC_EXTS):
+        raise HTTPException(
+            status_code=415,
+            detail="HEIC/AVIF not supported on this server. Install Pillow and pillow-heif (plus libheif on Linux) and restart."
+        )
+    ext = _guess_ext_from_ct_or_name(ct, f.filename)
+    if ext not in (".jpg", ".png", ".webp"):
+        raise HTTPException(status_code=415, detail=f"Unsupported image type: {ct or f.filename or 'unknown'}")
 
-    try:
-        # write original (re-encode if necessary)
-        orig_bytes = _encode_as(im, orig_ext)
-        _atomic_write(orig_path, orig_bytes)
-        # write webp
-        _atomic_write(webp_path, webp_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to store avatar: {e}")
+    rel = set_user_avatar_from_bytes(s, uid, data, ext)
+    return AvatarOut(avatar_url=abs_media(rel))
 
-    # 5) commit DB only after successful writes
-    cy = """
-    MATCH (u:User {id:$uid})
-    SET   u.avatar_sha = $sha,
-          u.avatar_rev = $rev,
-          u.avatar_url = NULL,
-          u.avatar_updated_at = datetime()
-    RETURN u.avatar_sha AS avatar_sha, u.avatar_rev AS avatar_rev
-    """
-    rec = s.run(cy, {"uid": uid, "sha": sha, "rev": rev}).single()
-    if not rec:
-        # roll forward: keep files, but signal user not found
-        raise HTTPException(status_code=404, detail="User not found")
-
-    url = _build_avatar_url(sha, rev)
-    return AvatarOut(avatar_url=abs_media(url))
 
 @router.delete("/avatar", response_model=AvatarOut)
 def r_delete_avatar(

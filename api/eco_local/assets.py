@@ -9,11 +9,11 @@ import hmac
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 import qrcode
 from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File, Body
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse, RedirectResponse
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
@@ -22,6 +22,7 @@ from PIL import Image, UnidentifiedImageError
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
+from site_backend.core.paths import UPLOAD_ROOT  # <- canonical uploads root (…/site_backend/data/uploads)
 
 router = APIRouter(prefix="/eco-local/assets", tags=["eco-local-assets"])
 
@@ -39,30 +40,31 @@ BRAND_CREAM  = "#faf3e0"
 BRAND_BLACK  = "#000000"
 BRAND_WHITE  = "#ffffff"
 
-# Storage roots (ABSOLUTE)
-# Try to infer repo root safely; fall back to CWD if path depth is shallow.
-_this_file = Path(__file__).resolve()
-_repo_parents = _this_file.parents
-REPO_ROOT = Path(os.getenv("REPO_ROOT") or (_repo_parents[3] if len(_repo_parents) >= 4 else Path.cwd()))
+# ---------- Storage locations ----------
+# Avatars already live under UPLOAD_ROOT/avatars; heroes mirror that:
+UPLOADS_DIR: Path = UPLOAD_ROOT
+HERO_DIR: Path = (UPLOADS_DIR / "heroes").resolve()
+HERO_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_HERO_DIR = REPO_ROOT / "storage" / "eco-local" / "hero"
-HERO_DIR = Path(os.getenv("HERO_DIR", str(DEFAULT_HERO_DIR))).resolve()
-HERO_DIR.mkdir(parents=True, exist_ok=True)  # safe in dev
+# Allowed hero file extensions we’ll *read* (we always store .webp)
+_ALLOWED_EXT = (".png", ".webp", ".jpg", ".jpeg")
+
+# Legacy read locations (compat)
+LEGACY_HERO_DIRS = [
+    (UPLOADS_DIR / "hero").resolve(),                      # singular
+    (UPLOADS_DIR / "eco-local" / "hero").resolve(),        # very old
+]
 
 # --------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------
 def short_url_for_code(code: str) -> str:
-    """Next.js QR landing lives at /q/[code]."""
     return f"{PUBLIC_BASE.rstrip('/')}/q/{code}"
 
 def app_payload_for_code(code: str) -> str:
-    # Simple scheme the modal can parse reliably.
-    # Examples: "eco-local:qr_abc123"  or for non-qr prefixed codes: "eco-local:biz_,783j28d3"
     return f"eco-local:{code}"
 
 def _sign_qr_path(code: str, exp_ts: int) -> str:
-    # payload: "code|exp"
     msg = f"{code}|{exp_ts}".encode("utf-8")
     return hmac.new(QR_SIGNING_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
@@ -72,21 +74,55 @@ def _verify_qr_signature(code: str, exp_ts: int, sig: str) -> bool:
     expected = _sign_qr_path(code, exp_ts)
     return hmac.compare_digest(expected, sig or "")
 
-def _assert_png_filename(fname: str) -> str:
-    """
-    Only allow simple filenames like abc123.png (no slashes).
-    """
-    if not re.fullmatch(r"[A-Za-z0-9_\-]+\.png", fname or ""):
+def _assert_hero_filename(fname: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+\.(?:png|webp|jpg|jpeg)", fname or "", flags=re.I):
         raise HTTPException(status_code=404, detail="Not found")
     return fname
 
-def _abs_hero_path(fname: str) -> Path:
-    fname = _assert_png_filename(fname)
-    p = (HERO_DIR / fname).resolve()
-    # Prevent path traversal: must stay inside HERO_DIR
+def _safe_stem(stem: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_\-]+", stem or ""):
+        raise HTTPException(status_code=404, detail="Not found")
+    return stem
+
+def _abs_hero_path(filename: str) -> Path:
+    filename = _assert_hero_filename(filename)
+    p = (HERO_DIR / filename).resolve()
     if HERO_DIR not in p.parents and p != HERO_DIR:
         raise HTTPException(status_code=404, detail="Not found")
     return p
+
+def _try_paths_for(stem_or_filename: str) -> Optional[Tuple[Path, str]]:
+    """
+    Resolve an on-disk hero by checking /uploads/heroes first, then legacy dirs.
+    Accepts either 'abc123.png' or bare 'abc123'.
+    Returns (path, media_type) or None.
+    """
+    candidates: list[Path] = []
+
+    if "." in stem_or_filename:
+        try:
+            fname = _assert_hero_filename(stem_or_filename)
+        except HTTPException:
+            return None
+        candidates.append((HERO_DIR / fname).resolve())
+        for d in LEGACY_HERO_DIRS:
+            candidates.append((d / fname).resolve())
+    else:
+        stem = _safe_stem(stem_or_filename)
+        for ext in _ALLOWED_EXT:
+            candidates.append((HERO_DIR / f"{stem}{ext}").resolve())
+        for d in LEGACY_HERO_DIRS:
+            for ext in _ALLOWED_EXT:
+                candidates.append((d / f"{stem}{ext}").resolve())
+
+    for p in candidates:
+        base_dirs = [HERO_DIR, *LEGACY_HERO_DIRS]
+        if not any((bd == p or bd in p.parents) for bd in base_dirs):
+            continue
+        if p.is_file():
+            media = f"image/{p.suffix.lstrip('.').lower()}"
+            return p, media
+    return None
 
 @dataclass
 class QRMeta:
@@ -96,9 +132,6 @@ class QRMeta:
     code: str
 
 def _get_owned_qr_meta(s: Session, *, user_id: str, code: str) -> QRMeta:
-    """
-    Ensure the QR code belongs to a business owned/managed by the current user.
-    """
     rec = s.run(
         """
         MATCH (u:User {id:$uid})-[r]->(b:BusinessProfile)
@@ -134,81 +167,158 @@ def _get_owned_business_id(s: Session, *, user_id: str) -> Optional[str]:
     return rec["id"] if rec else None
 
 # --------------------------------------------------------------------
-# HERO: Upload & Serve
+# Hero storage (inline, no external service module)
 # --------------------------------------------------------------------
+def _to_webp_bytes(im: Image.Image) -> bytes:
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, "WEBP", quality=85, method=6)
+    return buf.getvalue()
+
+def _sharded_target(root: Path, sha: str, ext: str) -> Path:
+    aa, bb = sha[:2], sha[2:4]
+    p = root / aa / bb
+    p.mkdir(parents=True, exist_ok=True)
+    return p / f"{sha}{ext}"
+
+def set_business_hero_from_bytes(
+    s: Session,
+    business_id: str,
+    raw: bytes,
+    filename_hint: Optional[str] = None,
+) -> str:
+    # Content hash (stable name)
+    sha = hashlib.sha256(raw).hexdigest()
+
+    # Decode & convert to webp
+    im = Image.open(io.BytesIO(raw))
+    im.load()
+    webp = _to_webp_bytes(im)
+
+    # Write sharded file
+    target = _sharded_target(HERO_DIR, sha, ".webp")
+    target.write_bytes(webp)
+
+    # Cache-busting rev
+    rev = str(int(time.time()))
+    aa, bb = sha[:2], sha[2:4]
+    url = f"/uploads/heroes/{aa}/{bb}/{sha}.webp?v={rev}"
+
+    # Persist on BusinessProfile
+    s.run(
+        """
+        MATCH (b:BusinessProfile {id:$bid})
+        SET b.hero_sha = $sha,
+            b.hero_rev = $rev,
+            b.hero_url = $url
+        """,
+        bid=business_id, sha=sha, rev=rev, url=url,
+    )
+    return url
+# replace your existing hero_upload with this
+
 @router.post("/hero_upload", response_model=dict)
 async def hero_upload(
-    file: UploadFile = File(...),
+    file: UploadFile = File(None),          # accept "file"
+    upload: UploadFile = File(None),        # or legacy "upload"
     s: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
-    """
-    Accept an image upload, validate it with Pillow, store as PNG,
-    and return a *relative* URL like `/eco-local/assets/hero/<slug>.png`.
-    """
-    # Ownership scope
+    uf = file or upload
+    if uf is None:
+        # make it clear what's wrong if someone still trips this
+        raise HTTPException(status_code=400, detail="No file field provided. Use form field 'file'.")
+
     bid = _get_owned_business_id(s, user_id=user_id)
     if not bid:
         raise HTTPException(status_code=403, detail="No business found for this account")
 
-    data = await file.read()
+    data = await uf.read()
     if not data or len(data) < 16:
         raise HTTPException(status_code=400, detail="Empty or invalid file")
 
+    # sanity check (we convert internally to webp)
     try:
-        img = Image.open(io.BytesIO(data))
-        img.verify()
-    except UnidentifiedImageError:
+        Image.open(io.BytesIO(data)).verify()
+    except Exception:
         raise HTTPException(status_code=400, detail="The uploaded file is not a valid image")
 
-    # Re-open after verify() to get a usable image object, normalize to RGB PNG
-    img = Image.open(io.BytesIO(data)).convert("RGB")
+    url = set_business_hero_from_bytes(s, bid, data, uf.filename or None)
+    # return both for callers that use `path` or `url`
+    return {"url": url, "path": url}
 
-    import secrets
-    slug = secrets.token_hex(8)
-    filename = f"{slug}.png"
-    abs_path = os.path.join(HERO_DIR, filename)
 
-    try:
-        img.save(abs_path, format="PNG", optimize=True)
-    except Exception:
-        raise HTTPException(status_code=500, detail="Failed to store image")
-
-    s.run(
-        """
-        MATCH (b:BusinessProfile {id:$bid})
-        SET b.hero_url = $rel
-        """,
-        bid=bid,
-        rel=f"/eco-local/assets/hero/{filename}",
-    )
-    return {"url": f"/eco-local/assets/hero/{filename}"}
-
-@router.get("/hero/{filename}")
-def serve_hero(filename: str):
-    path = _abs_hero_path(filename)
-    if not path.is_file():
+@router.get("/hero/{key}")
+def serve_hero(key: str):
+    """
+    Legacy-friendly hero serving:
+    - If we find a file under /uploads/heroes → 307 to that canonical path.
+    - Otherwise, serve directly from the legacy folder.
+    """
+    found = _try_paths_for(key)
+    if not found:
         raise HTTPException(status_code=404, detail="Not found")
-    # Allow browser caching; assets change by filename
+    path, media = found
+
+    # If it's already in our canonical folder, redirect to its public path
+    if HERO_DIR in path.parents:
+        # detect shard if present; else flat filename
+        rel = str(path.relative_to(UPLOADS_DIR)).replace("\\", "/")  # "heroes/aa/bb/sha.webp"
+        u = f"/uploads/{rel}"
+        resp = RedirectResponse(u, status_code=307)
+        resp.headers["Cache-Control"] = "public, max-age=2592000, immutable"
+        return resp
+
+    # Legacy: serve the file as-is
     return FileResponse(
         str(path),
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=2592000, immutable"}  # 30d
+        media_type=media,
+        headers={"Cache-Control": "public, max-age=2592000, immutable"}
+    )
+
+@router.head("/hero/{key}")
+def serve_hero_head(key: str):
+    found = _try_paths_for(key)
+    if not found:
+        raise HTTPException(status_code=404, detail="Not found")
+    path, media = found
+    return JSONResponse(
+        content=None,
+        headers={
+            "Content-Length": str(path.stat().st_size),
+            "Content-Type": media,
+            "Cache-Control": "public, max-age=2592000, immutable",
+        },
+        status_code=200,
     )
 
 @router.get("/_debug/hero_exists")
 def hero_exists_debug(filename: str):
-    try:
-        path = _abs_hero_path(filename)
-    except HTTPException as e:
-        return JSONResponse({"ok": False, "error": e.detail, "hero_dir": str(HERO_DIR)}, status_code=404)
+    f = _try_paths_for(filename)
+    if not f:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "Not found",
+                "hero_dir": str(HERO_DIR),
+                "legacy_dirs": [str(p) for p in LEGACY_HERO_DIRS],
+                "dir_exists": HERO_DIR.is_dir(),
+                "dir_contents_sample": sorted(
+                    [str(p.relative_to(UPLOADS_DIR)) for p in HERO_DIR.rglob("*") if p.suffix.lower() in _ALLOWED_EXT]
+                )[:10],
+            },
+            status_code=404,
+        )
+    path, media = f
+    rel = f"/uploads/{path.relative_to(UPLOADS_DIR)}".replace("\\", "/") if HERO_DIR in path.parents else None
     return {
-        "ok": path.is_file(),
-        "filename": filename,
-        "abs_path": str(path),
+        "ok": True,
+        "resolved_path": str(path),
+        "media": media,
         "hero_dir": str(HERO_DIR),
-        "dir_exists": HERO_DIR.is_dir(),
-        "dir_contents_sample": sorted([p.name for p in HERO_DIR.glob("*.png")])[:10],
+        "legacy_dirs": [str(p) for p in LEGACY_HERO_DIRS],
+        "public_canonical": rel,
     }
 
 # --------------------------------------------------------------------
@@ -339,17 +449,11 @@ def qr_poster_pdf(
 @router.post("/qr_signed_url")
 def qr_signed_url(
     code: str = Body(..., embed=True),
-    minutes_valid: int = Body(30, embed=True),  # default 30 minutes
+    minutes_valid: int = Body(30, embed=True),
     s: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
-    """
-    Generate signed, time-limited URLs for QR PNG and Poster.
-    Ensures the caller owns the QR/business.
-    """
-    # ensure caller owns this QR before minting a signed URL
     _get_owned_qr_meta(s, user_id=user_id, code=code)
-
     exp = int(time.time()) + (minutes_valid * 60)
     sig = _sign_qr_path(code, exp)
     return {

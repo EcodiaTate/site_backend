@@ -61,8 +61,26 @@ class OfferPublicOut(BaseModel):
     tags: Optional[List[str]] = None
     createdAt: Optional[int] = None
 
+# ---------- normalizers ----------
+def _norm_uploadish(raw: Optional[str]) -> Optional[str]:
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    low = s.lower()
+    if low.startswith("http://") or low.startswith("https://"):
+        return s
+    if not s.startswith("/"):
+        s = "/" + s
+    if s.startswith("/uploads/avatar/"):
+        s = s.replace("/uploads/avatar/", "/uploads/avatars/", 1)
+    if s.startswith("/uploads/hero/"):
+        s = s.replace("/uploads/hero/", "/uploads/heroes/", 1)
+    return s
+
 # ---------------------------------------------------------
-# Public business profile (with avatar fields!)
+# Public business profile (with normalized avatar/hero)
 # ---------------------------------------------------------
 
 @router.get("/{business_id}", response_model=BusinessPublicOut)
@@ -85,21 +103,17 @@ def public_profile(business_id: str, s: Session = Depends(session_dep)):
           b.hours                      AS hours,
           b.description                AS description,
 
-          // media fields (as stored; frontend will absolutize)
           b.hero_url                   AS hero_url,
           b.avatar_url                 AS avatar_url,
           b.logo_url                   AS logo_url,
           b.photo_url                  AS photo_url,
           b.image_small                AS image_small,
 
-          // if business node doesn’t have owner_user_id, use related user id
           coalesce(b.owner_user_id, u.id) AS owner_user_id,
 
           b.lat                        AS lat,
           b.lng                        AS lng,
           coalesce(b.tags, [])         AS tags,
-
-          // if you track store hours → expose "open_now" if present
           coalesce(b.open_now, NULL)   AS open_now
         """,
         bid=business_id,
@@ -108,7 +122,10 @@ def public_profile(business_id: str, s: Session = Depends(session_dep)):
     if not rec:
         raise HTTPException(status_code=404, detail="Business not found")
 
-    return BusinessPublicOut(**rec.data())
+    row = rec.data()
+    row["avatar_url"] = _norm_uploadish(row.get("avatar_url"))
+    row["hero_url"]   = _norm_uploadish(row.get("hero_url"))
+    return BusinessPublicOut(**row)
 
 # ---------------------------------------------------------
 # Public stats (unchanged)

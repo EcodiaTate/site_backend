@@ -14,6 +14,7 @@ from .referrals import router as referrals_router
 from .youth_stats import public_router as youth_stats_router, admin_router as admin_youth_stats_router
 from .bizz_recruiting import router as bizz_recruiting_router
 from .owner import router as owner_router
+from .redirects import router as redirects_router
 from .qr import router as qr_router
 
 router= APIRouter()
@@ -27,6 +28,7 @@ router.include_router(assets_router)
 router.include_router(business_stats_router)
 router.include_router(youth_stats_router)
 router.include_router(admin_youth_stats_router)
+router.include_router(redirects_router)
 router.include_router(wallet_router)
 router.include_router(bizz_public_router)
 router.include_router(referrals_router)
