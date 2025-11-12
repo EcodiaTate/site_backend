@@ -525,8 +525,8 @@ LIMIT $limit
 
 @router.get("/proposals/admin")
 async def admin_list_proposals(
-    # ✅ this is the only auth path: header -> require_admin
-    admin_email: str = Depends(require_admin),
+    # ✅ accept X-Auth-Token header OR ?admin_token=
+    admin_email: str = Depends(_require_admin_from_any),
     status: Optional[str] = Query(default=None),
     q: Optional[str] = Query(default=None),
     skip: int = Query(default=0, ge=0),
