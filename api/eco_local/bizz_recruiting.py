@@ -463,3 +463,129 @@ def runs_send(dateISO: str) -> Dict[str, Any]:
         {"d": d},
     )[0]["sent"]
     return {"date": d, "sent": int(sent)}
+# ─────────────────────────────────────────────────────────
+# ADD: imports
+# ─────────────────────────────────────────────────────────
+from pydantic import BaseModel, Field
+import uuid
+
+# ─────────────────────────────────────────────────────────
+# ADD: models
+# ─────────────────────────────────────────────────────────
+from pydantic import BaseModel, Field
+
+class ProspectPatch(BaseModel):
+    name: Optional[str] = None
+    domain: Optional[str] = None
+    qualified: Optional[bool] = None
+    qualification_score: Optional[float] = Field(default=None, ge=0, le=1)  # ⬅️ 0..1, not 0..100
+    outreach_started: Optional[bool] = None
+    unsubscribed: Optional[bool] = None
+    won: Optional[bool] = None
+
+class HoldCreate(BaseModel):
+    start: Optional[str] = None   # ISO datetime
+    end: Optional[str] = None     # ISO datetime
+    note: Optional[str] = None
+
+class ThreadReply(BaseModel):
+    subject: str
+    html: Optional[str] = "<p>(empty)</p>"
+
+# ─────────────────────────────────────────────────────────
+# ADD: PATCH /prospects/{pid} — update fields
+# ─────────────────────────────────────────────────────────
+@router.patch("/prospects/{pid}")
+def update_prospect(pid: str, patch: ProspectPatch) -> Dict[str, Any]:
+    exists = _run("MATCH (p:Prospect {id:$pid}) RETURN p", {"pid": pid})
+    if not exists:
+        raise HTTPException(404, "Prospect not found")
+
+    allow = {
+        k: v for k, v in patch.model_dump().items()
+        if v is not None
+    }
+    # If nothing to set, just echo current
+    if not allow:
+        row = _run("MATCH (p:Prospect {id:$pid}) RETURN p", {"pid": pid})[0]["p"]
+        return {"prospect": row}
+
+    row = _run(
+        """
+        MATCH (p:Prospect {id:$pid})
+        SET p += $allow,
+            p.updated_at = datetime()
+        RETURN p
+        """,
+        {"pid": pid, "allow": allow},
+    )[0]["p"]
+    return {"prospect": row}
+
+# ─────────────────────────────────────────────────────────
+# ADD: POST /threads/{email}/holds — create one hold
+# ─────────────────────────────────────────────────────────
+@router.post("/threads/{email}/holds")
+def create_hold(email: str, body: HoldCreate) -> Dict[str, Any]:
+    hid = str(uuid.uuid4())
+    params = {
+        "email": email,
+        "hid": hid,
+        "start": body.start,
+        "end": body.end,
+        "note": body.note or "",
+    }
+    row = _run(
+        """
+        MATCH (p:Prospect {email:$email})
+        MERGE (h:CalendarHold {id:$hid})
+          ON CREATE SET h.created_at = datetime()
+        SET h.start = CASE WHEN $start IS NULL OR $start = '' THEN NULL ELSE datetime($start) END,
+            h.end   = CASE WHEN $end   IS NULL OR $end   = '' THEN NULL ELSE datetime($end) END,
+            h.note  = $note,
+            h.status = coalesce(h.status, 'hold'),
+            h.updated_at = datetime()
+        MERGE (p)-[:HAS_HOLD]->(h)
+        RETURN h
+        """,
+        params,
+    )
+    if not row:
+        raise HTTPException(404, "Prospect not found for email")
+    return {"hold": row[0]["h"]}
+
+# ─────────────────────────────────────────────────────────
+# ADD: DELETE /threads/{email}/holds/{hid} — cancel one hold
+# ─────────────────────────────────────────────────────────
+@router.delete("/threads/{email}/holds/{hid}")
+def cancel_one_hold(email: str, hid: str) -> Dict[str, Any]:
+    touched = _run(
+        """
+        MATCH (:Prospect {email:$email})-[rel:HAS_HOLD]->(h:CalendarHold {id:$hid})
+        DELETE rel
+        SET h.status = 'canceled', h.updated_at = datetime()
+        RETURN 1 AS touched
+        """,
+        {"email": email, "hid": hid},
+    )
+    return {"ok": True, "touched": 1 if touched else 0}
+
+# ─────────────────────────────────────────────────────────
+# ADD: POST /threads/{email}/reply — custom reply (graph-only)
+# ─────────────────────────────────────────────────────────
+@router.post("/threads/{email}/reply")
+def custom_reply(email: str, body: ThreadReply) -> Dict[str, Any]:
+    mid = f"reply-{datetime.utcnow().isoformat()}"
+
+    _run(
+        """
+        MERGE (t:Thread {email:$email})
+          ON CREATE SET t.created_at = datetime()
+        SET t.last_outbound_at = datetime(), t.last_outbound_date = date(datetime())
+        MERGE (r:Reply {message_id:$mid})
+          ON CREATE SET r.created_at = datetime()
+        SET r.subject = $subject, r.html = $html, r.updated_at = datetime()
+        MERGE (r)-[:IN_THREAD]->(t)
+        """,
+        {"email": email, "mid": mid, "subject": body.subject, "html": body.html or "<p>(empty)</p>"},
+    )
+    return {"ok": True, "message_id": mid}
