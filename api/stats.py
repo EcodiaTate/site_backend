@@ -7,16 +7,20 @@ from pydantic import BaseModel
 from neo4j import Session
 
 from site_backend.core.neo_driver import session_dep
+from site_backend.api.eco_local.wallet import _youth_totals  # reuse wallet semantics
 
 router = APIRouter(prefix="/stats", tags=["stats"])
+
 
 # =========================
 # Models (FE-aligned)
 # =========================
 class YouthStats(BaseModel):
     user_id: str
-    minted_eco: int                    # total ECO earned via MINT_ACTION
-    eco_contributed_total: int         # ECO spent as contributions
+    # NOTE: mirrors /eco-local/wallet "earned_total" semantics:
+    # real settled EcoTx + virtual approved submissions without a tx
+    minted_eco: int
+    eco_contributed_total: int         # ECO spent as contributions (CONTRIBUTE)
     eco_given_total: int               # ECO spent on offers (BURN_REWARD)
     missions_completed: int
     last_earn_at: str | None = None    # ISO datetime (from t.at/createdAt)
@@ -51,21 +55,60 @@ def _month_bounds_utc_now() -> tuple[str, str]:
 @router.get("/youth/{user_id}", response_model=YouthStats)
 def get_youth_stats(user_id: str, s: Session = Depends(session_dep)):
     """
-    - minted_eco: sum of settled MINT_ACTION earned by the user
-    - eco_contributed_total: sum of settled CONTRIBUTE spent by the user
-    - eco_given_total: sum of settled BURN_REWARD spent by the user (offers)
-    - missions_completed: approved submissions count
-    - last_earn_at: latest earn timestamp (t.at preferred, else createdAt)
+    Youth stats, aligned with /eco-local/wallet semantics.
+
+    - minted_eco:
+        total ECO earned into this user's wallet
+        (settled EcoTx + virtual approved submissions w/o a tx)
+        -> mirrors WalletOut.earned_total
+    - eco_contributed_total:
+        ECO they spent as contributions (CONTRIBUTE)
+    - eco_given_total:
+        ECO they spent on offers (BURN_REWARD)
+    - missions_completed:
+        approved submissions count (same as before)
+    - last_earn_at:
+        latest "earn-ish" timestamp from EcoTx:
+          - kind in ['MINT_ACTION','SPONSOR_DEPOSIT']
+          - or source='sidequest'
+          - or reason='sidequest_reward'
     """
+    # 1) Canonical totals from wallet helper
+    eco_earned, eco_spent, xp_total, xp_30d = _youth_totals(s, user_id)
+
+    # 2) Split spending into contributed vs given + missions + last earn
     rec = s.run(
         """
         MATCH (u:User {id:$uid})
 
-        // ------- Earned (MINT_ACTION) -------
-        OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx {status:'settled'})
-        WHERE coalesce(te.kind,'') = 'MINT_ACTION'
+        // ------- Spent buckets: contributions vs offers -------
+        OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx {status:'settled'})
+        WHERE coalesce(ts.kind,'') IN ['BURN_REWARD','CONTRIBUTE']
         WITH u,
-             sum(toInteger(coalesce(te.eco, te.amount, 0))) AS minted_eco,
+             sum(
+               CASE WHEN ts.kind = 'CONTRIBUTE'
+                    THEN toInteger(coalesce(ts.eco, ts.amount, 0))
+                    ELSE 0 END
+             ) AS eco_contributed_total,
+             sum(
+               CASE WHEN ts.kind = 'BURN_REWARD'
+                    THEN toInteger(coalesce(ts.eco, ts.amount, 0))
+                    ELSE 0 END
+             ) AS eco_given_total
+
+        // ------- Missions completed (approved submissions) -------
+        OPTIONAL MATCH (u)-[:SUBMITTED]->(sub:Submission {state:'approved'})
+        WITH u, eco_contributed_total, eco_given_total, count(sub) AS missions_completed
+
+        // ------- Last earn timestamp (any "earn-ish" EcoTx) -------
+        OPTIONAL MATCH (u)-[:EARNED]->(te:EcoTx)
+        WHERE coalesce(te.status,'settled') = 'settled'
+          AND (
+                coalesce(te.kind,'') IN ['MINT_ACTION','SPONSOR_DEPOSIT']
+             OR te.source = 'sidequest'
+             OR te.reason = 'sidequest_reward'
+          )
+        WITH u, eco_contributed_total, eco_given_total, missions_completed,
              max(
                CASE
                  WHEN te.at IS NOT NULL THEN te.at
@@ -73,24 +116,11 @@ def get_youth_stats(user_id: str, s: Session = Depends(session_dep)):
                  ELSE NULL
                END
              ) AS lastEarn
-
-        // ------- Spent buckets -------
-        OPTIONAL MATCH (u)-[:SPENT]->(ts:EcoTx {status:'settled'})
-        WHERE coalesce(ts.kind,'') IN ['BURN_REWARD','CONTRIBUTE']
-        WITH u, minted_eco, lastEarn,
-             sum( CASE WHEN ts.kind='CONTRIBUTE'  THEN toInteger(coalesce(ts.eco, ts.amount, 0)) ELSE 0 END )
-               AS eco_contributed_total,
-             sum( CASE WHEN ts.kind='BURN_REWARD' THEN toInteger(coalesce(ts.eco, ts.amount, 0)) ELSE 0 END )
-               AS eco_given_total
-
-        // ------- Missions completed -------
-        OPTIONAL MATCH (u)-[:SUBMITTED]->(sub:Submission {state:'approved'})
         RETURN
           u.id AS user_id,
-          toInteger(coalesce(minted_eco,0)) AS minted_eco,
-          toInteger(coalesce(eco_contributed_total,0)) AS eco_contributed_total,
-          toInteger(coalesce(eco_given_total,0)) AS eco_given_total,
-          toInteger(count(sub)) AS missions_completed,
+          toInteger(coalesce(eco_contributed_total, 0)) AS eco_contributed_total,
+          toInteger(coalesce(eco_given_total, 0)) AS eco_given_total,
+          toInteger(missions_completed) AS missions_completed,
           CASE WHEN lastEarn IS NULL THEN NULL ELSE toString(lastEarn) END AS last_earn_at
         """,
         {"uid": user_id},
@@ -99,7 +129,17 @@ def get_youth_stats(user_id: str, s: Session = Depends(session_dep)):
     if not rec:
         raise HTTPException(status_code=404, detail="User not found")
 
-    return YouthStats(**dict(rec))
+    payload = dict(rec)
+
+    return YouthStats(
+        user_id=payload["user_id"],
+        minted_eco=int(eco_earned),  # wallet-aligned earned_total
+        eco_contributed_total=int(payload["eco_contributed_total"] or 0),
+        eco_given_total=int(payload["eco_given_total"] or 0),
+        missions_completed=int(payload["missions_completed"] or 0),
+        last_earn_at=payload["last_earn_at"],
+    )
+
 
 @router.get("/business/{business_id}", response_model=BizStats)
 def get_business_stats(business_id: str, s: Session = Depends(session_dep)):
@@ -108,11 +148,18 @@ def get_business_stats(business_id: str, s: Session = Depends(session_dep)):
     def _month_bounds_utc_now() -> tuple[str, str, int, int]:
         now = datetime.now(timezone.utc)
         start = datetime(now.year, now.month, 1, tzinfo=timezone.utc)
-        end = datetime(now.year + (1 if now.month == 12 else 0),
-                       1 if now.month == 12 else now.month + 1,
-                       1, tzinfo=timezone.utc)
-        return (start.isoformat(), end.isoformat(),
-                int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+        end = datetime(
+            now.year + (1 if now.month == 12 else 0),
+            1 if now.month == 12 else now.month + 1,
+            1,
+            tzinfo=timezone.utc,
+        )
+        return (
+            start.isoformat(),
+            end.isoformat(),
+            int(start.timestamp() * 1000),
+            int(end.timestamp() * 1000),
+        )
 
     mstart, mend, mstart_ms, mend_ms = _month_bounds_utc_now()
 
@@ -167,7 +214,13 @@ def get_business_stats(business_id: str, s: Session = Depends(session_dep)):
           toInteger(coalesce(unique_youth_month,0)) AS unique_youth_month,
           CASE WHEN latest IS NULL THEN NULL ELSE toString(latest) END AS last_tx_at
         """,
-        {"bid": business_id, "mstart": mstart, "mend": mend, "mstart_ms": mstart_ms, "mend_ms": mend_ms},
+        {
+            "bid": business_id,
+            "mstart": mstart,
+            "mend": mend,
+            "mstart_ms": mstart_ms,
+            "mend_ms": mend_ms,
+        },
     ).single()
 
     if not rec:
