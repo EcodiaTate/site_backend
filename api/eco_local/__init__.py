@@ -35,4 +35,10 @@ router.include_router(referrals_router)
 router.include_router(onboarding_router)
 router.include_router(bizz_recruiting_router)
 router.include_router(owner_router)
+
+# site_backend/api/eco_local/__init__.py (or equivalent)
+from .universal_impact import router as universal_impact_router
+
+router.include_router(universal_impact_router)
+
 router.include_router(qr_router)

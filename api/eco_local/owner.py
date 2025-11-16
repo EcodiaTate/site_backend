@@ -46,7 +46,7 @@ class BusinessMine(BaseModel):
     tagline: Optional[str] = None
     website: Optional[str] = None
     address: Optional[str] = None
-    hours: Optional[str] = None  # JSON string of HoursMap (your graph stores it as map; we surface string)
+    hours: Optional[str] = None  # JSON string of HoursMap (graph stores as map; we surface string)
     description: Optional[str] = None
     hero_url: Optional[str] = None
     lat: Optional[float] = None
@@ -55,7 +55,7 @@ class BusinessMine(BaseModel):
     tags: Optional[List[str]] = None
     qr_code: Optional[str] = None
 
-    # NEW - rule/config fields used by the FE autosave
+    # Rule/config fields used by FE autosave
     pledge_tier: Optional[Literal["starter", "builder", "leader"]] = None
     rules_first_visit: Optional[int] = None
     rules_return_visit: Optional[int] = None
@@ -75,7 +75,7 @@ class ActivityRow(BaseModel):
     user_id: Optional[str] = None
     kind: str
     amount: float
-    offer_id: Optional[str] = None   # ← add
+    offer_id: Optional[str] = None
 
 class PatchProfile(BaseModel):
     # Existing editable fields
@@ -91,13 +91,13 @@ class PatchProfile(BaseModel):
     visible_on_map: Optional[bool] = None
     tags: Optional[List[str]] = None
 
-    # NEW - accept rule/config fields from FE to avoid 422
+    # Accept rule/config fields from FE to avoid 422
     pledge_tier: Optional[Literal["starter", "builder", "leader"]] = None
     rules_first_visit: Optional[int] = None
     rules_return_visit: Optional[int] = None
     rules_cooldown_hours: Optional[int] = None
     rules_daily_cap_per_user: Optional[int] = None
-    # FE sends "" to disable; we normalize in handler but type stays Optional[int]
+    # FE may send "" to disable; normalize in handler
     rules_geofence_radius_m: Optional[int] = None
 
 router = APIRouter(prefix="/eco-local/owner", tags=["eco_local.owner"])
@@ -192,6 +192,7 @@ def _offer_record_to_out(rec: Dict[str, Any]) -> OfferOut:
 # ─────────────────────────────────────────────────────────────────────────────
 # Endpoints
 # ─────────────────────────────────────────────────────────────────────────────
+
 @router.get("/mine")
 def owner_mine(uid: str = Depends(current_user_id),
                s: Session = Depends(session_dep)):
@@ -224,6 +225,7 @@ def owner_mine(uid: str = Depends(current_user_id),
     if not rec:
         return {"result": None}
     return rec["result"]
+
 @router.get("/metrics", response_model=Dict[str, Any])
 def get_metrics(
     user_id: str = Depends(current_user_id),
@@ -354,8 +356,13 @@ def list_offers(
 ):
     _ensure_owner_business(s, user_id)
     cy = """
-    MATCH (b:BusinessProfile {user_id: $uid})-[:HAS_OFFER]->(o:Offer)
-    WITH o
+    MATCH (b:BusinessProfile {user_id: $uid})
+    OPTIONAL MATCH (b)-[:HAS_OFFER]->(a:Offer)
+    OPTIONAL MATCH (o:Offer)-[:OF]->(b)
+    WITH b, coalesce(a, o) AS o
+    WHERE o IS NOT NULL
+    WITH collect(DISTINCT o) AS os
+    UNWIND os AS o
     ORDER BY coalesce(o.valid_until, '') DESC, o.title
     RETURN o {
       .id, .title, .blurb, .visible, .url, .valid_until, .type, .tags,
@@ -381,6 +388,7 @@ def create_offer(
       created_at: datetime()
     })
     MERGE (b)-[:HAS_OFFER]->(o)
+    MERGE (o)-[:OF]->(b)        // keep both directions for compatibility
     RETURN o {
       .id, .title, .blurb, .visible, .url, .valid_until, .type, .tags
     } AS o
@@ -409,7 +417,11 @@ def patch_offer(
 ):
     _ensure_owner_business(s, user_id)
     cy = """
-    MATCH (b:BusinessProfile {user_id:$uid})-[:HAS_OFFER]->(o:Offer {id:$oid})
+    MATCH (b:BusinessProfile {user_id: $uid})
+    OPTIONAL MATCH (b)-[:HAS_OFFER]->(o1:Offer {id:$oid})
+    OPTIONAL MATCH (o2:Offer {id:$oid})-[:OF]->(b)
+    WITH coalesce(o1, o2) AS o
+    WHERE o IS NOT NULL
     SET o.title         = $title,
         o.blurb         = $blurb,
         o.visible       = $visible,
@@ -448,14 +460,22 @@ def delete_offer(
 ):
     _ensure_owner_business(s, user_id)
     cy = """
-    MATCH (b:BusinessProfile {user_id:$uid})-[:HAS_OFFER]->(o:Offer {id:$oid})
-    DETACH DELETE o
+    MATCH (b:BusinessProfile {user_id:$uid})
+    OPTIONAL MATCH (b)-[:HAS_OFFER]->(o1:Offer {id:$oid})
+    OPTIONAL MATCH (o2:Offer {id:$oid})-[:OF]->(b)
+    WITH coalesce(o1, o2) AS o
+    WITH o
+    CALL apoc.do.when(o IS NULL,
+      'RETURN 0 AS deleted',
+      'DETACH DELETE o RETURN 1 AS deleted',
+      {}
+    ) YIELD value
+    RETURN value.deleted AS deleted
     """
-    s.run(cy, uid=user_id, oid=offer_id).consume()
+    rec = _one(s, cy, {"uid": user_id, "oid": offer_id})
+    if not rec or int(rec.get("deleted") or 0) == 0:
+        raise HTTPException(status_code=404, detail="Offer not found")
     return {"ok": True}
-
-def _all(s: Session, cypher: str, params: Dict[str, Any]) -> list[Dict[str, Any]]:
-    return [r.data() for r in s.run(cypher, **params)]
 
 @router.get("/activity", response_model=List[ActivityRow])
 def business_recent_activity(
@@ -466,37 +486,37 @@ def business_recent_activity(
     cy = """
     MATCH (b:BusinessProfile {user_id:$uid})
 
-  CALL {
-  WITH b
-  // Inbound: contributions collected by the business
-  MATCH (b)-[:COLLECTED]->(tin:EcoTx)
-  WHERE coalesce(tin.status,'settled')='settled'
-    AND (coalesce(tin.kind,'')='CONTRIBUTE' OR tin.source='contribution' OR tin.source='eco_local')
-  RETURN
-    tin.id AS id,
-    toString(datetime({epochMillis: toInteger(coalesce(tin.createdAt, timestamp(tin.at), timestamp()))})) AS createdAt,
-    tin.user_id AS user_id,
-    coalesce(tin.kind,'CONTRIBUTE') AS kind,
-    toFloat(coalesce(tin.eco, tin.amount)) AS amount,
-    NULL AS offer_id
-  UNION ALL
-  WITH b
-  // Outbound: rewards/payouts initiated by the business
-  MATCH (b)-[r]->(tout:EcoTx)
-  WHERE coalesce(tout.status,'settled')='settled'
-    AND type(r) IN ['SPENT','COLLECTED','EARNED']
-    AND coalesce(tout.kind,'') IN ['BURN_REWARD','SPONSOR_PAYOUT']
-  RETURN
-    tout.id AS id,
-    toString(datetime({epochMillis: toInteger(coalesce(tout.createdAt, timestamp(tout.at), timestamp()))})) AS createdAt,
-    tout.user_id AS user_id,
-    coalesce(tout.kind,'BURN_REWARD') AS kind,
-    toFloat(coalesce(tout.eco, tout.amount)) AS amount,
-    tout.offer_id AS offer_id
-}
-RETURN id, createdAt, user_id, kind, amount, offer_id
-ORDER BY datetime(createdAt) DESC
-LIMIT $limit
+    CALL {
+      WITH b
+      // Inbound: contributions collected by the business
+      MATCH (b)-[:COLLECTED]->(tin:EcoTx)
+      WHERE coalesce(tin.status,'settled')='settled'
+        AND (coalesce(tin.kind,'')='CONTRIBUTE' OR tin.source='contribution' OR tin.source='eco_local')
+      RETURN
+        tin.id AS id,
+        toString(datetime({epochMillis: toInteger(coalesce(tin.createdAt, timestamp(tin.at), timestamp()))})) AS createdAt,
+        tin.user_id AS user_id,
+        coalesce(tin.kind,'CONTRIBUTE') AS kind,
+        toFloat(coalesce(tin.eco, tin.amount)) AS amount,
+        NULL AS offer_id
+      UNION ALL
+      WITH b
+      // Outbound: rewards/payouts initiated by the business
+      MATCH (b)-[r]->(tout:EcoTx)
+      WHERE coalesce(tout.status,'settled')='settled'
+        AND type(r) IN ['SPENT','COLLECTED','EARNED']
+        AND coalesce(tout.kind,'') IN ['BURN_REWARD','SPONSOR_PAYOUT']
+      RETURN
+        tout.id AS id,
+        toString(datetime({epochMillis: toInteger(coalesce(tout.createdAt, timestamp(tout.at), timestamp()))})) AS createdAt,
+        tout.user_id AS user_id,
+        coalesce(tout.kind,'BURN_REWARD') AS kind,
+        toFloat(coalesce(tout.eco, tout.amount)) AS amount,
+        tout.offer_id AS offer_id
+    }
+    RETURN id, createdAt, user_id, kind, amount, offer_id
+    ORDER BY datetime(createdAt) DESC
+    LIMIT $limit
     """
     rows = _all(s, cy, {"uid": user_id, "limit": int(limit)})
 
