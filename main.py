@@ -46,6 +46,7 @@ from site_backend.api import launchpad
 from site_backend.api import sidequests
 from site_backend.api import gamification
 from site_backend.api import auth
+from site_backend.api import admin
 from site_backend.api import account
 from site_backend.api.social.router_public import router as social_router
 
@@ -131,6 +132,7 @@ def create_app() -> FastAPI:
     app.include_router(sidequests.router)
     app.include_router(teams_router)
     app.include_router(admin_cookie.router)
+    app.include_router(admin.router)
     app.include_router(identity_router)
     app.include_router(launchpad.router)
     app.include_router(social_router)

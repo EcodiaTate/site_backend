@@ -493,7 +493,7 @@ class ThreadReply(BaseModel):
     html: Optional[str] = "<p>(empty)</p>"
 
 # ─────────────────────────────────────────────────────────
-# ADD: PATCH /prospects/{pid} — update fields
+# ADD: PATCH /prospects/{pid} - update fields
 # ─────────────────────────────────────────────────────────
 @router.patch("/prospects/{pid}")
 def update_prospect(pid: str, patch: ProspectPatch) -> Dict[str, Any]:
@@ -522,7 +522,7 @@ def update_prospect(pid: str, patch: ProspectPatch) -> Dict[str, Any]:
     return {"prospect": row}
 
 # ─────────────────────────────────────────────────────────
-# ADD: POST /threads/{email}/holds — create one hold
+# ADD: POST /threads/{email}/holds - create one hold
 # ─────────────────────────────────────────────────────────
 @router.post("/threads/{email}/holds")
 def create_hold(email: str, body: HoldCreate) -> Dict[str, Any]:
@@ -554,7 +554,7 @@ def create_hold(email: str, body: HoldCreate) -> Dict[str, Any]:
     return {"hold": row[0]["h"]}
 
 # ─────────────────────────────────────────────────────────
-# ADD: DELETE /threads/{email}/holds/{hid} — cancel one hold
+# ADD: DELETE /threads/{email}/holds/{hid} - cancel one hold
 # ─────────────────────────────────────────────────────────
 @router.delete("/threads/{email}/holds/{hid}")
 def cancel_one_hold(email: str, hid: str) -> Dict[str, Any]:
@@ -570,7 +570,7 @@ def cancel_one_hold(email: str, hid: str) -> Dict[str, Any]:
     return {"ok": True, "touched": 1 if touched else 0}
 
 # ─────────────────────────────────────────────────────────
-# ADD: POST /threads/{email}/reply — custom reply (graph-only)
+# ADD: POST /threads/{email}/reply - custom reply (graph-only)
 # ─────────────────────────────────────────────────────────
 @router.post("/threads/{email}/reply")
 def custom_reply(email: str, body: ThreadReply) -> Dict[str, Any]:

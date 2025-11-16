@@ -357,7 +357,7 @@ def update_amount(
 
 
 # --------------------------------------------------------------------
-# Upcoming invoice preview (SCOPED) — optional helper for UI/emails
+# Upcoming invoice preview (SCOPED) - optional helper for UI/emails
 # --------------------------------------------------------------------
 @router.get("/billing/upcoming", response_model=UpcomingOut)
 def upcoming_invoice(
@@ -382,7 +382,7 @@ def upcoming_invoice(
 
 
 # --------------------------------------------------------------------
-# One-off top-up (SCOPED) — optional, charge immediately
+# One-off top-up (SCOPED) - optional, charge immediately
 # --------------------------------------------------------------------
 @router.post("/billing/topup_now", response_model=TopUpOut)
 def topup_now(

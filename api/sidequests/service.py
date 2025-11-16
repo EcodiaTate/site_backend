@@ -48,6 +48,69 @@ def _within_radius(geo: Optional[Dict[str, Any]], u_lat: Optional[float], u_lon:
     return d <= (geo.get("radius_m") or 0)
 
 
+NBSP = "\u00A0"
+
+def _norm_key(k: str) -> str:
+    return (k or "").replace("\ufeff","").replace(NBSP,"").strip()
+
+def _blank_to_none(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        return None if v == "" else v
+    return v
+
+def _expand_dots(flat: Dict[str, Any]) -> Dict[str, Any]:
+    root: Dict[str, Any] = {}
+    for k, v in flat.items():
+        parts = k.split(".")
+        cur = root
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur[parts[-1]] = v
+    return root
+
+def _coerce_for_sidequest(row: Dict[str, Any]) -> Dict[str, Any]:
+    # pipe-separated lists
+    for k in ("tags", "verification_methods"):
+        if k in row and isinstance(row[k], str):
+            row[k] = [s for s in row[k].split("|") if s]
+    # ints
+    for k in ("reward_eco","xp_reward","max_completions_per_user","cooldown_days",
+              "pills.time_estimate_min","streak.bonus_eco_per_step","streak.max_steps",
+              "team.min_size","team.max_size","team.team_bonus_eco",
+              "geo.radius_m","rotation.iso_year","rotation.iso_week","rotation.slot_index"):
+        if k in row and isinstance(row[k], str):
+            try: row[k] = int(row[k])
+            except ValueError: row[k] = None
+    # floats
+    for k in ("geo.lat","geo.lon"):
+        if k in row and isinstance(row[k], str):
+            try: row[k] = float(row[k])
+            except ValueError: row[k] = None
+    # bools
+    for k in ("rotation.is_weekly_slot","chain.requires_prev_approved","team.allowed"):
+        if k in row and isinstance(row[k], str):
+            row[k] = row[k].strip().lower() in ("1","true","yes","y")
+    return row
+
+def _normalise_incoming_row(raw: Dict[str, Any]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    # fix weird header keys (BOM/nbsp/whitespace)
+    fixed = {_norm_key(k): _blank_to_none(v) for k, v in raw.items()}
+    # if we received \ufeffid, repair it
+    if "id" not in fixed:
+        for bad in list(fixed.keys()):
+            if bad.endswith("id") and bad != "id":
+                fixed["id"] = fixed.pop(bad)
+                break
+    # coerce & expand dotted keys
+    fixed = _coerce_for_sidequest(fixed)
+    fixed = _expand_dots(fixed)
+    return fixed
+
 # ---------- Legacy mapping ----------
 def _public_kind_from_legacy(legacy_type: Optional[str], legacy_sub_type: Optional[str]) -> str:
     if (legacy_type or "").lower() == "sidequest" and (legacy_sub_type or "").lower() == "eco_action":
@@ -61,6 +124,107 @@ def _title_key(s: Optional[str]) -> Optional[str]:
     # lower + trim + collapse all internal whitespace to single spaces
     return " ".join(s.strip().lower().split())
 
+# ---- Robust CSV entry point (safe quotes, commas, dotted keys, coercions) ----
+import csv, io
+from typing import Any, Dict, List
+
+NBSP = "\u00A0"
+
+def _norm_key(k: str) -> str:
+    return (str(k) if k is not None else "").replace("\ufeff","").replace(NBSP,"").strip()
+
+def _blank_to_none(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        v = v.strip()
+        return None if v == "" else v
+    return v
+
+def _expand_dots(flat: Dict[str, Any]) -> Dict[str, Any]:
+    root: Dict[str, Any] = {}
+    for k, v in flat.items():
+        parts = k.split(".")
+        cur = root
+        for p in parts[:-1]:
+            cur = cur.setdefault(p, {})
+        cur[parts[-1]] = v
+    return root
+
+def _coerce(row: Dict[str, Any]) -> Dict[str, Any]:
+    # lists
+    for k in ("tags","verification_methods"):
+        if k in row and isinstance(row[k], str):
+            row[k] = [s for s in row[k].split("|") if s]
+    # ints
+    for k in ("reward_eco","xp_reward","max_completions_per_user","cooldown_days",
+              "pills.time_estimate_min","streak.bonus_eco_per_step","streak.max_steps",
+              "team.min_size","team.max_size","team.team_bonus_eco",
+              "geo.radius_m","rotation.iso_year","rotation.iso_week","rotation.slot_index"):
+        if k in row and isinstance(row[k], str):
+            try: row[k] = int(row[k])
+            except ValueError: row[k] = None
+    # floats
+    for k in ("geo.lat","geo.lon"):
+        if k in row and isinstance(row[k], str):
+            try: row[k] = float(row[k])
+            except ValueError: row[k] = None
+    # bools
+    for k in ("rotation.is_weekly_slot","chain.requires_prev_approved","team.allowed"):
+        if k in row and isinstance(row[k], str):
+            row[k] = row[k].strip().lower() in ("1","true","yes","y")
+    return row
+
+def parse_sidequests_csv_text(csv_text: str) -> List[Dict[str, Any]]:
+    """
+    Robust CSV → list[dict] for Sidequest bulk_upsert.
+    Handles quotes, commas in text, BOM/nbsp headers, dotted keys, coercions.
+    """
+    # Sniff dialect to handle weird quoting/delimiters safely
+    sample = csv_text[:4096]
+    try:
+        dialect = csv.Sniffer().sniff(sample)
+    except Exception:
+        dialect = csv.excel
+    dialect.skipinitialspace = True
+
+    f = io.StringIO(csv_text)
+    reader = csv.reader(f, dialect)
+    rows = list(reader)
+    if not rows:
+        return []
+
+    # Normalise header
+    header = [_norm_key(h) for h in rows[0]]
+    # Fallback: if header collapsed to a single cell due to bad upstream split, bail clearly
+    if len(header) == 1:
+        raise ValueError(f"CSV header not parsed (got one column: {header[0]!r}). Use a proper CSV reader, not .split(',').")
+
+    out: List[Dict[str, Any]] = []
+    for i, raw_vals in enumerate(rows[1:], start=2):  # 1-based line numbers incl. header
+        # Pad/truncate to header length
+        vals = list(raw_vals) + [""] * (len(header) - len(raw_vals))
+        vals = vals[:len(header)]
+        flat = {_norm_key(k): _blank_to_none(v) for k, v in zip(header, vals)}
+        # repair funky id keys like '\ufeffid'
+        if "id" not in flat:
+            for bad in list(flat.keys()):
+                if bad.endswith("id") and bad != "id":
+                    flat["id"] = flat.pop(bad)
+                    break
+        flat = _coerce(flat)
+        flat = _expand_dots(flat)
+
+        # If the whole row is blank, skip quietly
+        if all(v in (None, "", [], {}) for v in flat.values()):
+            continue
+        out.append(flat)
+    return out
+
+# Convenience one-shot:
+def bulk_upsert_from_csv_text(session, csv_text: str) -> Dict[str, Any]:
+    sidequests = parse_sidequests_csv_text(csv_text)
+    return bulk_upsert(session, sidequests)
 
 # -------- helpers → SidequestOut --------
 def _to_sidequest_out(d: Dict[str, Any]) -> SidequestOut:
@@ -1315,17 +1479,7 @@ def rotate_weekly_sidequests(session: Session, payload: RotationRequest) -> Rota
         window=payload,
     )
 
-
-# -------- bulk upsert (sidequests) --------
 def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Upsert a list of sidequest dicts.
-    Behavior:
-      - If 'id' present AND exists → update
-      - If 'id' present AND missing → create with that same id
-      - If 'id' absent → create (auto id)
-    Returns: {"created": int, "updated": int, "errors": [str, ...]}
-    """
     import traceback
 
     created = 0
@@ -1334,16 +1488,32 @@ def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str,
 
     for idx, raw in enumerate(sidequests, start=1):
         try:
-            if "id" in raw and raw["id"]:
-                sid = str(raw["id"])
-                payload = {k: v for k, v in raw.items() if k != "id"}
+            # NEW: accept already-normalized CSV payloads verbatim
+            def _already_normalized(d: Dict[str, Any]) -> bool:
+                # any canonical key means "don’t touch"
+                canonical = {"title", "description_md", "tags", "verification_methods",
+                            "pills", "geo", "streak", "rotation", "chain", "team"}
+                return any(k in d for k in canonical)
+
+            fixed = raw if _already_normalized(raw) else _normalise_incoming_row(raw)
+
+            # guard: totally empty row after normalisation
+            if not fixed or all(v in (None, "", [], {}) for v in fixed.values()):
+                raise ValueError("Row normalised to empty dict (header/whitelist issue upstream)")
+
+            sid = str(fixed.get("id") or "").strip() or None
+            payload = {k: v for k, v in fixed.items() if k != "id"}
+
+            if not payload.get("title"):
+                raise ValueError(f"Missing required field: title (keys={sorted(list(fixed.keys()))})")
+
+            if sid:
                 try:
                     if _sidequest_exists(session, sid):
                         mu = SidequestUpdate(**payload)
                         update_sidequest(session, sid, mu)
                         updated += 1
                     else:
-                        # Create with the caller-provided id
                         mc = SidequestCreate(**payload)
                         create_sidequest(session, mc, forced_id=sid)
                         created += 1
@@ -1353,15 +1523,15 @@ def bulk_upsert(session: Session, sidequests: List[Dict[str, Any]]) -> Dict[str,
                         f"row {idx}: upsert:{type(e).__name__}: {e} | keys={sorted(list(raw.keys()))} | trace_tail={' | '.join(tb)}"
                     )
             else:
-                mc = SidequestCreate(**raw)
+                mc = SidequestCreate(**payload)
                 create_sidequest(session, mc)
                 created += 1
+
         except Exception as e:
             tb = traceback.format_exc().strip().splitlines()[-2:]
             errors.append(f"row {idx}: unknown:{type(e).__name__}: {e} | trace_tail={' | '.join(tb)}")
 
     return {"created": created, "updated": updated, "errors": errors}
-
 
 # -------- Chain Context (user-aware) --------
 class ChainStepOut(TypedDict, total=False):

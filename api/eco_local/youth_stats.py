@@ -60,7 +60,7 @@ def _iter_year_months(start_ym: str, end_ym: str) -> List[str]:
 
 class YouthStats(BaseModel):
     user_id: str
-    # Lifetime earned ECO (posted/settled) from ledger — NOT balance.
+    # Lifetime earned ECO (posted/settled) from ledger - NOT balance.
     total_eco: int
     # From missions (sidequests): earned tx with t.source='sidequest' or t.reason='sidequest_reward'
     # plus virtual approved submissions which lack a PROOF-linked EcoTx.

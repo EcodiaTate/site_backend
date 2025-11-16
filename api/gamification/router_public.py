@@ -69,7 +69,7 @@ def claim(body: ClaimRequest, uid: str = Depends(current_user_id), s: Session = 
             badges_granted=res["badges_granted"],
             stats=res["stats"],
             window=res["window"],
-            balance_after=res.get("balance_after"),  # <— include if present
+            balance_after=res.get("balance_after"),  # <- include if present
         )
     except ValueError as e:
         # 400 with precise reason string (frontend shows this)

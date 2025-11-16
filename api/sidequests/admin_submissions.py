@@ -16,7 +16,7 @@ from site_backend.core.urls import abs_media                     # absolutize /u
 from site_backend.api.sidequests.service import moderate_submission
 from site_backend.api.sidequests.schema import ModerationDecision
 
-router = APIRouter(prefix="/admin/submissions", tags=["Admin Submissions"])
+router = APIRouter(prefix="/sidequests/admin/submissions", tags=["Admin Submissions"])
 
 
 # ───────────────────────────────────────────────────────────────────────────────

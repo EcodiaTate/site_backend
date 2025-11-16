@@ -79,7 +79,7 @@ def _where_user_is_youth(alias: str = "u") -> str:
     return f"WHERE NOT {_user_is_business_predicate(alias)}"
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Youth ECO leaderboard (EARNED) — wallet parity for earned side
+# Youth ECO leaderboard (EARNED) - wallet parity for earned side
 # ───────────────────────────────────────────────────────────────────────────────
 
 def top_youth_eco(
@@ -321,7 +321,7 @@ def top_youth_eco(
                       END AS eco_real_piece
                   WITH u2, my_eco, sum(eco_real_piece) AS eco_real2
 
-                  // B) Virtual for others (approved, no PROOF EcoTx) — windowed sum of reward_eco
+                  // B) Virtual for others (approved, no PROOF EcoTx) - windowed sum of reward_eco
                   OPTIONAL MATCH (u2)-[:SUBMITTED]->(sub2:Submission {{state:'approved'}})-[:FOR]->(sq2:Sidequest)
                   WHERE NOT (sub2)<-[:PROOF]-(:EcoTx)
                   WITH u2, my_eco, eco_real2, sub2, sq2,
@@ -519,7 +519,7 @@ def top_youth_contributed(
     }
 
 # ───────────────────────────────────────────────────────────────────────────────
-# Business ECO leaderboard — COLLECTED (wallet parity)
+# Business ECO leaderboard - COLLECTED (wallet parity)
 # ───────────────────────────────────────────────────────────────────────────────
 # ⛑️ CHANGE: coalesce business avatar from (b.avatar_url) or owner/manager user’s avatar
 

@@ -55,7 +55,7 @@ class BusinessMine(BaseModel):
     tags: Optional[List[str]] = None
     qr_code: Optional[str] = None
 
-    # NEW — rule/config fields used by the FE autosave
+    # NEW - rule/config fields used by the FE autosave
     pledge_tier: Optional[Literal["starter", "builder", "leader"]] = None
     rules_first_visit: Optional[int] = None
     rules_return_visit: Optional[int] = None
@@ -91,7 +91,7 @@ class PatchProfile(BaseModel):
     visible_on_map: Optional[bool] = None
     tags: Optional[List[str]] = None
 
-    # NEW — accept rule/config fields from FE to avoid 422
+    # NEW - accept rule/config fields from FE to avoid 422
     pledge_tier: Optional[Literal["starter", "builder", "leader"]] = None
     rules_first_visit: Optional[int] = None
     rules_return_visit: Optional[int] = None
