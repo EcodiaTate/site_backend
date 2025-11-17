@@ -1,7 +1,7 @@
 from fastapi import APIRouter
 
 from .admin_users import router as users_router
-from .rad_tra import router as rad_tra_router
+from .radical_transparency import router as rad_tra_router
 
 
 router = APIRouter()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Literal, Dict, Any, Tuple
 
 from fastapi import APIRouter, Depends, Query, Request, status
@@ -17,16 +17,19 @@ router = APIRouter(prefix="/eco-local", tags=["eco-local"])
 def _now_ms() -> int:
     return int(datetime.now(timezone.utc).timestamp() * 1000)
 
+
 def _device_hash(ip: str, ua: str) -> str:
     h = hashlib.sha256()
     h.update((ip or "-").encode())
     h.update((ua or "-").encode())
     return h.hexdigest()[:16]
 
+
 def _guest_user_id(req: Request) -> str:
     ip = req.client.host if req.client else "0.0.0.0"
     ua = req.headers.get("user-agent", "")
     return f"y_{_device_hash(ip, ua)}"
+
 
 async def _resolve_user_id(req: Request, force_uid: Optional[str] = None) -> Dict[str, str]:
     """
@@ -45,6 +48,7 @@ async def _resolve_user_id(req: Request, force_uid: Optional[str] = None) -> Dic
     final = (force_uid.strip() if force_uid else None) or authed or guest
     return {"final": final, "authed": authed or "", "guest": guest}
 
+
 # ---------- models ----------
 class WalletTx(BaseModel):
     id: str
@@ -55,64 +59,78 @@ class WalletTx(BaseModel):
     source: Optional[str] = None
     business: Optional[dict] = None
     offer_id: Optional[str] = None
-    xp: int = 0                    # NEW: XP tied to this tx (usually only for earned rows)
+    xp: int = 0                    # XP tied to this tx (usually only for earned rows)
+
 
 class WalletOut(BaseModel):
     balance: int
     earned_total: int
     spent_total: int
-    xp_total: int = 0              # NEW: lifetime XP (earned)
-    xp_30d: int = 0                # NEW: last 30 days XP
+    xp_total: int = 0              # lifetime XP (earned)
+    xp_30d: int = 0                # last 30 days XP
     txs: List[WalletTx] = Field(default_factory=list)
     next_before_ms: Optional[int] = None
     debug: Optional[Dict[str, Any]] = None
-from datetime import datetime, timezone, timedelta  # add timedelta
+
+
+# ---------- youth wallet (EcoTx-only, Submissions = connectors only) ----------
 
 def _youth_totals(s: Session, uid: str) -> Tuple[int, int, int, int]:
     """
     Returns: (eco_earned, eco_spent, xp_total, xp_30d)
-    - ECO earned = settled EcoTx MINT_ACTION/sidequest + virtual approved submissions w/o tx
-    - ECO spent  = BURN_REWARD, CONTRIBUTE
-    - XP total   = sum(t.xp on earned txs) + virtual approved submissions' sq.xp_reward
+
+    Source of truth: settled EcoTx only.
+
+    - ECO earned = sum of EcoTx (EARNED) with:
+        kind in [MINT_ACTION, CONTRIBUTE, SPONSOR_DEPOSIT, SPONSOR_PAYOUT]
+        or source='sidequest' or reason='sidequest_reward'
+    - ECO spent  = sum of EcoTx (SPENT) with:
+        kind in [BURN_REWARD, CONTRIBUTE, SPONSOR_PAYOUT]
+        or source='sidequest' or reason='sidequest_reward'
+      (we still filter via rel type so only SPENT edges count here)
+    - XP total   = sum(t.xp on earned txs only
     - XP 30d     = same as XP total but only last 30 days
+
+    Submissions are *not* counted directly; they only exist as proof
+    and connectors that may have minted those EcoTx.
     """
     thirty_days_ms = int((datetime.now(timezone.utc) - timedelta(days=30)).timestamp() * 1000)
 
     rec = s.run(
         """
         MATCH (u:User {id:$uid})
-
-        // ---------- A) Real EcoTx (settled) tied to earning/spending ----------
         OPTIONAL MATCH (u)-[rel:EARNED|SPENT]->(t:EcoTx {status:'settled'})
-        WHERE  coalesce(t.kind,'') IN ['MINT_ACTION','BURN_REWARD','CONTRIBUTE','SPONSOR_DEPOSIT','SPONSOR_PAYOUT']
-           OR  t.source = 'sidequest' OR t.reason = 'sidequest_reward'
-        WITH u, rel, t,
-             toInteger(coalesce(t.eco, t.amount))              AS eco_amt,
-             toInteger(coalesce(t.xp, 0))                      AS xp_amt,
-             toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp())) AS t_ms
+        WHERE
+          coalesce(t.kind,'') IN ['MINT_ACTION','BURN_REWARD','CONTRIBUTE','SPONSOR_DEPOSIT','SPONSOR_PAYOUT']
+          OR t.source = 'sidequest'
+          OR t.reason = 'sidequest_reward'
 
-        WITH u,
-             sum( CASE WHEN type(rel)='EARNED' THEN eco_amt ELSE 0 END ) AS eco_earned_tx,
-             sum( CASE WHEN type(rel)='SPENT'  THEN eco_amt ELSE 0 END ) AS eco_spent_tx,
-             sum( CASE WHEN type(rel)='EARNED' THEN xp_amt  ELSE 0 END ) AS xp_earned_tx,
-             sum( CASE WHEN type(rel)='EARNED' AND t_ms >= $cutoff_ms THEN xp_amt ELSE 0 END ) AS xp_earned_tx_30d
-
-        // ---------- B) Virtual: approved submissions with no PROOF-linked EcoTx ----------
-        OPTIONAL MATCH (u)-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(sq:Sidequest)
-        WHERE NOT (sub)<-[:PROOF]-(:EcoTx)
-        WITH u, eco_earned_tx, eco_spent_tx, xp_earned_tx, xp_earned_tx_30d,
-             sum(toInteger(coalesce(sq.reward_eco,0))) AS eco_virtual,
-             sum(toInteger(coalesce(sq.xp_reward,0)))  AS xp_virtual,
-             sum( CASE
-                    WHEN toInteger(timestamp(coalesce(sub.reviewed_at, sub.created_at, datetime()))) >= $cutoff_ms
-                    THEN toInteger(coalesce(sq.xp_reward,0)) ELSE 0
-                  END ) AS xp_virtual_30d
+        WITH
+          rel,
+          t,
+          toInteger(coalesce(t.eco, t.amount)) AS eco_amt,
+          toInteger(coalesce(t.xp, 0)) AS xp_amt,
+          toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp())) AS t_ms
 
         RETURN
-          toInteger(coalesce(eco_earned_tx,0) + coalesce(eco_virtual,0)) AS eco_earned,
-          toInteger(coalesce(eco_spent_tx,0)) AS eco_spent,
-          toInteger(coalesce(xp_earned_tx,0) + coalesce(xp_virtual,0)) AS xp_total,
-          toInteger(coalesce(xp_earned_tx_30d,0) + coalesce(xp_virtual_30d,0)) AS xp_30d
+          toInteger(
+            sum( CASE WHEN type(rel) = 'EARNED' THEN eco_amt ELSE 0 END )
+          ) AS eco_earned,
+          toInteger(
+            sum( CASE WHEN type(rel) = 'SPENT' THEN eco_amt ELSE 0 END )
+          ) AS eco_spent,
+          toInteger(
+            sum( CASE WHEN type(rel) = 'EARNED' THEN xp_amt ELSE 0 END )
+          ) AS xp_total,
+          toInteger(
+            sum(
+              CASE
+                WHEN type(rel) = 'EARNED' AND t_ms >= $cutoff_ms
+                THEN xp_amt
+                ELSE 0
+              END
+            )
+          ) AS xp_30d
         """,
         {"uid": uid, "cutoff_ms": thirty_days_ms},
     ).single() or {}
@@ -124,52 +142,44 @@ def _youth_totals(s: Session, uid: str) -> Tuple[int, int, int, int]:
         int(rec.get("xp_30d") or 0),
     )
 
+
 def _youth_txs(s: Session, uid: str, limit: int, before_ms: Optional[int]) -> List[WalletTx]:
+    """
+    Return a reverse-chronological list of EcoTx-backed wallet rows.
+
+    Only real EcoTx are returned. Approved Submissions are NOT turned into
+    virtual transactions anymore; they just act as connectors (e.g. PROOF).
+    """
     recs = s.run(
         """
-        CALL {
-          // ---------- A) Real EcoTx rows ----------
-          WITH $uid AS uid, $before AS before
-          MATCH (u:User {id:uid})-[rel:EARNED|SPENT]->(t:EcoTx)
-          WHERE coalesce(t.status,'settled')='settled'
-            AND (
-                  t.kind IN ['MINT_ACTION','BURN_REWARD','CONTRIBUTE','SPONSOR_DEPOSIT','SPONSOR_PAYOUT']
-               OR t.source='sidequest'
-               OR t.reason='sidequest_reward'
-            )
-          WITH
-            t.id AS id,
-            t.kind AS kind,
-            CASE type(rel) WHEN 'EARNED' THEN 'earned' ELSE 'spent' END AS direction,
-            toInteger(coalesce(t.eco, t.amount)) AS amount,
-            toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp())) AS createdAt,
-            t.source AS source,
-            toInteger(coalesce(t.xp,0)) AS xp,
-            null AS business,
-            null AS offer_id
-          WHERE before IS NULL OR createdAt < toInteger(before)
-          RETURN id, kind, direction, amount, createdAt, source, xp, business, offer_id
-
-          UNION ALL
-
-          // ---------- B) Virtual rows from approved Submissions lacking a tx ----------
-          WITH $uid AS uid, $before AS before
-          MATCH (u:User {id:uid})-[:SUBMITTED]->(sub:Submission {state:'approved'})-[:FOR]->(sq:Sidequest)
-          WHERE NOT (sub)<-[:PROOF]-(:EcoTx)
-          WITH
-            'vtx:' + sub.id AS id,
-            'MINT_ACTION' AS kind,
-            'earned' AS direction,
-            toInteger(coalesce(sq.reward_eco,0)) AS amount,
-            toInteger(timestamp(coalesce(sub.reviewed_at, sub.created_at, datetime()))) AS createdAt,
-            'sidequest' AS source,
-            toInteger(coalesce(sq.xp_reward,0)) AS xp,
-            null AS business,
-            null AS offer_id
-          WHERE before IS NULL OR createdAt < toInteger(before)
-          RETURN id, kind, direction, amount, createdAt, source, xp, business, offer_id
-        }
-        RETURN id, kind, direction, amount, createdAt, source, xp, business, offer_id
+        MATCH (u:User {id:$uid})-[rel:EARNED|SPENT]->(t:EcoTx)
+        WHERE coalesce(t.status,'settled') = 'settled'
+          AND (
+                t.kind IN ['MINT_ACTION','BURN_REWARD','CONTRIBUTE','SPONSOR_DEPOSIT','SPONSOR_PAYOUT']
+             OR t.source = 'sidequest'
+             OR t.reason = 'sidequest_reward'
+          )
+        WITH
+          rel,
+          t,
+          CASE type(rel)
+            WHEN 'EARNED' THEN 'earned'
+            ELSE 'spent'
+          END AS direction,
+          toInteger(coalesce(t.eco, t.amount)) AS amount,
+          toInteger(coalesce(t.createdAt, timestamp(t.at), timestamp())) AS createdAt,
+          toInteger(coalesce(t.xp,0)) AS xp
+        WHERE $before IS NULL OR createdAt < toInteger($before)
+        RETURN
+          t.id AS id,
+          t.kind AS kind,
+          direction,
+          amount,
+          createdAt,
+          t.source AS source,
+          xp,
+          NULL AS business,
+          NULL AS offer_id
         ORDER BY createdAt DESC
         LIMIT $limit
         """,
@@ -189,7 +199,7 @@ def _youth_txs(s: Session, uid: str, limit: int, before_ms: Optional[int]) -> Li
                 source=row.get("source"),
                 business=row.get("business"),
                 offer_id=row.get("offer_id"),
-                xp=int(row.get("xp") or 0),         # NEW
+                xp=int(row.get("xp") or 0),
             )
         )
     return items
@@ -228,21 +238,23 @@ async def get_wallet(
         balance=balance,
         earned_total=eco_earned,
         spent_total=eco_spent,
-        xp_total=xp_total,          # NEW
-        xp_30d=xp_30d,              # NEW
+        xp_total=xp_total,
+        xp_30d=xp_30d,
         txs=txs,
         next_before_ms=next_before,
         debug=dbg,
     )
 
 
-
 # ---------- business wallet (mirrors youth) ----------
+
 class BizWalletTx(WalletTx):
     pass  # same shape
 
+
 class BizWalletOut(WalletOut):
     business_id: str
+
 
 def _biz_id_for_user(s: Session, uid: str, requested: Optional[str]) -> str:
     """
@@ -256,6 +268,7 @@ def _biz_id_for_user(s: Session, uid: str, requested: Optional[str]) -> str:
         ).single()
         if not row or (row["owner"] or "") != uid:
             from fastapi import HTTPException
+
             raise HTTPException(status_code=403, detail="Not your business")
         return requested
 
@@ -265,9 +278,10 @@ def _biz_id_for_user(s: Session, uid: str, requested: Optional[str]) -> str:
     ).single()
     if not row or not row["bid"]:
         from fastapi import HTTPException
+
         raise HTTPException(status_code=404, detail="No business found for user")
     return row["bid"]
-# --- replace _biz_totals and _biz_txs with these ---
+
 
 def _biz_totals(s: Session, bid: str) -> tuple[int, int]:
     rec = s.run(
