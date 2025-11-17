@@ -74,7 +74,7 @@ def business_init(
         // Ensure the user
         MERGE (u:User {id:$user_id})
 
-        // Single business per user – key by user_id
+        // Single business per user - key by user_id
         MERGE (b:BusinessProfile {user_id:$user_id})
           ON CREATE SET
             b.id             = randomUUID(),

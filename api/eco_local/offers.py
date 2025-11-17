@@ -573,7 +573,7 @@ def redeem_offer_api(
         MERGE (v)-[:FOR_BUSINESS]->(b)
         MERGE (u)-[:HAS_VOUCHER]->(v)
 
-        // EcoTx (burn) – canonical user spend
+        // EcoTx (burn) - canonical user spend
         MERGE (t:EcoTx {id:$tx})
           ON CREATE SET
             t.kind        = 'BURN_REWARD',
@@ -599,7 +599,7 @@ def redeem_offer_api(
 
         SET o.claims = coalesce(o.claims,0) + 1
 
-        // Sponsor payout (fiat) – canonical business spend
+        // Sponsor payout (fiat) - canonical business spend
         FOREACH (_ IN CASE WHEN $fiat_cost > 0 THEN [1] ELSE [] END |
           SET b.sponsor_balance_cents = coalesce(b.sponsor_balance_cents,0) - $fiat_cost
 

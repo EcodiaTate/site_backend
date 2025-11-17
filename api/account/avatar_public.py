@@ -50,7 +50,7 @@ def _normalize_upload_url(raw: Optional[str]) -> Optional[str]:
     if s.startswith("/uploads/avatars/") or s.startswith("/uploads/avatar/"):
         return s
 
-    # unknown relative path – still return normalized absolute-ish
+    # unknown relative path - still return normalized absolute-ish
     return s
 
 def _build_from_sha(sha: str, rev: Optional[str]) -> str:

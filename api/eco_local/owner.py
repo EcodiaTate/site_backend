@@ -118,7 +118,7 @@ def _all(s: Session, cypher: str, params: Dict[str, Any]) -> List[Dict[str, Any]
     return [r.data() for r in s.run(cypher, **params)]
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Graph helpers – aligned to your constraints
+# Graph helpers - aligned to your constraints
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _ensure_owner_business(s: Session, user_id: str) -> str:

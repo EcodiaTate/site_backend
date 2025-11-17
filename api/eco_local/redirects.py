@@ -97,7 +97,7 @@ def _normalize_hero_url(raw: Optional[str]) -> Optional[str]:
     if s.startswith("/uploads/hero/"):
         s = s.replace("/uploads/hero/", "/uploads/heroes/", 1)
     # keep legacy asset route working without rewrites
-    # (/eco-local/assets/hero/abc.png) – your old endpoint can still serve it
+    # (/eco-local/assets/hero/abc.png) - your old endpoint can still serve it
     return s
 
 def _build_hero_from_sha(sha: str, rev: Optional[str]) -> str:
