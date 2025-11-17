@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import Optional, Literal, Any
+
 from fastapi import APIRouter, Depends, Body, HTTPException, status, Request, Response
 from pydantic import BaseModel
 from neo4j import Session
@@ -32,7 +33,7 @@ def role_snapshot(
     response: Response,
     s: Session = Depends(session_dep),
     uid: str = Depends(current_user_id),
-    p: Optional[RoleSnapshotIn] = Body(default=None),   # ← tolerate {} or no body
+    p: Optional[RoleSnapshotIn] = Body(default=None),
 ):
     # 1) Load user + attached profile presence
     rec = s.run(
@@ -78,13 +79,12 @@ def role_snapshot(
         # If current is public and inferred is public, accept hint
         if cur_role == "public" and inferred == "public":
             inferred = hint
-        # If current/inferred are non-public, we choose the "stronger" one (keep business > others)
+        # If current/inferred are non-public, choose stronger one
         elif inferred == "public" and cur_role in NON_PUBLIC:
-            inferred = cur_role  # keep current non-public
+            inferred = cur_role
         elif inferred in NON_PUBLIC and cur_role == "public":
             # already good; leave inferred
             pass
-        # If both non-public, prefer business, else keep inferred
         elif inferred in NON_PUBLIC and hint in NON_PUBLIC:
             if hint == "business":
                 inferred = "business"

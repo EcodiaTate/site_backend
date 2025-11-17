@@ -4,7 +4,7 @@ import hashlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional, Literal, List, Dict, Any
-
+import os
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from neo4j import Session
 from pydantic import BaseModel
@@ -15,6 +15,7 @@ from site_backend.core.user_guard import current_user_id  # 👈 use real logged
 router = APIRouter(prefix="/eco-local", tags=["eco-local"])
 
 PledgeTier = Literal["starter", "builder", "leader"]
+DISABLE_GEOFENCE = os.getenv("ECO_LOCAL_DISABLE_GEOFENCE", "false").lower() == "true"
 
 
 # ---------- Request / Response models ----------
@@ -100,16 +101,7 @@ class DBQRMeta:
     pledge_tier: PledgeTier
     rules_geofence_radius_m: Optional[int]
 
-
 def _fetch_qr_meta(s: Session, code: str) -> Optional[DBQRMeta]:
-    """
-    Expects:
-      (q:QR {code})-[:OF]->(b:BusinessProfile)
-
-    We only keep what we need for the QR → offers flow:
-      - business id/name/location
-      - QR coords + geofence radius (if configured)
-    """
     rec = s.run(
         """
         MATCH (q:QR {code:$code})-[:OF]->(b:BusinessProfile)
@@ -119,8 +111,8 @@ def _fetch_qr_meta(s: Session, code: str) -> Optional[DBQRMeta]:
           b['id'] AS bid,
           b['name'] AS bname,
           coalesce(b['area'], b['location'], b['suburb']) AS locname,
-          toFloat(q['lat']) AS qlat,
-          toFloat(q['lng']) AS qlng,
+          toFloat(coalesce(q['lat'], b['lat'])) AS qlat,
+          toFloat(coalesce(q['lng'], b['lng'])) AS qlng,
           coalesce(q['active'], true) AS qactive,
           coalesce(b['pledge_tier'], 'starter') AS pledge_tier,
           toInteger(coalesce(b['rules_geofence_radius_m'], 150)) AS geofence_m
@@ -140,6 +132,7 @@ def _fetch_qr_meta(s: Session, code: str) -> Optional[DBQRMeta]:
         pledge_tier=rec["pledge_tier"],
         rules_geofence_radius_m=int(rec["geofence_m"]) if rec["geofence_m"] is not None else None,
     )
+
 
 
 # ---------- Wallet balance (parity with offers.py) ----------
@@ -178,29 +171,39 @@ def _wallet_balance_for_offers(s: Session, user_id: str) -> int:
 
 
 # ---------- Active offers for the business ----------
-
 def _active_offers_for_business(s: Session, business_id: str) -> List[Dict[str, Any]]:
     """
-    Active, ECO-priced, in-stock, non-expired offers for a business.
-    Mirrors the visibility logic in offers.py::_is_visible but done here in Cypher.
+    Active, visible offers for a business.
+
+    Supports both legacy (b)-[:HAS_OFFER]->(o) and new (o)-[:OF]->(b) wiring.
+    Does NOT require eco_price > 0, so 0 / missing eco_price shows as 0 ECO.
     """
     today_iso = _now_utc().date().isoformat()
     recs = s.run(
         """
-        MATCH (o:Offer)-[:OF]->(b:BusinessProfile {id:$bid})
-        WHERE coalesce(o.status,'active') = 'active'
-          AND toInteger(coalesce(o.eco_price,0)) > 0
-          AND (o.stock IS NULL OR toInteger(o.stock) > 0)
+        MATCH (b:BusinessProfile {id:$bid})
+
+        // New style: (o)-[:OF]->(b)
+        OPTIONAL MATCH (o1:Offer)-[:OF]->(b)
+
+        // Legacy style: (b)-[:HAS_OFFER]->(o)
+        OPTIONAL MATCH (b)-[:HAS_OFFER]->(o2:Offer)
+
+        WITH b, coalesce(o1, o2) AS o
+        WHERE o IS NOT NULL
+          AND coalesce(o.status, 'active') = 'active'
+          AND coalesce(o.visible, true) = true
           AND (
-               o.valid_until IS NULL
-            OR o.valid_until = ''
-            OR date(o.valid_until) >= date($today)
+                o.valid_until IS NULL
+             OR o.valid_until = ''
+             OR date(o.valid_until) >= date($today)
           )
+
         RETURN
           o.id AS id,
           o.title AS title,
           o.blurb AS blurb,
-          toInteger(coalesce(o.eco_price,0)) AS eco_price,
+          toInteger(coalesce(o.eco_price, 0)) AS eco_price,
           toInteger(coalesce(o.stock, -1)) AS stock,
           o.valid_until AS valid_until
         ORDER BY o.title ASC
@@ -208,6 +211,7 @@ def _active_offers_for_business(s: Session, business_id: str) -> List[Dict[str, 
         bid=business_id,
         today=today_iso,
     )
+
     out: List[Dict[str, Any]] = []
     for r in recs:
         out.append(
@@ -216,11 +220,12 @@ def _active_offers_for_business(s: Session, business_id: str) -> List[Dict[str, 
                 "title": r["title"],
                 "blurb": r.get("blurb"),
                 "eco_price": int(r["eco_price"] or 0),
-                "stock": int(r["stock"]) if r.get("stock") is not None else None,
+                "stock": int(r["stock"]) if r.get("stock") is not None and int(r["stock"]) >= 0 else None,
                 "valid_until": r.get("valid_until"),
             }
         )
     return out
+
 
 
 # ---------- Primary endpoint: QR scan → offers ----------
@@ -261,9 +266,10 @@ def qr_scan_offers(
     # Offer-wallet balance for this authenticated youth
     balance = _wallet_balance_for_offers(s, user_id)
 
-    # Optional geofence check (only if both sides have coordinates + radius)
+       # Optional geofence check (only if both sides have coordinates + radius)
     if (
-        meta.rules_geofence_radius_m
+        not DISABLE_GEOFENCE
+        and meta.rules_geofence_radius_m
         and payload.lat is not None
         and payload.lng is not None
         and meta.lat is not None
@@ -271,7 +277,6 @@ def qr_scan_offers(
     ):
         dist = _haversine_m(payload.lat, payload.lng, meta.lat, meta.lng)
         if dist > float(meta.rules_geofence_radius_m):
-            # No offers if you're too far away
             return QRScanOffersResponse(
                 ok=False,
                 reason="geofence",
@@ -282,7 +287,7 @@ def qr_scan_offers(
                 offers=[],
             )
 
-    # Fetch visible offers for this business
+
     offers_raw = _active_offers_for_business(s, meta.business_id)
     offers_out: List[ClaimableOffer] = []
     for o in offers_raw:
@@ -298,6 +303,7 @@ def qr_scan_offers(
                 can_claim=(balance >= eco_price),
             )
         )
+
 
     return QRScanOffersResponse(
         ok=True,

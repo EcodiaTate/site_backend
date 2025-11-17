@@ -140,6 +140,10 @@ def _assert_voucher_belongs_to_user_business(
 
 
 def _user_wallet_balance(s: Session, user_id: str) -> int:
+    """
+    Canonical youth ECO balance based solely on EcoTx.
+    Vouchers are *not* part of the ledger; they're just UX tokens.
+    """
     row = s.run(
         """
         // Earned (posted)
@@ -313,7 +317,10 @@ def list_offers_api(
 ):
     raw = svc_list_offers(s, business_id=business_id, visible_only=visible_only)
 
-    offers = [_normalize_offer(dict(o) if not isinstance(o, dict) else o) for o in (raw or [])]
+    offers = [
+        _normalize_offer(dict(o) if not isinstance(o, dict) else o)
+        for o in (raw or [])
+    ]
 
     if status:
         offers = [o for o in offers if (o.get("status") or "active") == status]
@@ -468,7 +475,7 @@ def delete_offer_api(
 
 
 # ============================================================
-# Redemption → Voucher + burn ECO
+# Redeem (youth → voucher + EcoTx ledger)
 # ============================================================
 
 @router.post("/offers/{offer_id}/redeem", response_model=RedeemResponse)
@@ -478,42 +485,38 @@ def redeem_offer_api(
     user_id: str = Depends(current_user_id),
 ):
     tx_id = str(uuid4())
+    payout_id = str(uuid4())
     now = now_ms()
     vcode = short_code()
     expires_at = now + VOUCHER_TTL_MIN * 60 * 1000
+    now_iso_str = now_iso()
 
+    # 1) Fetch offer + business + sponsor balance
     rec = s.run(
         """
         MATCH (o:Offer {id:$oid})-[:OF]->(b:BusinessProfile)
-        WITH o,b
-
-        OPTIONAL MATCH (:User {id:$uid})-[:EARNED]->(m:EcoTx {kind:'MINT_ACTION', status:'settled'})
-        WITH o,b, coalesce(sum(m.amount),0) AS earned
-        OPTIONAL MATCH (:User {id:$uid})-[:SPENT]->(sx:EcoTx {status:'settled'})
-        WHERE sx.kind IN ['BURN_REWARD','CONTRIBUTE']
-        WITH o,b, toInteger(earned - coalesce(sum(sx.amount),0)) AS user_balance
-
         RETURN
           o.id AS oid,
           o.title AS title,
-          o.status AS status,
-          toInteger(o.eco_price) AS eco_price,
-          toInteger(coalesce(o.fiat_cost_cents,0)) AS fiat_cost_cents,
-          toInteger(coalesce(o.stock,-1)) AS stock,
+          coalesce(o.status, 'active') AS status,
+          toInteger(coalesce(o.eco_price, 0)) AS eco_price,
+          toInteger(coalesce(o.fiat_cost_cents, 0)) AS fiat_cost_cents,
+          toInteger(coalesce(o.stock, -1)) AS stock_int,
           o.valid_until AS valid_until,
           b.id AS bid,
-          toInteger(coalesce(b.sponsor_balance_cents,0)) AS sponsor_balance_cents,
-          user_balance AS user_balance
+          toInteger(coalesce(b.sponsor_balance_cents, 0)) AS sponsor_balance_cents
         """,
         oid=offer_id,
-        uid=user_id,
     ).single()
 
     if not rec:
         raise HTTPException(status_code=404, detail="Offer not found")
-    if rec["status"] != "active":
+
+    status = rec["status"] or "active"
+    if status != "active":
         raise HTTPException(status_code=409, detail="Offer unavailable")
 
+    # 2) Valid-until guard (if present)
     if rec["valid_until"]:
         try:
             vu = datetime.fromisoformat(str(rec["valid_until"]))
@@ -521,17 +524,29 @@ def redeem_offer_api(
                 vu = vu.replace(tzinfo=timezone.utc)
             if datetime.now(timezone.utc) > vu:
                 raise HTTPException(status_code=409, detail="Offer expired")
+        except HTTPException:
+            raise
         except Exception:
+            # ignore bad date format
             pass
 
-    eco_price = int(rec["eco_price"])
-    fiat_cost = int(rec["fiat_cost_cents"])
-    stock = int(rec["stock"])
+    eco_price = int(rec["eco_price"] or 0)
+    fiat_cost = int(rec["fiat_cost_cents"] or 0)
+    stock = int(rec["stock_int"] or -1)
     bid = rec["bid"]
-    sponsor_balance = int(rec["sponsor_balance_cents"])
-    user_balance = int(rec["user_balance"] or 0)
+    sponsor_balance = int(rec["sponsor_balance_cents"] or 0)
 
-    if user_balance < eco_price:
+    # Offer must cost >0 ECO
+    if eco_price <= 0:
+        raise HTTPException(
+            status_code=409,
+            detail="Offer misconfigured: ECO price must be > 0 to redeem",
+        )
+
+    # 3) Use canonical wallet logic based on EcoTx only
+    user_balance_before = _user_wallet_balance(s, user_id)
+
+    if user_balance_before < eco_price:
         raise HTTPException(status_code=400, detail="Insufficient ECO")
 
     if stock == 0:
@@ -540,25 +555,30 @@ def redeem_offer_api(
     if fiat_cost > 0 and sponsor_balance < fiat_cost:
         raise HTTPException(status_code=402, detail="Temporarily unavailable")
 
+    # 4) Create Voucher (UX) + EcoTx (ledger) + business payout EcoTx
     s.run(
         """
         MATCH (o:Offer {id:$oid})-[:OF]->(b:BusinessProfile {id:$bid})
         MATCH (u:User {id:$uid})
 
+        // Voucher: ephemeral claim token
         MERGE (v:Voucher {code:$vcode})
           ON CREATE SET
             v.status      = 'issued',
             v.createdAt   = $now,
             v.expiresAt   = $expires,
             v.eco_spent   = $eco_price
+
         MERGE (v)-[:FOR_OFFER]->(o)
         MERGE (v)-[:FOR_BUSINESS]->(b)
         MERGE (u)-[:HAS_VOUCHER]->(v)
 
+        // EcoTx (burn) – canonical user spend
         MERGE (t:EcoTx {id:$tx})
           ON CREATE SET
             t.kind        = 'BURN_REWARD',
             t.amount      = $eco_price,
+            t.eco         = $eco_price,
             t.burn        = true,
             t.voucher     = $vcode,
             t.source      = 'offer',
@@ -570,50 +590,50 @@ def redeem_offer_api(
         MERGE (u)-[:SPENT]->(t)
         MERGE (t)-[:FOR_OFFER]->(o)
         MERGE (b)-[:REDEEMED]->(t)
+        MERGE (b)-[:EARNED]->(t)   // business "earns" the retired ECO in its impact ledger
 
-        WITH o,b,t,v
-        CALL apoc.do.when(
-          o.stock IS NOT NULL AND o.stock > 0,
-          'SET o.stock = o.stock - 1 RETURN o',
-          'RETURN o',
-          {o:o}
-        ) YIELD value
+        // Decrement stock if we had a positive integer stock_int in Python
+        FOREACH (_ IN CASE WHEN $stock > 0 THEN [1] ELSE [] END |
+          SET o.stock = $stock - 1
+        )
 
         SET o.claims = coalesce(o.claims,0) + 1
 
-        WITH o,b,t,v
-        CALL apoc.do.when(
-          $fiat_cost > 0,
-          '
+        // Sponsor payout (fiat) – canonical business spend
+        FOREACH (_ IN CASE WHEN $fiat_cost > 0 THEN [1] ELSE [] END |
           SET b.sponsor_balance_cents = coalesce(b.sponsor_balance_cents,0) - $fiat_cost
+
           MERGE (p:EcoTx {id:$payout})
-            ON CREATE SET p.kind="SPONSOR_PAYOUT",
-                          p.amount=$fiat_cost,
-                          p.status="settled",
-                          p.createdAt=$now
+            ON CREATE SET
+              p.kind       = "SPONSOR_PAYOUT",
+              p.amount     = $fiat_cost,
+              p.eco        = $fiat_cost,
+              p.status     = "settled",
+              p.createdAt  = $now,
+              p.at         = datetime($now_iso),
+              p.source     = "offer"
+
           MERGE (b)-[:PAID]->(p)
+          MERGE (b)-[:SPENT]->(p)
           MERGE (p)-[:PAIRS]->(t)
-          RETURN b
-          ',
-          'RETURN b',
-          {fiat_cost:$fiat_cost, payout:$payout, now:$now, t:t, b:b}
-        ) YIELD value AS _
-        RETURN 1 AS ok
+        )
         """,
         oid=offer_id,
         bid=bid,
         uid=user_id,
         tx=tx_id,
-        payout=str(uuid4()),
+        payout=payout_id,
         vcode=vcode,
         eco_price=eco_price,
         fiat_cost=fiat_cost,
+        stock=stock,
         now=now,
-        now_iso=now_iso(),
+        now_iso=now_iso_str,
         expires=expires_at,
     )
 
-    balance_after = _user_wallet_balance(s, user_id)
+    # Derive new balance purely from EcoTx so it matches wallet logic
+    balance_after = max(0, user_balance_before - eco_price)
 
     return RedeemResponse(
         offer_id=offer_id,
@@ -909,9 +929,6 @@ def public_places_with_offers(
     """
     Public, unauthenticated listing of businesses that are visible on the map,
     with an 'has_offers' flag.
-
-    Aligns with FE Places.list → GET /eco-local/places?...
-    where `pledge`, `industry`, `area` are comma-separated in a single key.
     """
     use_distance = sort == "distance" and lat is not None and lng is not None
     if sort == "distance" and not use_distance:

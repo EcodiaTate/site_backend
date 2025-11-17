@@ -1,5 +1,6 @@
 # site_backend/api/auth/set_role.py
 from __future__ import annotations
+
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query

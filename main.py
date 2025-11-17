@@ -167,12 +167,24 @@ def create_app() -> FastAPI:
             content={"ok": False, "error": "Validation failed", "message": str(exc)},
         )
 
+    from neo4j.exceptions import Neo4jError
+    import logging
+
+    log = logging.getLogger(__name__)
+
     @app.exception_handler(Neo4jError)
     async def friendly_neo4j_error(request: Request, exc: Neo4jError):
+        # TEMP: log real error so we can debug
+        log.exception("[Neo4jError] %s %s", request.url.path, exc)
         return JSONResponse(
             status_code=500,
-            content={"ok": False, "error": "Database error", "message": "Something went wrong saving to the database."},
+            content={
+                "ok": False,
+                "error": "Database error",
+                "message": "Something went wrong saving to the database.",
+            },
         )
+
 
     @app.exception_handler(Exception)
     async def friendly_generic_error(request: Request, exc: Exception):

@@ -31,9 +31,12 @@ def _mint_access(uid: str, email: str | None = None) -> tuple[str, int]:
     now = _now_s()
     exp = now + ACCESS_JWT_TTL_S
     payload: dict[str, Any] = {"sub": uid, "iat": now, "exp": exp}
-    if email: payload["email"] = email
-    if ACCESS_JWT_ISS: payload["iss"] = ACCESS_JWT_ISS
-    if ACCESS_JWT_AUD: payload["aud"] = ACCESS_JWT_AUD
+    if email:
+        payload["email"] = email
+    if ACCESS_JWT_ISS:
+        payload["iss"] = ACCESS_JWT_ISS
+    if ACCESS_JWT_AUD:
+        payload["aud"] = ACCESS_JWT_AUD
     return jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO), exp
 
 def _mint_refresh(uid: str) -> str:
@@ -77,20 +80,40 @@ def _determine_role(rec: dict, email: str, current_role: str) -> str:
 
     if ADMIN_EMAIL and email == ADMIN_EMAIL.lower():
         return "admin"
-    if has_bp: return "business"
-    if has_yp: return "youth"
-    if has_cp: return "creative"
-    if has_pp: return "partner"
+    if has_bp:
+        return "business"
+    if has_yp:
+        return "youth"
+    if has_cp:
+        return "creative"
+    if has_pp:
+        return "partner"
     return current_role or "public"
 
-def _issue_tokens_and_build_response(u: dict, role: str, caps: dict[str, Any], request: Request, response: Response) -> dict[str, Any]:
+def _issue_tokens_and_build_response(
+    u: dict,
+    role: str,
+    caps: dict[str, Any],
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
     access, exp = _mint_access(u["id"], u.get("email"))
     refresh = _mint_refresh(u["id"])
 
-    set_scoped_cookie(response, name=REFRESH_COOKIE_NAME, value=refresh,
-                      max_age=REFRESH_TTL_DAYS * 24 * 3600, request=request)
-    set_scoped_cookie(response, name=ACCESS_COOKIE_NAME, value=access,
-                      max_age=ACCESS_JWT_TTL_S, request=request)
+    set_scoped_cookie(
+      response,
+      name=REFRESH_COOKIE_NAME,
+      value=refresh,
+      max_age=REFRESH_TTL_DAYS * 24 * 3600,
+      request=request,
+    )
+    set_scoped_cookie(
+      response,
+      name=ACCESS_COOKIE_NAME,
+      value=access,
+      max_age=ACCESS_JWT_TTL_S,
+      request=request,
+    )
 
     out: dict[str, Any] = {
         "id": u["id"],
@@ -102,13 +125,14 @@ def _issue_tokens_and_build_response(u: dict, role: str, caps: dict[str, Any], r
         "token": access,
         "exp": exp,
     }
-    if ADMIN_EMAIL and (u.get("email","").lower() == ADMIN_EMAIL.lower()):
+    if ADMIN_EMAIL and (u.get("email", "").lower() == ADMIN_EMAIL.lower()):
         out["admin_token"] = _mint_admin_token(u["email"])
     return out
 
 def _upsert_and_login(email: str, request: Request, response: Response, s: Session) -> dict[str, Any]:
     # MERGE user if missing (upsert), then read attached profiles to derive final role.
-    rec = s.run("""
+    rec = s.run(
+        """
         MERGE (u:User {email:$email})
           ON CREATE SET
             u.id = coalesce(u.id, randomUUID()),
@@ -125,7 +149,9 @@ def _upsert_and_login(email: str, request: Request, response: Response, s: Sessi
                cp IS NOT NULL AS has_cp,
                pp IS NOT NULL AS has_pp,
                (bp IS NOT NULL OR bOwned IS NOT NULL) AS has_bp
-    """, email=email).single()
+        """,
+        email=email,
+    ).single()
 
     if not rec or not rec.get("u"):
         # Shouldn't happen, but be explicit.
@@ -142,14 +168,23 @@ def _upsert_and_login(email: str, request: Request, response: Response, s: Sessi
     return _issue_tokens_and_build_response(u, final_role, caps, request, response)
 
 @router.post("/sso-login")
-def sso_login(p: SsoLoginIn, request: Request, response: Response, s: Session = Depends(session_dep)):
+def sso_login(
+    p: SsoLoginIn,
+    request: Request,
+    response: Response,
+    s: Session = Depends(session_dep),
+):
     email = p.email.lower()
     # Upsert + login (always 200 on success)
     return _upsert_and_login(email, request, response, s)
 
 # Optional alias: some FE builds still try /auth/sso-register on 404 from old flows.
-# Keep it for compatibility; it does the exact same thing.
 @router.post("/sso-register")
-def sso_register(p: SsoLoginIn, request: Request, response: Response, s: Session = Depends(session_dep)):
+def sso_register(
+    p: SsoLoginIn,
+    request: Request,
+    response: Response,
+    s: Session = Depends(session_dep),
+):
     email = p.email.lower()
     return _upsert_and_login(email, request, response, s)
