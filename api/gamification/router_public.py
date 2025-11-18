@@ -6,7 +6,6 @@ from neo4j import Session
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id, maybe_current_user_id
-from site_backend.core.user_bootstrap import ensure_user_exists  # makes sure User exists
 
 from site_backend.api.gamification import service
 from site_backend.api.gamification.schema import (
@@ -28,7 +27,6 @@ from site_backend.api.gamification.schema import (
 router = APIRouter(
     prefix="/gamification",
     tags=["gamification"],
-    dependencies=[Depends(ensure_user_exists)],
 )
 
 # ─── Public seasons (FIX for 404) ─────────────────────────────────────────────

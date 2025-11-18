@@ -9,6 +9,7 @@ from neo4j import Session
 import io
 import os
 import logging
+import datetime as dt
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.user_guard import current_user_id
@@ -21,7 +22,7 @@ from .service import (
     trigger_verify_email,
     change_password as svc_change_password,
     trigger_password_reset,
-    set_user_avatar_from_bytes,  # keep existing storage path/versioning logic
+    set_user_avatar_from_bytes,
     clear_user_avatar,
 )
 
@@ -37,6 +38,14 @@ class MeAccount(BaseModel):
     role: str = Field(default="public")
     email_verified: bool = False
     avatar_url: Optional[str] = None  # absolute via abs_media
+
+    # ── Legal flags (read-only) ───────────────────────────────────
+    legal_onboarding_complete: bool | None = None
+    tos_version: str | None = None
+    tos_accepted_at: str | None = None
+    privacy_accepted_at: str | None = None
+    over18_confirmed: bool | None = None
+    birth_year: int | None = None
 
 class DisplayNameIn(BaseModel):
     display_name: str = Field(min_length=1, max_length=80)
@@ -63,29 +72,41 @@ class PasswordResetOut(BaseModel):
 class AvatarOut(BaseModel):
     avatar_url: Optional[str] = None
 
+# ── Legal onboarding I/O ─────────────────────────────────────────
+
+class LegalStatusOut(BaseModel):
+    legal_onboarding_complete: bool
+    tos_version: str | None = None
+    tos_accepted_at: str | None = None
+    privacy_accepted_at: str | None = None
+    over18_confirmed: bool | None = None
+    birth_year: int | None = None
+
+class LegalAcceptIn(BaseModel):
+    agreed_tos: bool
+    agreed_privacy: bool
+    tos_version: str | None = None
+    is_adult: bool | None = None
+    birth_year: int | None = None
+
+class LegalAcceptOut(BaseModel):
+    ok: bool = True
+    legal_onboarding_complete: bool = True
 
 # ==================== Upload helpers ====================
-
-# Max avatar size (MB) -> bytes (defaults to 15 MB)
 _AVATAR_MAX_MB = float(os.getenv("AVATAR_MAX_MB", "15"))
 _AVATAR_MAX_BYTES = int(_AVATAR_MAX_MB * 1024 * 1024)
 
-# Content-type / extension sets
 _HEIC_CTS = {"image/heic", "image/heif", "image/avif"}
 _BASIC_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 _HEIC_EXTS = (".heic", ".heif", ".avif")
 
 def _register_heif_plugins() -> bool:
-    """
-    Try all known pillow-heif registration entry points across versions.
-    Returns True if any registration succeeded.
-    """
     try:
         import pillow_heif  # type: ignore
     except Exception as e:
         log.info("pillow-heif not importable: %s", e)
         return False
-
     registered = False
     for fn_name in ("register_heif", "register_heif_opener", "register_avif_opener"):
         try:
@@ -101,11 +122,6 @@ def _register_heif_plugins() -> bool:
     return registered
 
 def _lazy_pillow():
-    """
-    Import PIL lazily so the app still starts if Pillow isn't installed.
-    Also attempt to register HEIF/AVIF openers if pillow-heif is present.
-    Returns the PIL Image module or None.
-    """
     try:
         from PIL import Image as PILImage  # type: ignore
     except Exception as e:
@@ -115,7 +131,6 @@ def _lazy_pillow():
     return PILImage
 
 def _normalize_orientation_pil(im):
-    # EXIF orientation normalization; safe no-op if no EXIF
     try:
         exif = getattr(im, "getexif", lambda: {})()
         orientation = exif.get(274)
@@ -141,15 +156,14 @@ def _guess_ext_from_ct_or_name(content_type: Optional[str], filename: Optional[s
     ct = (content_type or "").lower()
     fn = (filename or "").lower()
     if "png" in ct or fn.endswith(".png"):
-        return ".png"
+      return ".png"
     if "webp" in ct or fn.endswith(".webp"):
-        return ".webp"
-    if "jpeg" in ct or "jpg" in ct or fn.endswith(".jpg") or fn.endswith(".jpeg"):
-        return ".jpg"
+      return ".webp"
+    if "jpeg" in ct or "jpg" in ct or fn.endswith((".jpg",".jpeg")):
+      return ".jpg"
     if fn.endswith(_HEIC_EXTS):
-        return ".heic"  # marker; we won't passthrough this without conversion
+      return ".heic"
     return ".jpg"
-
 
 # ==================== Routes ====================
 
@@ -159,8 +173,83 @@ def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(s
     if not acc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     acc["avatar_url"] = abs_media(acc.get("avatar_url"))
+
+    # surface legal flags (safe defaults)
+    acc.setdefault("legal_onboarding_complete", bool(acc.get("legal_onboarding_complete") or False))
+    acc.setdefault("tos_version", acc.get("tos_version"))
+    acc.setdefault("tos_accepted_at", acc.get("tos_accepted_at"))
+    acc.setdefault("privacy_accepted_at", acc.get("privacy_accepted_at"))
+    acc.setdefault("over18_confirmed", acc.get("over18_confirmed"))
+    acc.setdefault("birth_year", acc.get("birth_year"))
+
     return acc
 
+@router.get("/legal-status", response_model=LegalStatusOut)
+def r_get_legal_status(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
+    row = s.run(
+        """
+        MATCH (u:User {id:$uid})
+        RETURN coalesce(u.legal_onboarding_complete,false) AS complete,
+               coalesce(u.tos_version, NULL)              AS tos_version,
+               coalesce(u.tos_accepted_at, NULL)          AS tos_at,
+               coalesce(u.privacy_accepted_at, NULL)      AS priv_at,
+               coalesce(u.over18_confirmed, NULL)         AS over18,
+               coalesce(u.birth_year, NULL)               AS birth_year
+        """,
+        uid=uid,
+    ).single()
+    if not row:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "legal_onboarding_complete": bool(row["complete"]),
+        "tos_version": row["tos_version"],
+        "tos_accepted_at": row["tos_at"],
+        "privacy_accepted_at": row["priv_at"],
+        "over18_confirmed": row["over18"],
+        "birth_year": row["birth_year"],
+    }
+
+@router.post("/legal-accept", response_model=LegalAcceptOut)
+def r_post_legal_accept(
+    p: LegalAcceptIn,
+    uid: str = Depends(current_user_id),
+    s: Session = Depends(session_dep),
+):
+    if not (p.agreed_tos and p.agreed_privacy):
+        raise HTTPException(status_code=400, detail="You must agree to Terms and Privacy Policy.")
+
+    # accept timestamps and version
+    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
+    tos_version = (p.tos_version or os.getenv("DEFAULT_TOS_VERSION", "v1")).strip() or "v1"
+
+    # determine adulthood (either explicit is_adult OR infer from birth_year)
+    over18: bool | None = None
+    if p.is_adult is not None:
+        over18 = bool(p.is_adult)
+    elif p.birth_year is not None and 1900 <= p.birth_year <= dt.datetime.now().year:
+        over18 = (dt.datetime.now().year - int(p.birth_year)) >= 18
+
+    # persist
+    s.run(
+        """
+        MATCH (u:User {id:$uid})
+        SET u.tos_version = $tos_version,
+            u.tos_accepted_at = $now_iso,
+            u.privacy_accepted_at = $now_iso,
+            u.over18_confirmed = coalesce($over18, u.over18_confirmed),
+            u.birth_year = coalesce($birth_year, u.birth_year),
+            u.legal_onboarding_complete = true,
+            u.updated_at = datetime()
+        """,
+        uid=uid,
+        tos_version=tos_version,
+        now_iso=now_iso,
+        over18=over18,
+        birth_year=(int(p.birth_year) if p.birth_year else None),
+    )
+
+    return LegalAcceptOut(ok=True, legal_onboarding_complete=True)
 
 @router.patch("/display-name", response_model=dict)
 def r_update_display_name(
@@ -171,7 +260,6 @@ def r_update_display_name(
     update_display_name(s, uid, p.display_name.strip())
     return {"ok": True}
 
-
 @router.post("/change-email", response_model=ChangeEmailOut)
 def r_change_email(
     p: ChangeEmailIn,
@@ -181,12 +269,10 @@ def r_change_email(
     begin_change_email(s, uid, p.new_email)
     return ChangeEmailOut(pending_verification=True)
 
-
 @router.post("/send-verify-email", response_model=VerifyEmailOut)
 def r_send_verify_email(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
     sent = trigger_verify_email(s, uid)
     return VerifyEmailOut(sent=sent)
-
 
 @router.post("/change-password", response_model=ChangePasswordOut)
 def r_change_password(
@@ -197,12 +283,10 @@ def r_change_password(
     svc_change_password(s, uid, p.current_password, p.new_password)
     return ChangePasswordOut(ok=True)
 
-
 @router.post("/send-password-reset", response_model=PasswordResetOut)
 def r_send_password_reset(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
     sent = trigger_password_reset(s, uid)
     return PasswordResetOut(sent=sent)
-
 
 # -------- Avatar upload/remove (HEIC-safe, tolerant, lazy Pillow) --------
 @router.post("/avatar", response_model=AvatarOut)
@@ -211,7 +295,6 @@ def r_upload_avatar(
     uid: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
-    # Tolerant: allow empty/odd content-types if filename looks like an image
     ct = (f.content_type or "").lower()
     fn = (f.filename or "").lower()
     looks_like_image = (
@@ -231,14 +314,12 @@ def r_upload_avatar(
             detail=f"Image too large (max {int(_AVATAR_MAX_MB)} MB).",
         )
 
-    # Try Pillow first regardless of provided content-type.
     PILImage = _lazy_pillow()
     if PILImage is not None:
         try:
             im = PILImage.open(io.BytesIO(data))
-            im.load()  # force decode; works for HEIC/AVIF if pillow-heif registered
+            im.load()
         except Exception as e:
-            # If decode failed, fall back to passthrough for basic types; otherwise explain.
             ext = _guess_ext_from_ct_or_name(ct, f.filename)
             if ext in (".jpg", ".png", ".webp"):
                 rel = set_user_avatar_from_bytes(s, uid, data, ext)
@@ -250,16 +331,18 @@ def r_upload_avatar(
                 )
             raise HTTPException(status_code=415, detail=f"Unsupported image format: {e}")
 
-        # With a decoded image, normalize and convert to WEBP
         try:
-            webp_bytes = _to_webp_bytes_pil(PILImage, im)
+            from PIL import Image as PIL  # type: ignore
+            im = im.convert("RGB")
+            buf = io.BytesIO()
+            im.save(buf, "WEBP", quality=85, method=6)
+            webp_bytes = buf.getvalue()
         except Exception as e:
             raise HTTPException(status_code=400, detail=f"Could not convert to WEBP: {e}")
 
         rel = set_user_avatar_from_bytes(s, uid, webp_bytes, ".webp")
         return AvatarOut(avatar_url=abs_media(rel))
 
-    # No Pillow available → allow passthrough for PNG/JPG/WebP; block HEIC/AVIF with a clear message.
     if ct in _HEIC_CTS or fn.endswith(_HEIC_EXTS):
         raise HTTPException(
             status_code=415,
@@ -271,7 +354,6 @@ def r_upload_avatar(
 
     rel = set_user_avatar_from_bytes(s, uid, data, ext)
     return AvatarOut(avatar_url=abs_media(rel))
-
 
 @router.delete("/avatar", response_model=AvatarOut)
 def r_delete_avatar(

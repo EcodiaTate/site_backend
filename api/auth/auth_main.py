@@ -53,6 +53,43 @@ def _mint_access(uid: str, email: Optional[str] = None) -> tuple[str, int]:
         payload["aud"] = ACCESS_JWT_AUD
     return jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO), exp
 
+# ── TOS/Age stamping helpers ────────────────────────────────────────────────
+import datetime as _dt
+
+DEFAULT_TOS_VERSION = os.getenv("DEFAULT_TOS_VERSION", "v1")
+
+def _now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+def _infer_over18(payload: dict) -> bool:
+    """
+    Prefer explicit over18_confirmed from payload.
+    If absent, infer from birth_year when present (youth flow).
+    Otherwise default False (caller may choose to hard-enforce at the route).
+    """
+    if "over18_confirmed" in payload:
+        return bool(payload.get("over18_confirmed"))
+    by = payload.get("birth_year")
+    if isinstance(by, int) and 1900 <= by <= _dt.datetime.now().year:
+        return (_dt.datetime.now().year - by) >= 18
+    return False
+
+def _extract_tos_age_fields(payload: dict) -> dict[str, Any]:
+    """
+    Collects TOS + age fields robustly from mixed signup payloads.
+    - tos_version: payload.tos_version or DEFAULT_TOS_VERSION
+    - tos_accepted_at: now
+    - over18_confirmed: explicit flag OR infer from birth_year (if available)
+    """
+    tos_version = (payload.get("tos_version") or DEFAULT_TOS_VERSION).strip()
+    tos_accepted_at = _now_iso()
+    over18_confirmed = _infer_over18(payload)
+    return {
+        "tos_version": tos_version,
+        "tos_accepted_at": tos_accepted_at,
+        "over18_confirmed": bool(over18_confirmed),
+    }
+
 def _mint_refresh(uid: str) -> str:
     now = _now_s()
     exp = now + REFRESH_TTL_DAYS * 24 * 3600
@@ -117,6 +154,9 @@ class UserOut(BaseModel):
     role: str
     caps: dict[str, Any]
     profile: dict[str, Any] = {}
+# site_backend/api/auth/auth_routes.py  (only the changed/added bits shown as full function bodies)
+
+# ... imports & helpers unchanged ...
 
 @router.post("/login")
 def login(
@@ -159,7 +199,6 @@ def login(
     elif role == "public" and rec.get("pub"):
         profile = dict(rec["pub"])
 
-    # Unify avatar at session boundary
     prof_avatar = profile.get("avatar_url") if isinstance(profile, dict) else None
     unified_avatar = prof_avatar or u.get("avatar_url")
     if isinstance(profile, dict):
@@ -170,31 +209,28 @@ def login(
     access, exp = _mint_access(u["id"], u["email"])
     refresh = _mint_refresh(u["id"])
 
-    # Set both refresh + access cookies so SSR / cookie-based calls work
-    set_scoped_cookie(
-        response,
-        name=REFRESH_COOKIE_NAME,
-        value=refresh,
-        max_age=REFRESH_TTL_DAYS * 24 * 3600,
-        request=request,
-    )
-    set_scoped_cookie(
-        response,
-        name=ACCESS_COOKIE_NAME,
-        value=access,
-        max_age=ACCESS_JWT_TTL_S,
-        request=request,
-    )
+    set_scoped_cookie(response, name=REFRESH_COOKIE_NAME, value=refresh, max_age=REFRESH_TTL_DAYS * 24 * 3600, request=request)
+    set_scoped_cookie(response, name=ACCESS_COOKIE_NAME,  value=access,  max_age=ACCESS_JWT_TTL_S, request=request)
 
+    # ── Legal flags surfaced in response ──────────────────────────
+    legal_complete = bool(u.get("legal_onboarding_complete") or False)
     resp: dict[str, Any] = {
         "id": u["id"],
         "email": u["email"],
         "role": role,
         "caps": caps,
         "profile": profile,
-        "user_token": u["id"],  # legacy
+        "user_token": u["id"],
         "token": access,
         "exp": exp,
+
+        "legal_onboarding_complete": legal_complete,
+        "needs_legal": (not legal_complete),
+        "tos_version": u.get("tos_version"),
+        "tos_accepted_at": u.get("tos_accepted_at"),
+        "privacy_accepted_at": u.get("privacy_accepted_at"),
+        "over18_confirmed": u.get("over18_confirmed"),
+        "birth_year": u.get("birth_year"),
     }
 
     if ADMIN_EMAIL and u["email"].lower() == ADMIN_EMAIL:

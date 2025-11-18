@@ -89,6 +89,7 @@ def _determine_role(rec: dict, email: str, current_role: str) -> str:
     if has_pp:
         return "partner"
     return current_role or "public"
+# site_backend/api/auth/sso_login.py  (only the changed/added bits shown as full function bodies)
 
 def _issue_tokens_and_build_response(
     u: dict,
@@ -100,20 +101,10 @@ def _issue_tokens_and_build_response(
     access, exp = _mint_access(u["id"], u.get("email"))
     refresh = _mint_refresh(u["id"])
 
-    set_scoped_cookie(
-      response,
-      name=REFRESH_COOKIE_NAME,
-      value=refresh,
-      max_age=REFRESH_TTL_DAYS * 24 * 3600,
-      request=request,
-    )
-    set_scoped_cookie(
-      response,
-      name=ACCESS_COOKIE_NAME,
-      value=access,
-      max_age=ACCESS_JWT_TTL_S,
-      request=request,
-    )
+    set_scoped_cookie(response, name=REFRESH_COOKIE_NAME, value=refresh, max_age=REFRESH_TTL_DAYS * 24 * 3600, request=request)
+    set_scoped_cookie(response, name=ACCESS_COOKIE_NAME,  value=access,  max_age=ACCESS_JWT_TTL_S, request=request)
+
+    legal_complete = bool(u.get("legal_onboarding_complete") or False)
 
     out: dict[str, Any] = {
         "id": u["id"],
@@ -121,13 +112,23 @@ def _issue_tokens_and_build_response(
         "role": role,
         "caps": caps,
         "profile": {},
-        "user_token": u["id"],  # legacy
+        "user_token": u["id"],
         "token": access,
         "exp": exp,
+
+        # surface legal flags for FE gating
+        "legal_onboarding_complete": legal_complete,
+        "needs_legal": (not legal_complete),
+        "tos_version": u.get("tos_version"),
+        "tos_accepted_at": u.get("tos_accepted_at"),
+        "privacy_accepted_at": u.get("privacy_accepted_at"),
+        "over18_confirmed": u.get("over18_confirmed"),
+        "birth_year": u.get("birth_year"),
     }
     if ADMIN_EMAIL and (u.get("email", "").lower() == ADMIN_EMAIL.lower()):
         out["admin_token"] = _mint_admin_token(u["email"])
     return out
+
 
 def _upsert_and_login(email: str, request: Request, response: Response, s: Session) -> dict[str, Any]:
     # MERGE user if missing (upsert), then read attached profiles to derive final role.

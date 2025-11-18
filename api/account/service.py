@@ -108,7 +108,6 @@ def _parse_sha_from_url(url: Optional[str]) -> Optional[str]:
 # =========================================================
 # Account Reads
 # =========================================================
-
 def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
     cy = """
     MATCH (u:User {id:$uid})
@@ -117,7 +116,15 @@ def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
            toLower(coalesce(u.role,'public')) AS role,
            coalesce(u.display_name, NULL) AS display_name,
            coalesce(u.email_verified, false) AS email_verified,
-           coalesce(u.avatar_url, NULL) AS avatar_url
+           coalesce(u.avatar_url, NULL) AS avatar_url,
+
+           // legal flags
+           coalesce(u.legal_onboarding_complete,false) AS legal_onboarding_complete,
+           coalesce(u.tos_version, NULL)               AS tos_version,
+           coalesce(u.tos_accepted_at, NULL)           AS tos_accepted_at,
+           coalesce(u.privacy_accepted_at, NULL)       AS privacy_accepted_at,
+           coalesce(u.over18_confirmed, NULL)          AS over18_confirmed,
+           coalesce(u.birth_year, NULL)                AS birth_year
     """
     rec = s.run(cy, uid=uid).single()
     if not rec:
@@ -129,7 +136,15 @@ def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
         "role": rec["role"],
         "email_verified": bool(rec["email_verified"]),
         "avatar_url": rec["avatar_url"],
+
+        "legal_onboarding_complete": bool(rec["legal_onboarding_complete"]),
+        "tos_version": rec["tos_version"],
+        "tos_accepted_at": rec["tos_accepted_at"],
+        "privacy_accepted_at": rec["privacy_accepted_at"],
+        "over18_confirmed": rec["over18_confirmed"],
+        "birth_year": rec["birth_year"],
     }
+
 
 def get_public_profile(s: Session, uid: str) -> Optional[Dict[str, Any]]:
     """
