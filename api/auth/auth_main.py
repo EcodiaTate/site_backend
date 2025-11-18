@@ -1,5 +1,6 @@
 # site_backend/api/auth/auth_routes.py
 from __future__ import annotations
+
 from uuid import uuid4
 from typing import Any, Optional
 
@@ -8,9 +9,12 @@ from pydantic import BaseModel, EmailStr, Field
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
 from neo4j import Session
-import os, time, json
-from jose import jwt
 from neo4j.exceptions import ConstraintError
+from jose import jwt
+import os
+import time
+import json
+import datetime as _dt
 
 from site_backend.core.neo_driver import session_dep
 from site_backend.core.cookies import (
@@ -29,22 +33,26 @@ JWT_ALGO = "HS256"
 ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "tate@ecodia.au").lower()
 
 ACCESS_JWT_SECRET = os.getenv("ACCESS_JWT_SECRET", JWT_SECRET)
-ACCESS_JWT_ALGO   = os.getenv("ACCESS_JWT_ALGO", "HS256")
-ACCESS_JWT_TTL_S  = int(os.getenv("ACCESS_JWT_TTL_S", "900"))
-ACCESS_JWT_ISS    = os.getenv("ACCESS_JWT_ISS")
-ACCESS_JWT_AUD    = os.getenv("ACCESS_JWT_AUD")
+ACCESS_JWT_ALGO = os.getenv("ACCESS_JWT_ALGO", "HS256")
+ACCESS_JWT_TTL_S = int(os.getenv("ACCESS_JWT_TTL_S", "900"))
+ACCESS_JWT_ISS = os.getenv("ACCESS_JWT_ISS")
+ACCESS_JWT_AUD = os.getenv("ACCESS_JWT_AUD")
 
-REFRESH_JWT_SECRET  = os.getenv("REFRESH_JWT_SECRET", JWT_SECRET)
-REFRESH_JWT_ALGO    = os.getenv("REFRESH_JWT_ALGO", "HS256")
-REFRESH_TTL_DAYS    = int(os.getenv("REFRESH_TTL_DAYS", "90"))
+REFRESH_JWT_SECRET = os.getenv("REFRESH_JWT_SECRET", JWT_SECRET)
+REFRESH_JWT_ALGO = os.getenv("REFRESH_JWT_ALGO", "HS256")
+REFRESH_TTL_DAYS = int(os.getenv("REFRESH_TTL_DAYS", "90"))
+
+DEFAULT_TOS_VERSION = os.getenv("DEFAULT_TOS_VERSION", "v1")
 
 
 # ── Signup payloads ────────────────────────────────────────────────────────
+
 
 class YouthSignupIn(BaseModel):
     email: EmailStr
     password: str
     birth_year: int
+
 
 class CreativeSignupIn(BaseModel):
     email: EmailStr
@@ -52,21 +60,168 @@ class CreativeSignupIn(BaseModel):
     display_name: str
     portfolio_url: str | None = None
 
+
 class PartnerSignupIn(BaseModel):
     email: EmailStr
     password: str
     org_name: str
     org_type: str | None = None
 
+
 class PublicSignupIn(BaseModel):
     email: EmailStr
     password: str
     display_name: str | None = None
 
+
 class MinimalSignupIn(BaseModel):
     email: EmailStr
     password: str
-    role: str = Field(regex="^(youth|business|creative|partner|public)$")
+    # Pydantic v2: use `pattern` instead of `regex`
+    role: str = Field(pattern="^(youth|business|creative|partner|public)$")
+
+
+# ── Role caps ──────────────────────────────────────────────────────────────
+
+
+ROLE_DEFAULT_CAPS: dict[str, dict[str, Any]] = {
+    "youth": {
+        "max_redemptions_per_week": 5,
+        "streak_bonus_enabled": True,
+        "max_active_sidequests": 7,
+    },
+    "business": {
+        "max_active_offers": 3,
+        "can_issue_qr": True,
+        "analytics_enabled": True,
+    },
+    "creative": {
+        "max_active_collabs": 3,
+        "portfolio_required": False,
+    },
+    "partner": {
+        "max_workspaces": 2,
+        "can_host_events": True,
+    },
+    "public": {},
+}
+
+
+# ── Simple models ──────────────────────────────────────────────────────────
+
+
+class LoginIn(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class UserOut(BaseModel):
+    id: str
+    email: EmailStr
+    role: str
+    caps: dict[str, Any]
+    profile: dict[str, Any] = {}
+
+
+# ── Time / token helpers ───────────────────────────────────────────────────
+
+
+def _now_s() -> int:
+    return int(time.time())
+
+
+def _now_iso() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def _mint_access(uid: str, email: Optional[str] = None) -> tuple[str, int]:
+    now = _now_s()
+    exp = now + ACCESS_JWT_TTL_S
+    payload: dict[str, Any] = {"sub": uid, "iat": now, "exp": exp}
+    if email:
+        payload["email"] = email
+    if ACCESS_JWT_ISS:
+        payload["iss"] = ACCESS_JWT_ISS
+    if ACCESS_JWT_AUD:
+        payload["aud"] = ACCESS_JWT_AUD
+    return jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO), exp
+
+
+def _mint_refresh(uid: str) -> str:
+    now = _now_s()
+    exp = now + REFRESH_TTL_DAYS * 24 * 3600
+    payload = {"sub": uid, "iat": now, "exp": exp, "typ": "refresh"}
+    return jwt.encode(payload, REFRESH_JWT_SECRET, algorithm=REFRESH_JWT_ALGO)
+
+
+def _infer_over18(payload: dict) -> bool:
+    """
+    Prefer explicit over18_confirmed from payload.
+    If absent, infer from birth_year when present (youth flow).
+    Otherwise default False (caller may choose to hard-enforce at the route).
+    """
+    if "over18_confirmed" in payload:
+        return bool(payload.get("over18_confirmed"))
+
+    by = payload.get("birth_year")
+    if isinstance(by, int) and 1900 <= by <= _dt.datetime.now().year:
+        return (_dt.datetime.now().year - by) >= 18
+    return False
+
+
+def _extract_tos_age_fields(payload: dict) -> dict[str, Any]:
+    """
+    Collects TOS + age fields robustly from mixed signup payloads.
+    - tos_version: payload.tos_version or DEFAULT_TOS_VERSION
+    - tos_accepted_at: now
+    - over18_confirmed: explicit flag OR infer from birth_year (if available)
+    """
+    tos_version = (payload.get("tos_version") or DEFAULT_TOS_VERSION).strip()
+    tos_accepted_at = _now_iso()
+    over18_confirmed = _infer_over18(payload)
+    return {
+        "tos_version": tos_version,
+        "tos_accepted_at": tos_accepted_at,
+        "over18_confirmed": bool(over18_confirmed),
+    }
+
+
+def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
+    try:
+        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
+    except Exception:
+        caps = {}
+    if not caps:
+        caps = ROLE_DEFAULT_CAPS.get(role, {})
+    return caps
+
+
+def is_admin_email(email: str) -> bool:
+    if not email:
+        return False
+    e = email.lower()
+    return e == ADMIN_EMAIL or e.endswith("@ecodia.au")
+
+
+def mint_admin_token(email: str, ttl_secs: int = 6 * 60 * 60) -> str:
+    now = _now_s()
+    payload = {
+        "sub": email,
+        "scope": "admin",
+        "iat": now,
+        "exp": now + ttl_secs,
+        "aud": "admin",
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
+
+
+def get_user_by_id(session: Session, uid: str) -> Optional[dict]:
+    rec = session.run(
+        "MATCH (u:User {id:$id}) RETURN u.email AS email", {"id": uid}
+    ).single()
+    if not rec:
+        return None
+    return {"email": rec["email"]}
 
 
 def _issue_tokens_and_build_response_for_user(
@@ -126,123 +281,9 @@ def _issue_tokens_and_build_response_for_user(
 
     return resp
 
-def _now_s() -> int:
-    return int(time.time())
 
-def _mint_access(uid: str, email: Optional[str] = None) -> tuple[str, int]:
-    now = _now_s()
-    exp = now + ACCESS_JWT_TTL_S
-    payload: dict[str, Any] = {"sub": uid, "iat": now, "exp": exp}
-    if email:
-        payload["email"] = email
-    if ACCESS_JWT_ISS:
-        payload["iss"] = ACCESS_JWT_ISS
-    if ACCESS_JWT_AUD:
-        payload["aud"] = ACCESS_JWT_AUD
-    return jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO), exp
+# ── Routes ─────────────────────────────────────────────────────────────────
 
-# ── TOS/Age stamping helpers ────────────────────────────────────────────────
-import datetime as _dt
-
-DEFAULT_TOS_VERSION = os.getenv("DEFAULT_TOS_VERSION", "v1")
-
-def _now_iso() -> str:
-    return _dt.datetime.now(_dt.timezone.utc).isoformat()
-
-def _infer_over18(payload: dict) -> bool:
-    """
-    Prefer explicit over18_confirmed from payload.
-    If absent, infer from birth_year when present (youth flow).
-    Otherwise default False (caller may choose to hard-enforce at the route).
-    """
-    if "over18_confirmed" in payload:
-        return bool(payload.get("over18_confirmed"))
-    by = payload.get("birth_year")
-    if isinstance(by, int) and 1900 <= by <= _dt.datetime.now().year:
-        return (_dt.datetime.now().year - by) >= 18
-    return False
-
-def _extract_tos_age_fields(payload: dict) -> dict[str, Any]:
-    """
-    Collects TOS + age fields robustly from mixed signup payloads.
-    - tos_version: payload.tos_version or DEFAULT_TOS_VERSION
-    - tos_accepted_at: now
-    - over18_confirmed: explicit flag OR infer from birth_year (if available)
-    """
-    tos_version = (payload.get("tos_version") or DEFAULT_TOS_VERSION).strip()
-    tos_accepted_at = _now_iso()
-    over18_confirmed = _infer_over18(payload)
-    return {
-        "tos_version": tos_version,
-        "tos_accepted_at": tos_accepted_at,
-        "over18_confirmed": bool(over18_confirmed),
-    }
-
-def _mint_refresh(uid: str) -> str:
-    now = _now_s()
-    exp = now + REFRESH_TTL_DAYS * 24 * 3600
-    payload = {"sub": uid, "iat": now, "exp": exp, "typ": "refresh"}
-    return jwt.encode(payload, REFRESH_JWT_SECRET, algorithm=REFRESH_JWT_ALGO)
-
-def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
-    try:
-        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
-    except Exception:
-        caps = {}
-    if not caps:
-        caps = ROLE_DEFAULT_CAPS.get(role, {})
-    return caps
-
-def is_admin_email(email: str) -> bool:
-    if not email:
-        return False
-    e = email.lower()
-    return e == ADMIN_EMAIL or e.endswith("@ecodia.au")
-
-def mint_admin_token(email: str, ttl_secs: int = 6 * 60 * 60) -> str:
-    now = _now_s()
-    payload = {"sub": email, "scope": "admin", "iat": now, "exp": now + ttl_secs, "aud": "admin"}
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGO)
-
-def get_user_by_id(session: Session, uid: str) -> Optional[dict]:
-    rec = session.run("MATCH (u:User {id:$id}) RETURN u.email AS email", {"id": uid}).single()
-    if not rec:
-        return None
-    return {"email": rec["email"]}
-
-ROLE_DEFAULT_CAPS: dict[str, dict[str, Any]] = {
-    "youth": {
-        "max_redemptions_per_week": 5,
-        "streak_bonus_enabled": True,
-        "max_active_sidequests": 7,
-    },
-    "business": {
-        "max_active_offers": 3,
-        "can_issue_qr": True,
-        "analytics_enabled": True,
-    },
-    "creative": {
-        "max_active_collabs": 3,
-        "portfolio_required": False,
-    },
-    "partner": {
-        "max_workspaces": 2,
-        "can_host_events": True,
-    },
-    "public": {},
-}
-
-class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
-
-class UserOut(BaseModel):
-    id: str
-    email: EmailStr
-    role: str
-    caps: dict[str, Any]
-    profile: dict[str, Any] = {}
-# site_backend/api/auth/auth_routes.py  (only the changed/added bits shown as full function bodies)
 
 @router.post("/login")
 def login(
@@ -298,6 +339,7 @@ def login(
         response=response,
     )
 
+
 @router.post("/admin-cookie")
 def r_admin_cookie_here(
     response: Response,
@@ -310,7 +352,9 @@ def r_admin_cookie_here(
     user = get_user_by_id(s, uid)
     email = (user or {}).get("email") or ""
     if not is_admin_email(email):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not an admin")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Not an admin"
+        )
 
     token = mint_admin_token(email, ttl_secs=6 * 60 * 60)
 
@@ -382,7 +426,7 @@ def signup_youth(
         raise HTTPException(status_code=500, detail="Signup failed")
 
     u = rec["u"]
-    profile: dict[str, Any] = {}  # youth profile is currently minimal; FE reads display name via account API
+    profile: dict[str, Any] = {}
 
     return _issue_tokens_and_build_response_for_user(
         u=u,
@@ -391,6 +435,8 @@ def signup_youth(
         request=request,
         response=response,
     )
+
+
 @router.post("/login/creative")
 def signup_creative(
     p: CreativeSignupIn,
@@ -467,6 +513,7 @@ def signup_creative(
         response=response,
     )
 
+
 @router.post("/login/partner")
 def signup_partner(
     p: PartnerSignupIn,
@@ -541,7 +588,9 @@ def signup_partner(
         role="partner",
         profile=profile,
         request=request,
+        response=response,
     )
+
 
 @router.post("/login/public")
 def signup_public(
@@ -618,6 +667,7 @@ def signup_public(
         response=response,
     )
 
+
 @router.post("/login/minimal")
 def signup_minimal(
     p: MinimalSignupIn,
@@ -638,14 +688,21 @@ def signup_minimal(
         u = rec["u"]
         existing_hash = u.get("password_hash")
         if not existing_hash:
-            raise HTTPException(status_code=400, detail="Account exists as SSO-only. Use Sign in with Apple/Google.")
+            raise HTTPException(
+                status_code=400,
+                detail="Account exists as SSO-only. Use Sign in with Apple/Google.",
+            )
         try:
             ph.verify(existing_hash, p.password)
         except VerifyMismatchError:
             raise HTTPException(status_code=401, detail="Invalid credentials")
         # ensure role is at least the requested role
         if u.get("role") != role:
-            s.run("MATCH (u:User {id:$id}) SET u.role=$role", id=u["id"], role=role)
+            s.run(
+                "MATCH (u:User {id:$id}) SET u.role=$role",
+                id=u["id"],
+                role=role,
+            )
             u["role"] = role
         return _issue_tokens_and_build_response_for_user(
             u=u,
