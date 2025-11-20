@@ -171,6 +171,8 @@ def _infer_over18(payload: dict) -> bool:
 
 def _extract_tos_age_fields(payload: dict) -> dict[str, Any]:
     """
+    (Legacy helper; current flows now use /me/account onboarding to finalise legal state.)
+
     Collects TOS + age fields robustly from mixed signup payloads.
     - tos_version: payload.tos_version or DEFAULT_TOS_VERSION
     - tos_accepted_at: now
@@ -379,9 +381,9 @@ def signup_youth(
     email = p.email.lower()
     pwd_hash = ph.hash(p.password)
 
-    tos_bits = _extract_tos_age_fields({"birth_year": p.birth_year})
     uid = str(uuid4())
     yp_id = str(uuid4())
+    birth_year = int(p.birth_year)
 
     try:
         s.run(
@@ -392,10 +394,8 @@ def signup_youth(
               password_hash: $password_hash,
               role: 'youth',
               caps_json: $caps_json,
+              // legal fields are finalised via /me/account onboarding
               legal_onboarding_complete: false,
-              tos_version: $tos_version,
-              tos_accepted_at: $tos_accepted_at,
-              over18_confirmed: $over18_confirmed,
               birth_year: $birth_year,
               created_at: datetime(),
               updated_at: datetime()
@@ -412,9 +412,8 @@ def signup_youth(
                 "email": email,
                 "password_hash": pwd_hash,
                 "caps_json": json.dumps(ROLE_DEFAULT_CAPS["youth"]),
-                "birth_year": int(p.birth_year),
+                "birth_year": birth_year,
                 "yp_id": yp_id,
-                **tos_bits,
             },
         )
     except ConstraintError:
@@ -447,8 +446,6 @@ def signup_creative(
     email = p.email.lower()
     pwd_hash = ph.hash(p.password)
 
-    # For now, legal onboarding is completed via /me/account/legal-accept.
-    tos_bits = _extract_tos_age_fields({"over18_confirmed": True})
     uid = str(uuid4())
     cp_id = str(uuid4())
 
@@ -462,9 +459,6 @@ def signup_creative(
               role: 'creative',
               caps_json: $caps_json,
               legal_onboarding_complete: false,
-              tos_version: $tos_version,
-              tos_accepted_at: $tos_accepted_at,
-              over18_confirmed: $over18_confirmed,
               created_at: datetime(),
               updated_at: datetime()
             })
@@ -485,7 +479,6 @@ def signup_creative(
                 "cp_id": cp_id,
                 "display_name": p.display_name.strip(),
                 "portfolio_url": (p.portfolio_url or "").strip(),
-                **tos_bits,
             },
         )
     except ConstraintError:
@@ -524,7 +517,6 @@ def signup_partner(
     email = p.email.lower()
     pwd_hash = ph.hash(p.password)
 
-    tos_bits = _extract_tos_age_fields({"over18_confirmed": True})
     uid = str(uuid4())
     pp_id = str(uuid4())
 
@@ -540,9 +532,6 @@ def signup_partner(
               role: 'partner',
               caps_json: $caps_json,
               legal_onboarding_complete: false,
-              tos_version: $tos_version,
-              tos_accepted_at: $tos_accepted_at,
-              over18_confirmed: $over18_confirmed,
               created_at: datetime(),
               updated_at: datetime()
             })
@@ -563,7 +552,6 @@ def signup_partner(
                 "pp_id": pp_id,
                 "org_name": p.org_name.strip(),
                 "org_type": org_type or "community",
-                **tos_bits,
             },
         )
     except ConstraintError:
@@ -602,7 +590,6 @@ def signup_public(
     email = p.email.lower()
     pwd_hash = ph.hash(p.password)
 
-    tos_bits = _extract_tos_age_fields({"over18_confirmed": True})
     uid = str(uuid4())
     pub_id = str(uuid4())
 
@@ -618,9 +605,6 @@ def signup_public(
               role: 'public',
               caps_json: $caps_json,
               legal_onboarding_complete: false,
-              tos_version: $tos_version,
-              tos_accepted_at: $tos_accepted_at,
-              over18_confirmed: $over18_confirmed,
               created_at: datetime(),
               updated_at: datetime()
             })
@@ -639,7 +623,6 @@ def signup_public(
                 "caps_json": json.dumps(ROLE_DEFAULT_CAPS["public"]),
                 "pub_id": pub_id,
                 "display_name": display_name,
-                **tos_bits,
             },
         )
     except ConstraintError:
@@ -713,7 +696,6 @@ def signup_minimal(
         )
 
     # Otherwise create a bare-bones user (business flow will attach BusinessProfile via /eco-local/business/init).
-    tos_bits = _extract_tos_age_fields({"over18_confirmed": True})
     uid = str(uuid4())
 
     try:
@@ -726,9 +708,6 @@ def signup_minimal(
               role: $role,
               caps_json: $caps_json,
               legal_onboarding_complete: false,
-              tos_version: $tos_version,
-              tos_accepted_at: $tos_accepted_at,
-              over18_confirmed: $over18_confirmed,
               created_at: datetime(),
               updated_at: datetime()
             })
@@ -739,7 +718,6 @@ def signup_minimal(
                 "password_hash": pwd_hash,
                 "role": role,
                 "caps_json": json.dumps(ROLE_DEFAULT_CAPS[role]),
-                **tos_bits,
             },
         )
     except ConstraintError:

@@ -29,12 +29,19 @@ from .service import (
 router = APIRouter(prefix="/me/account", tags=["account"])
 log = logging.getLogger("account.avatar")
 
+ALLOWED_ROLES: set[str] = {"youth", "business", "creative", "partner", "public"}
+
 # ==================== Schemas ====================
+
+
 class MeAccount(BaseModel):
     id: str
     email: EmailStr
     display_name: str | None = None
+
+    # Primary routing / experience role
     role: str = Field(default="public")
+
     email_verified: bool = False
     avatar_url: Optional[str] = None  # absolute via abs_media
 
@@ -48,7 +55,6 @@ class MeAccount(BaseModel):
     privacy_accepted_at: str | None = None
     over18_confirmed: bool | None = None
     birth_year: int | None = None
-
 
 
 class DisplayNameIn(BaseModel):
@@ -109,7 +115,17 @@ class LegalAcceptOut(BaseModel):
     legal_onboarding_complete: bool = True
 
 
+class CompleteOnboardingIn(LegalAcceptIn):
+    """
+    Used by the new /account setup flow to atomically:
+    - set / confirm legal flags
+    - set primary role
+    """
+    role: str
+
+
 # ==================== Upload helpers ====================
+
 _AVATAR_MAX_MB = float(os.getenv("AVATAR_MAX_MB", "15"))
 _AVATAR_MAX_BYTES = int(_AVATAR_MAX_MB * 1024 * 1024)
 
@@ -187,15 +203,82 @@ def _guess_ext_from_ct_or_name(content_type: Optional[str], filename: Optional[s
     return ".jpg"
 
 
+# ==================== Internal helpers ====================
+
+
+def _persist_legal(
+    s: Session,
+    uid: str,
+    p: LegalAcceptIn,
+    *,
+    role: Optional[str] = None,
+) -> None:
+    """Core logic to set legal flags and optionally a primary role."""
+
+    if not (p.agreed_tos and p.agreed_privacy):
+        raise HTTPException(
+            status_code=400,
+            detail="You must agree to Terms and Privacy Policy.",
+        )
+
+    now = dt.datetime.now(dt.timezone.utc)
+    now_iso = now.isoformat()
+    current_year = now.year
+
+    tos_version = (p.tos_version or os.getenv("DEFAULT_TOS_VERSION", "v1")).strip() or "v1"
+
+    # determine adulthood (either explicit is_adult OR infer from birth_year)
+    over18: bool | None = None
+    if p.is_adult is not None:
+        over18 = bool(p.is_adult)
+    elif p.birth_year is not None and 1900 <= p.birth_year <= current_year:
+        over18 = (current_year - int(p.birth_year)) >= 18
+
+    if p.birth_year is not None and not (1900 <= p.birth_year <= current_year):
+        raise HTTPException(status_code=400, detail="Invalid birth year.")
+
+    params: dict = {
+        "uid": uid,
+        "tos_version": tos_version,
+        "now_iso": now_iso,
+        "over18": over18,
+        "birth_year": int(p.birth_year) if p.birth_year is not None else None,
+    }
+
+    cypher = """
+        MATCH (u:User {id:$uid})
+        SET u.tos_version = $tos_version,
+            u.tos_accepted_at = $now_iso,
+            u.privacy_accepted_at = $now_iso,
+            u.over18_confirmed = coalesce($over18, u.over18_confirmed),
+            u.birth_year = coalesce($birth_year, u.birth_year),
+            u.legal_onboarding_complete = true,
+            u.updated_at = datetime()
+    """
+
+    if role is not None:
+        cypher += ", u.role = $role"
+        params["role"] = role
+
+    s.run(cypher, **params)
+
+
 # ==================== Routes ====================
 
 
 @router.get("", response_model=MeAccount)
-def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
+def r_get_me_account(
+    uid: str = Depends(current_user_id),
+    s: Session = Depends(session_dep),
+):
     acc = get_me_account(s, uid)
     if not acc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
     acc["avatar_url"] = abs_media(acc.get("avatar_url"))
+
+    # ensure role always has a sensible default
+    acc.setdefault("role", "public")
 
     # surface legal flags (safe defaults)
     acc.setdefault(
@@ -212,7 +295,10 @@ def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(s
 
 
 @router.get("/legal-status", response_model=LegalStatusOut)
-def r_get_legal_status(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
+def r_get_legal_status(
+    uid: str = Depends(current_user_id),
+    s: Session = Depends(session_dep),
+):
     row = s.run(
         """
         MATCH (u:User {id:$uid})
@@ -244,42 +330,33 @@ def r_post_legal_accept(
     uid: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
-    if not (p.agreed_tos and p.agreed_privacy):
-        raise HTTPException(
-            status_code=400,
-            detail="You must agree to Terms and Privacy Policy.",
-        )
+    """
+    Legacy / existing route – just accepts legal flags.
+    The new unified onboarding flow will usually use /complete-onboarding instead.
+    """
+    _persist_legal(s, uid, p, role=None)
+    return LegalAcceptOut(ok=True, legal_onboarding_complete=True)
 
-    # accept timestamps and version
-    now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
-    tos_version = (p.tos_version or os.getenv("DEFAULT_TOS_VERSION", "v1")).strip() or "v1"
 
-    # determine adulthood (either explicit is_adult OR infer from birth_year)
-    over18: bool | None = None
-    if p.is_adult is not None:
-        over18 = bool(p.is_adult)
-    elif p.birth_year is not None and 1900 <= p.birth_year <= dt.datetime.now().year:
-        over18 = (dt.datetime.now().year - int(p.birth_year)) >= 18
+@router.post("/complete-onboarding", response_model=LegalAcceptOut)
+def r_post_complete_onboarding(
+    p: CompleteOnboardingIn,
+    uid: str = Depends(current_user_id),
+    s: Session = Depends(session_dep),
+):
+    """
+    New unified endpoint for the /account first-time card.
 
-    # persist
-    s.run(
-        """
-        MATCH (u:User {id:$uid})
-        SET u.tos_version = $tos_version,
-            u.tos_accepted_at = $now_iso,
-            u.privacy_accepted_at = $now_iso,
-            u.over18_confirmed = coalesce($over18, u.over18_confirmed),
-            u.birth_year = coalesce($birth_year, u.birth_year),
-            u.legal_onboarding_complete = true,
-            u.updated_at = datetime()
-        """,
-        uid=uid,
-        tos_version=tos_version,
-        now_iso=now_iso,
-        over18=over18,
-        birth_year=(int(p.birth_year) if p.birth_year else None),
-    )
+    Does, in one go:
+    - validates role against ALLOWED_ROLES
+    - sets role on the User node
+    - sets legal flags, timestamps, and legal_onboarding_complete
+    """
+    role = (p.role or "").strip().lower()
+    if role not in ALLOWED_ROLES:
+        raise HTTPException(status_code=400, detail="Invalid role.")
 
+    _persist_legal(s, uid, p, role=role)
     return LegalAcceptOut(ok=True, legal_onboarding_complete=True)
 
 
@@ -304,7 +381,10 @@ def r_change_email(
 
 
 @router.post("/send-verify-email", response_model=VerifyEmailOut)
-def r_send_verify_email(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
+def r_send_verify_email(
+    uid: str = Depends(current_user_id),
+    s: Session = Depends(session_dep),
+):
     sent = trigger_verify_email(s, uid)
     return VerifyEmailOut(sent=sent)
 
@@ -320,12 +400,17 @@ def r_change_password(
 
 
 @router.post("/send-password-reset", response_model=PasswordResetOut)
-def r_send_password_reset(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
+def r_send_password_reset(
+    uid: str = Depends(current_user_id),
+    s: Session = Depends(session_dep),
+):
     sent = trigger_password_reset(s, uid)
     return PasswordResetOut(sent=sent)
 
 
 # -------- Avatar upload/remove (HEIC-safe, tolerant, lazy Pillow) --------
+
+
 @router.post("/avatar", response_model=AvatarOut)
 def r_upload_avatar(
     f: UploadFile = File(...),
