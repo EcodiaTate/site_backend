@@ -16,18 +16,21 @@ from argon2.exceptions import VerifyMismatchError
 
 from PIL import Image, ImageOps
 
+import boto3
+import botocore.exceptions
+
 from site_backend.core.paths import UPLOAD_ROOT  # must resolve to .../uploads
 
 # =========================================================
 # Config
 # =========================================================
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://ecodia.au").rstrip("/")
+PUBLIC_BASE_URL = os.getenv("ECODIA_PUBLIC_URL", "https://ecodia.au").rstrip("/")
 VERIFY_EMAIL_PATH = os.getenv("VERIFY_EMAIL_PATH", "/auth/verify-email")
 RESET_PASSWORD_PATH = os.getenv("RESET_PASSWORD_PATH", "/auth/reset-password")
 
 # Avatar storage policy
-AVATAR_MAX_DIM       = int(os.getenv("AVATAR_MAX_DIM", "1024"))     # px
-AVATAR_WEBP_QUALITY  = int(os.getenv("AVATAR_WEBP_QUALITY", "92"))
+AVATAR_MAX_DIM = int(os.getenv("AVATAR_MAX_DIM", "1024"))  # px
+AVATAR_WEBP_QUALITY = int(os.getenv("AVATAR_WEBP_QUALITY", "92"))
 AVATAR_RETENTION_DAYS = int(os.getenv("AVATAR_RETENTION_DAYS", "14"))
 
 # Paths
@@ -37,20 +40,56 @@ AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 # Security
 ph = PasswordHasher()
 
+# Email (SES)
+SES_REGION = os.getenv("SES_REGION", "ap-southeast-2")
+# Default to connect@ecodia.au as requested – must be a verified identity in SES
+SES_FROM = os.getenv("SES_FROM", "connect@ecodia.au")
+
+# Create SES client (will use IAM role or AWS_* envs / shared config)
+_ses_client = boto3.client("ses", region_name=SES_REGION)
+
 
 # =========================================================
 # Utilities
 # =========================================================
 
+
 def _now_s() -> int:
     return int(time.time())
 
+
 def _send_email(to_email: str, subject: str, body: str) -> bool:
-    try:
-        print(f"[MAIL] To: {to_email}\nSubj: {subject}\n\n{body}\n")
-        return True
-    except Exception:
+    """
+    Send a plain-text email via AWS SES.
+
+    Returns True on success, False on failure (callers may raise HTTPException).
+    """
+    to_email = (to_email or "").strip()
+    if not to_email:
+        print("[MAIL][SES] No destination email provided; skipping send.")
         return False
+
+    try:
+        print(f"[MAIL][SES] Sending email to={to_email!r} from={SES_FROM!r} subj={subject!r}")
+        _ses_client.send_email(
+            Source=SES_FROM,
+            Destination={"ToAddresses": [to_email]},
+            Message={
+                "Subject": {"Data": subject, "Charset": "UTF-8"},
+                "Body": {
+                    "Text": {"Data": body, "Charset": "UTF-8"},
+                },
+            },
+        )
+        return True
+    except botocore.exceptions.ClientError as e:
+        # Common issues: SES sandbox, unverified sender/recipient, permissions
+        print(f"[MAIL][SES][ERROR] ClientError sending to {to_email}: {e}")
+        return False
+    except Exception as e:
+        print(f"[MAIL][SES][ERROR] Unexpected error sending to {to_email}: {e}")
+        return False
+
 
 def _normalize_avatar(img: Image.Image) -> Image.Image:
     """Square center-crop, EXIF transpose, RGB, clamp to AVATAR_MAX_DIM."""
@@ -66,30 +105,36 @@ def _normalize_avatar(img: Image.Image) -> Image.Image:
     w, h = img.size
     side = min(w, h)
     left = max(0, (w - side) // 2)
-    top  = max(0, (h - side) // 2)
+    top = max(0, (h - side) // 2)
     img = img.crop((left, top, left + side, top + side))
 
     if side > AVATAR_MAX_DIM:
         img = img.resize((AVATAR_MAX_DIM, AVATAR_MAX_DIM), Image.LANCZOS)
     return img
 
+
 def _encode_webp_bytes(img: Image.Image) -> bytes:
     out = io.BytesIO()
     img.save(out, format="WEBP", method=6, quality=AVATAR_WEBP_QUALITY)
     return out.getvalue()
 
+
 def _sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
+
 
 def _avatar_rel_path(sha: str) -> str:
     # /uploads/avatars/aa/bb/<sha>.webp
     return f"/uploads/avatars/{sha[:2]}/{sha[2:4]}/{sha}.webp"
 
+
 def _avatar_fs_path(sha: str) -> Path:
     return AVATAR_DIR / sha[:2] / sha[2:4] / f"{sha}.webp"
 
+
 def _ensure_parent(p: Path) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
+
 
 def _parse_sha_from_url(url: Optional[str]) -> Optional[str]:
     if not url:
@@ -103,6 +148,13 @@ def _parse_sha_from_url(url: Optional[str]) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+# =========================================================
+# Account Reads
+# =========================================================
+
+
 def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
     cy = """
     MATCH (u:User {id:$uid})
@@ -134,14 +186,12 @@ def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
         "role": rec["role"],
         "email_verified": bool(rec["email_verified"]),
         "avatar_url": rec["avatar_url"],
-
         "legal_onboarding_complete": bool(rec["legal_onboarding_complete"]),
         "tos_version": rec["tos_version"],
         "tos_accepted_at": rec["tos_accepted_at"],
         "privacy_accepted_at": rec["privacy_accepted_at"],
         "over18_confirmed": rec["over18_confirmed"],
         "birth_year": rec["birth_year"],
-
         "has_password": bool(rec["has_password"]),
     }
 
@@ -168,6 +218,7 @@ def get_public_profile(s: Session, uid: str) -> Optional[Dict[str, Any]]:
 # Account Mutations (email/name/password)
 # =========================================================
 
+
 def update_display_name(s: Session, uid: str, display_name: str) -> None:
     if not display_name:
         raise HTTPException(status_code=400, detail="Display name required")
@@ -179,6 +230,7 @@ def update_display_name(s: Session, uid: str, display_name: str) -> None:
     """
     if not s.run(cy, uid=uid, display_name=display_name).single():
         raise HTTPException(status_code=404, detail="User not found")
+
 
 def begin_change_email(s: Session, uid: str, new_email: str) -> None:
     new_email_l = new_email.lower().strip()
@@ -214,6 +266,7 @@ def begin_change_email(s: Session, uid: str, new_email: str) -> None:
     if not _send_email(new_email_l, subj, body):
         raise HTTPException(status_code=500, detail="Could not send verification email")
 
+
 def trigger_verify_email(s: Session, uid: str) -> bool:
     row = s.run(
         "MATCH (u:User {id:$uid}) "
@@ -237,16 +290,25 @@ def trigger_verify_email(s: Session, uid: str) -> bool:
         "    u.email_verify_expires = $exp, "
         "    u.email_verified = false, "
         "    u.updated_at = datetime()",
-        uid=uid, token=token, exp=exp,
+        uid=uid,
+        token=token,
+        exp=exp,
     )
 
     link = f"{PUBLIC_BASE_URL}{VERIFY_EMAIL_PATH}?token={token}"
     subj = "Verify your Ecodia email"
-    body = f"Hi!\n\nPlease verify your email for Ecodia by clicking the link below:\n\n{link}\n\nThis link expires in 24 hours."
+    body = (
+        "Hi!\n\nPlease verify your email for Ecodia by clicking the link below:\n\n"
+        f"{link}\n\nThis link expires in 24 hours."
+    )
     return _send_email(dest, subj, body)
 
+
 def change_password(s: Session, uid: str, current_password: str, new_password: str) -> None:
-    rec = s.run("MATCH (u:User {id:$uid}) RETURN u.password_hash AS hash", uid=uid).single()
+    rec = s.run(
+        "MATCH (u:User {id:$uid}) RETURN u.password_hash AS hash",
+        uid=uid,
+    ).single()
     if not rec:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -257,17 +319,25 @@ def change_password(s: Session, uid: str, current_password: str, new_password: s
         except VerifyMismatchError:
             raise HTTPException(status_code=401, detail="Current password is incorrect")
     elif current_password:
-        raise HTTPException(status_code=400, detail="Password change not allowed for SSO-only account")
+        raise HTTPException(
+            status_code=400,
+            detail="Password change not allowed for SSO-only account",
+        )
 
     new_hash = ph.hash(new_password)
     s.run(
         "MATCH (u:User {id:$uid}) "
         "SET u.password_hash = $hash, u.updated_at = datetime()",
-        uid=uid, hash=new_hash,
+        uid=uid,
+        hash=new_hash,
     )
 
+
 def trigger_password_reset(s: Session, uid: str) -> bool:
-    rec = s.run("MATCH (u:User {id:$uid}) RETURN toLower(coalesce(u.email,'')) AS email", uid=uid).single()
+    rec = s.run(
+        "MATCH (u:User {id:$uid}) RETURN toLower(coalesce(u.email,'')) AS email",
+        uid=uid,
+    ).single()
     if not rec:
         raise HTTPException(status_code=404, detail="User not found")
 
@@ -281,15 +351,17 @@ def trigger_password_reset(s: Session, uid: str) -> bool:
     s.run(
         "MATCH (u:User {id:$uid}) "
         "SET u.reset_token = $token, u.reset_expires = $exp, u.updated_at = datetime()",
-        uid=uid, token=token, exp=exp,
+        uid=uid,
+        token=token,
+        exp=exp,
     )
 
     link = f"{PUBLIC_BASE_URL}{RESET_PASSWORD_PATH}?token={token}"
     subj = "Reset your Ecodia password"
     body = (
-        f"We received a request to reset your Ecodia password.\n\n"
+        "We received a request to reset your Ecodia password.\n\n"
         f"Reset it here:\n{link}\n\n"
-        f"This link expires in 2 hours. If you didn’t request this, you can ignore this email."
+        "This link expires in 2 hours. If you didn’t request this, you can ignore this email."
     )
     return _send_email(email, subj, body)
 
@@ -297,6 +369,7 @@ def trigger_password_reset(s: Session, uid: str) -> bool:
 # =========================================================
 # Avatar: Content-Addressed Storage + Refcounts + GC
 # =========================================================
+
 
 def _upsert_blob_inc_ref(s: Session, sha: str, size_bytes: int) -> None:
     s.run(
@@ -312,8 +385,10 @@ def _upsert_blob_inc_ref(s: Session, sha: str, size_bytes: int) -> None:
                      b.last_ref_at = datetime(),
                      b.purge_at = null
         """,
-        sha=sha, bytes=size_bytes,
+        sha=sha,
+        bytes=size_bytes,
     )
+
 
 def _dec_ref_and_maybe_schedule_purge(s: Session, sha: str) -> None:
     s.run(
@@ -325,8 +400,10 @@ def _dec_ref_and_maybe_schedule_purge(s: Session, sha: str) -> None:
         SET b.refcount = 0,
             b.purge_at = datetime() + duration({days:$days})
         """,
-        sha=sha, days=AVATAR_RETENTION_DAYS,
+        sha=sha,
+        days=AVATAR_RETENTION_DAYS,
     )
+
 
 def _store_blob_if_absent(sha: str, data: bytes) -> None:
     p = _avatar_fs_path(sha)
@@ -334,6 +411,7 @@ def _store_blob_if_absent(sha: str, data: bytes) -> None:
         _ensure_parent(p)
         with open(p, "wb") as f:
             f.write(data)
+
 
 def _delete_blob_file(sha: str) -> None:
     p = _avatar_fs_path(sha)
@@ -347,11 +425,18 @@ def _delete_blob_file(sha: str) -> None:
     except FileNotFoundError:
         pass
 
+
 def _build_avatar_url(sha: str, rev: str) -> str:
     rel = _avatar_rel_path(sha)
     return f"{rel}?v={rev}"
 
-def set_user_avatar_from_bytes(s: Session, user_id: str, file_bytes: bytes, ext_hint: str = ".jpg") -> str:
+
+def set_user_avatar_from_bytes(
+    s: Session,
+    user_id: str,
+    file_bytes: bytes,
+    ext_hint: str = ".jpg",
+) -> str:
     """
     Process, content-hash, store if new, track refcounts, update user with cache-busting avatar_url.
     Returns the (relative) avatar_url with ?v=rev.
@@ -368,8 +453,10 @@ def set_user_avatar_from_bytes(s: Session, user_id: str, file_bytes: bytes, ext_
 
     _store_blob_if_absent(sha, data)
 
-    row = s.run("MATCH (u:User {id:$uid}) RETURN coalesce(u.avatar_sha, NULL) AS old_sha",
-                uid=user_id).single()
+    row = s.run(
+        "MATCH (u:User {id:$uid}) RETURN coalesce(u.avatar_sha, NULL) AS old_sha",
+        uid=user_id,
+    ).single()
     old_sha = row["old_sha"] if row else None
 
     _upsert_blob_inc_ref(s, sha, size)
@@ -388,12 +475,19 @@ def set_user_avatar_from_bytes(s: Session, user_id: str, file_bytes: bytes, ext_
             u.avatar_updated_at = timestamp(),
             u.updated_at = datetime()
         """,
-        uid=user_id, sha=sha, url=avatar_url_rel, rev=rev,
+        uid=user_id,
+        sha=sha,
+        url=avatar_url_rel,
+        rev=rev,
     )
     return avatar_url_rel
 
+
 def clear_user_avatar(s: Session, user_id: str) -> None:
-    row = s.run("MATCH (u:User {id:$uid}) RETURN coalesce(u.avatar_sha,NULL) AS sha", uid=user_id).single()
+    row = s.run(
+        "MATCH (u:User {id:$uid}) RETURN coalesce(u.avatar_sha,NULL) AS sha",
+        uid=user_id,
+    ).single()
     old_sha = row["sha"] if row else None
 
     s.run(
@@ -405,11 +499,13 @@ def clear_user_avatar(s: Session, user_id: str) -> None:
             u.avatar_updated_at = timestamp(),
             u.updated_at = datetime()
         """,
-        uid=user_id, rev=str(int(time.time())),
+        uid=user_id,
+        rev=str(int(time.time())),
     )
 
     if old_sha:
         _dec_ref_and_maybe_schedule_purge(s, old_sha)
+
 
 def gc_avatar_blobs(s: Session) -> int:
     rows = s.run(
@@ -428,6 +524,7 @@ def gc_avatar_blobs(s: Session) -> int:
         count += 1
     return count
 
+
 def backfill_user_avatar_sha(s: Session, user_id: str) -> None:
     row = s.run(
         "MATCH (u:User {id:$uid}) "
@@ -445,6 +542,9 @@ def backfill_user_avatar_sha(s: Session, user_id: str) -> None:
     size = p.stat().st_size if p.exists() else 0
     _upsert_blob_inc_ref(s, sha, size)
     s.run(
-        "MATCH (u:User {id:$uid}) SET u.avatar_sha = $sha, u.avatar_rev = coalesce(u.avatar_rev, substring($sha,0,8))",
-        uid=user_id, sha=sha,
+        "MATCH (u:User {id:$uid}) "
+        "SET u.avatar_sha = $sha, "
+        "    u.avatar_rev = coalesce(u.avatar_rev, substring($sha,0,8))",
+        uid=user_id,
+        sha=sha,
     )
