@@ -24,7 +24,6 @@ from site_backend.core.cookies import (
 
 router = APIRouter(tags=["auth"])
 
-
 ACCESS_JWT_SECRET = os.getenv("ACCESS_JWT_SECRET", os.getenv("JWT_SECRET", "dev-secret-change-me"))
 ACCESS_JWT_ALGO = os.getenv("ACCESS_JWT_ALGO", "HS256")
 ACCESS_JWT_TTL_S = int(os.getenv("ACCESS_JWT_TTL_S", "900"))
@@ -37,235 +36,241 @@ REFRESH_TTL_DAYS = int(os.getenv("REFRESH_TTL_DAYS", "90"))
 
 
 def _now_s() -> int:
-  return int(time.time())
+    return int(time.time())
 
 
 def _mint_access(uid: str, email: str | None = None) -> tuple[str, int]:
-  now = _now_s()
-  exp = now + ACCESS_JWT_TTL_S
-  payload: dict[str, Any] = {"sub": uid, "iat": now, "exp": exp}
-  if email:
-      payload["email"] = email
-  if ACCESS_JWT_ISS:
-      payload["iss"] = ACCESS_JWT_ISS
-  if ACCESS_JWT_AUD:
-      payload["aud"] = ACCESS_JWT_AUD
-  return jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO), exp
+    now = _now_s()
+    exp = now + ACCESS_JWT_TTL_S
+    payload: dict[str, Any] = {"sub": uid, "iat": now, "exp": exp}
+    if email:
+        payload["email"] = email
+    if ACCESS_JWT_ISS:
+        payload["iss"] = ACCESS_JWT_ISS
+    if ACCESS_JWT_AUD:
+        payload["aud"] = ACCESS_JWT_AUD
+    return jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO), exp
 
 
 def _mint_refresh(uid: str) -> str:
-  now = _now_s()
-  exp = now + REFRESH_TTL_DAYS * 24 * 3600
-  payload = {"sub": uid, "iat": now, "exp": exp, "typ": "refresh"}
-  return jwt.encode(payload, REFRESH_JWT_SECRET, algorithm=REFRESH_JWT_ALGO)
+    now = _now_s()
+    exp = now + REFRESH_TTL_DAYS * 24 * 3600
+    payload = {"sub": uid, "iat": now, "exp": exp, "typ": "refresh"}
+    return jwt.encode(payload, REFRESH_JWT_SECRET, algorithm=REFRESH_JWT_ALGO)
 
 
 def _mint_admin_token(email: str) -> str:
-  now = _now_s()
-  exp = now + 60 * 60 * 12
-  payload = {"sub": email, "scope": "admin", "iat": now, "exp": exp, "aud": "admin"}
-  return jwt.encode(payload, ADMIN_JWT_SECRET, algorithm=ADMIN_JWT_ALGO)
+    now = _now_s()
+    exp = now + 60 * 60 * 12
+    payload = {"sub": email, "scope": "admin", "iat": now, "exp": exp, "aud": "admin"}
+    return jwt.encode(payload, ADMIN_JWT_SECRET, algorithm=ADMIN_JWT_ALGO)
 
 
 class SsoLoginIn(BaseModel):
-  email: EmailStr
+    email: EmailStr
 
 
 ROLE_DEFAULT_CAPS: dict[str, dict[str, int]] = {
-  "youth": {"max_redemptions_per_week": 5},
-  "business": {"max_active_offers": 3},
-  "creative": {"max_active_collabs": 3},
-  "partner": {"max_workspaces": 2},
-  "public": {},
+    "youth": {"max_redemptions_per_week": 5},
+    "business": {"max_active_offers": 3},
+    "creative": {"max_active_collabs": 3},
+    "partner": {"max_workspaces": 2},
+    "public": {},
 }
 
 
 def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
-  try:
-      caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
-  except Exception:
-      caps = {}
-  if not caps:
-      caps = ROLE_DEFAULT_CAPS.get(role, {})
-  return caps
+    try:
+        caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
+    except Exception:
+        caps = {}
+    if not caps:
+        caps = ROLE_DEFAULT_CAPS.get(role, {})
+    return caps
 
 
 def _email_local(email: str | None) -> str:
-  return (email or "").split("@")[0] if email else ""
+    return (email or "").split("@")[0] if email else ""
 
 
 def _compute_display_name(u: dict) -> str:
-  # Prefer saved display_name; else given/family; else any name; else email local; else "friend"
-  dn = (u.get("display_name") or u.get("name") or "").strip()
-  if not dn:
-      gn = (u.get("given_name") or "").strip()
-      fn = (u.get("family_name") or "").strip()
-      dn = f"{gn} {fn}".strip()
-  if not dn:
-      dn = _email_local(u.get("email")) or "friend"
-  return dn
+    # Prefer saved display_name; else given/family; else any name; else email local; else "friend"
+    dn = (u.get("display_name") or u.get("name") or "").strip()
+    if not dn:
+        gn = (u.get("given_name") or "").strip()
+        fn = (u.get("family_name") or "").strip()
+        dn = f"{gn} {fn}".strip()
+    if not dn:
+        dn = _email_local(u.get("email")) or "friend"
+    return dn
 
 
 def _compute_initials(display_name: str) -> str:
-  parts = [p for p in display_name.strip().split() if p]
-  if not parts:
-      return ""
-  if len(parts) == 1:
-      return parts[0][:2].upper()
-  return (parts[0][0] + parts[-1][0]).upper()
+    parts = [p for p in display_name.strip().split() if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
 
 
 def _determine_role(rec: dict, email: str, current_role: str) -> str:
-  # precedence: admin → business → youth → creative → partner → public
-  has_bp = bool(rec.get("has_bp"))
-  has_yp = bool(rec.get("has_yp"))
-  has_cp = bool(rec.get("has_cp"))
-  has_pp = bool(rec.get("has_pp"))
+    # precedence: admin → business → youth → creative → partner → public
+    has_bp = bool(rec.get("has_bp"))
+    has_yp = bool(rec.get("has_yp"))
+    has_cp = bool(rec.get("has_cp"))
+    has_pp = bool(rec.get("has_pp"))
 
-  if ADMIN_EMAIL and email == ADMIN_EMAIL.lower():
-      return "admin"
-  if has_bp:
-      return "business"
-  if has_yp:
-      return "youth"
-  if has_cp:
-      return "creative"
-  if has_pp:
-      return "partner"
-  return current_role or "public"
+    if ADMIN_EMAIL and email == ADMIN_EMAIL.lower():
+        return "admin"
+    if has_bp:
+        return "business"
+    if has_yp:
+        return "youth"
+    if has_cp:
+        return "creative"
+    if has_pp:
+        return "partner"
+    return current_role or "public"
 
 
 def _issue_tokens_and_build_response(
-  u: dict,
-  role: str,
-  caps: dict[str, Any],
-  request: Request,
-  response: Response,
+    u: dict,
+    role: str,
+    caps: dict[str, Any],
+    request: Request,
+    response: Response,
 ) -> dict[str, Any]:
-  access, exp = _mint_access(u["id"], u.get("email"))
-  refresh = _mint_refresh(u["id"])
-  set_scoped_cookie(
-      response,
-      name=REFRESH_COOKIE_NAME,
-      value=refresh,
-      max_age=REFRESH_TTL_DAYS * 24 * 3600,
-      request=request,
-  )
-  set_scoped_cookie(
-      response,
-      name=ACCESS_COOKIE_NAME,
-      value=access,
-      max_age=ACCESS_JWT_TTL_S,
-      request=request,
-  )
+    """
+    Shared response for SSO bridge.
 
-  display_name = _compute_display_name(u)
-  initials = _compute_initials(display_name)
-  avatar_url = u.get("avatar_url")  # /me/account can abs_media() this later
+    NOTE: This is now used as a *generic* "bridge" from NextAuth -> backend cookies
+    (called from /auth/after in the frontend) for both:
+      - SSO accounts
+      - Credential accounts (email/password), keyed by email
+    """
+    access, exp = _mint_access(u["id"], u.get("email"))
+    refresh = _mint_refresh(u["id"])
+    set_scoped_cookie(
+        response,
+        name=REFRESH_COOKIE_NAME,
+        value=refresh,
+        max_age=REFRESH_TTL_DAYS * 24 * 3600,
+        request=request,
+    )
+    set_scoped_cookie(
+        response,
+        name=ACCESS_COOKIE_NAME,
+        value=access,
+        max_age=ACCESS_JWT_TTL_S,
+        request=request,
+    )
 
-  legal_complete = bool(u.get("legal_onboarding_complete") or False)
+    display_name = _compute_display_name(u)
+    initials = _compute_initials(display_name)
+    avatar_url = u.get("avatar_url")  # /me/account can abs_media() this later
 
-  out: dict[str, Any] = {
-      "id": u["id"],
-      "email": u["email"],
-      "role": role,
-      "caps": caps,
-      "profile": {
-          "display_name": display_name,
-          "given_name": (u.get("given_name") or "").strip(),
-          "family_name": (u.get("family_name") or "").strip(),
-          "nickname": (u.get("nickname") or "").strip(),
-          "avatar_url": avatar_url or "",
-          "initials": initials,
-      },
-      "user_token": u["id"],
-      "token": access,
-      "exp": exp,
-      # Legal flags mirrored for compatibility, but canonical gate is now /me/account
-      "legal_onboarding_complete": legal_complete,
-      "needs_legal": (not legal_complete),
-      "tos_version": u.get("tos_version"),
-      "tos_accepted_at": u.get("tos_accepted_at"),
-      "privacy_accepted_at": u.get("privacy_accepted_at"),
-      "over18_confirmed": u.get("over18_confirmed"),
-      "birth_year": u.get("birth_year"),
-  }
-  if ADMIN_EMAIL and (u.get("email", "").lower() == ADMIN_EMAIL.lower()):
-      out["admin_token"] = _mint_admin_token(u["email"])
-  return out
+    legal_complete = bool(u.get("legal_onboarding_complete") or False)
+
+    out: dict[str, Any] = {
+        "id": u["id"],
+        "email": u["email"],
+        "role": role,
+        "caps": caps,
+        "profile": {
+            "display_name": display_name,
+            "given_name": (u.get("given_name") or "").strip(),
+            "family_name": (u.get("family_name") or "").strip(),
+            "nickname": (u.get("nickname") or "").strip(),
+            "avatar_url": avatar_url or "",
+            "initials": initials,
+        },
+        "user_token": u["id"],
+        "token": access,
+        "exp": exp,
+        # Legal flags mirrored for compatibility, but canonical gate is now /me/account
+        "legal_onboarding_complete": legal_complete,
+        "needs_legal": (not legal_complete),
+        "tos_version": u.get("tos_version"),
+        "tos_accepted_at": u.get("tos_accepted_at"),
+        "privacy_accepted_at": u.get("privacy_accepted_at"),
+        "over18_confirmed": u.get("over18_confirmed"),
+        "birth_year": u.get("birth_year"),
+    }
+    if ADMIN_EMAIL and (u.get("email", "").lower() == ADMIN_EMAIL.lower()):
+        out["admin_token"] = _mint_admin_token(u["email"])
+    return out
 
 
 def _upsert_and_login(email: str, request: Request, response: Response, s: Session) -> dict[str, Any]:
-  """
-  Upsert a User node by email (SSO identity), then derive role from attached profiles.
+    """
+    Upsert a User node by email (SSO identity *or* credential user),
+    then derive role from attached profiles.
 
-  NOTE:
-  - New SSO users are created with legal_onboarding_complete = false.
-  - The /me/account onboarding flow is responsible for setting TOS + legal flags.
-  """
-  rec = s.run(
-      """
-      MERGE (u:User {email:$email})
-        ON CREATE SET
-          u.id = coalesce(u.id, randomUUID()),
-          u.role = coalesce(u.role, "public"),
-          u.legal_onboarding_complete = false,
-          u.created_at = datetime(),
-          u.updated_at = datetime()
-      WITH u
-      OPTIONAL MATCH (u)-[:HAS_PROFILE]->(yp:YouthProfile)
-      OPTIONAL MATCH (u)-[:HAS_PROFILE]->(cp:CreativeProfile)
-      OPTIONAL MATCH (u)-[:HAS_PROFILE]->(pp:PartnerProfile)
-      OPTIONAL MATCH (u)-[:HAS_PROFILE]->(bp:BusinessProfile)
-      OPTIONAL MATCH (u)-[:OWNS|MANAGES]->(bOwned:BusinessProfile)
-      RETURN u,
-             yp IS NOT NULL AS has_yp,
-             cp IS NOT NULL AS has_cp,
-             pp IS NOT NULL AS has_pp,
-             (bp IS NOT NULL OR bOwned IS NOT NULL) AS has_bp
-      """,
-      email=email,
-  ).single()
+    - New users: legal_onboarding_complete = false
+    - /account handles role selection + legal onboarding
+    """
+    rec = s.run(
+        """
+        MERGE (u:User {email:$email})
+          ON CREATE SET
+            u.id = coalesce(u.id, randomUUID()),
+            u.role = coalesce(u.role, "public"),
+            u.legal_onboarding_complete = false,
+            u.created_at = datetime(),
+            u.updated_at = datetime()
+        WITH u
+        OPTIONAL MATCH (u)-[:HAS_PROFILE]->(yp:YouthProfile)
+        OPTIONAL MATCH (u)-[:HAS_PROFILE]->(cp:CreativeProfile)
+        OPTIONAL MATCH (u)-[:HAS_PROFILE]->(pp:PartnerProfile)
+        OPTIONAL MATCH (u)-[:HAS_PROFILE]->(bp:BusinessProfile)
+        OPTIONAL MATCH (u)-[:OWNS|MANAGES]->(bOwned:BusinessProfile)
+        RETURN u,
+               yp IS NOT NULL AS has_yp,
+               cp IS NOT NULL AS has_cp,
+               pp IS NOT NULL AS has_pp,
+               (bp IS NOT NULL OR bOwned IS NOT NULL) AS has_bp
+        """,
+        email=email,
+    ).single()
 
-  if not rec or not rec.get("u"):
-      # Shouldn't happen, but be explicit.
-      raise HTTPException(status_code=500, detail="SSO upsert failed")
+    if not rec or not rec.get("u"):
+        raise HTTPException(status_code=500, detail="SSO upsert failed")
 
-  u = rec["u"]
-  current_role = (u.get("role") or "public").lower()
-  final_role = _determine_role(rec, email, current_role)
+    u = rec["u"]
+    current_role = (u.get("role") or "public").lower()
+    final_role = _determine_role(rec, email, current_role)
 
-  if final_role != current_role:
-      s.run(
-          "MATCH (u:User {id:$id}) SET u.role=$role, u.updated_at = datetime()",
-          id=u["id"],
-          role=final_role,
-      )
-      u["role"] = final_role
+    if final_role != current_role:
+        s.run(
+            "MATCH (u:User {id:$id}) SET u.role=$role, u.updated_at = datetime()",
+            id=u["id"],
+            role=final_role,
+        )
+        u["role"] = final_role
 
-  caps = _safe_caps(u.get("caps_json") or "{}", final_role)
-  return _issue_tokens_and_build_response(u, final_role, caps, request, response)
+    caps = _safe_caps(u.get("caps_json") or "{}", final_role)
+    return _issue_tokens_and_build_response(u, final_role, caps, request, response)
 
 
 @router.post("/sso-login")
 def sso_login(
-  p: SsoLoginIn,
-  request: Request,
-  response: Response,
-  s: Session = Depends(session_dep),
+    p: SsoLoginIn,
+    request: Request,
+    response: Response,
+    s: Session = Depends(session_dep),
 ):
-  email = p.email.lower()
-  # Upsert + login (always 200 on success)
-  return _upsert_and_login(email, request, response, s)
+    email = p.email.lower()
+    return _upsert_and_login(email, request, response, s)
 
 
-# Optional alias: some FE builds still try /auth/sso-register on 404 from old flows.
 @router.post("/sso-register")
 def sso_register(
-  p: SsoLoginIn,
-  request: Request,
-  response: Response,
-  s: Session = Depends(session_dep),
+    p: SsoLoginIn,
+    request: Request,
+    response: Response,
+    s: Session = Depends(session_dep),
 ):
-  email = p.email.lower()
-  return _upsert_and_login(email, request, response, s)
+    # Legacy alias – behaves identically to /sso-login
+    email = p.email.lower()
+    return _upsert_and_login(email, request, response, s)
