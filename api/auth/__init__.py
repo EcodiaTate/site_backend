@@ -5,7 +5,7 @@ from .sso_login import router as sso_router
 from .auth_main import router as main_router
 from .set_role import router as set_role_router
 from .refresh import router as refresh_router
-
+from .routes_email_links import router as links_router
 router = APIRouter(prefix="/auth")
 
 router.include_router(logout_router)
@@ -16,3 +16,4 @@ router.include_router(refresh_router)
 # site_backend/api/auth/__init__.py (or wherever you mount routes)
 from .role_snapshot import router as role_snapshot_router
 router.include_router(role_snapshot_router)
+router.include_router(links_router)
