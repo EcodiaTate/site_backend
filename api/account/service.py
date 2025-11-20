@@ -103,11 +103,6 @@ def _parse_sha_from_url(url: Optional[str]) -> Optional[str]:
     except Exception:
         pass
     return None
-
-
-# =========================================================
-# Account Reads
-# =========================================================
 def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
     cy = """
     MATCH (u:User {id:$uid})
@@ -124,7 +119,10 @@ def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
            coalesce(u.tos_accepted_at, NULL)           AS tos_accepted_at,
            coalesce(u.privacy_accepted_at, NULL)       AS privacy_accepted_at,
            coalesce(u.over18_confirmed, NULL)          AS over18_confirmed,
-           coalesce(u.birth_year, NULL)                AS birth_year
+           coalesce(u.birth_year, NULL)                AS birth_year,
+
+           // password presence for SSO-aware UI
+           coalesce(u.password_hash, '') <> ''         AS has_password
     """
     rec = s.run(cy, uid=uid).single()
     if not rec:
@@ -143,6 +141,8 @@ def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
         "privacy_accepted_at": rec["privacy_accepted_at"],
         "over18_confirmed": rec["over18_confirmed"],
         "birth_year": rec["birth_year"],
+
+        "has_password": bool(rec["has_password"]),
     }
 
 

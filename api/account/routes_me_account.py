@@ -30,7 +30,6 @@ router = APIRouter(prefix="/me/account", tags=["account"])
 log = logging.getLogger("account.avatar")
 
 # ==================== Schemas ====================
-
 class MeAccount(BaseModel):
     id: str
     email: EmailStr
@@ -38,6 +37,9 @@ class MeAccount(BaseModel):
     role: str = Field(default="public")
     email_verified: bool = False
     avatar_url: Optional[str] = None  # absolute via abs_media
+
+    # Does this account have a local password hash?
+    has_password: bool = False
 
     # ── Legal flags (read-only) ───────────────────────────────────
     legal_onboarding_complete: bool | None = None
@@ -47,32 +49,43 @@ class MeAccount(BaseModel):
     over18_confirmed: bool | None = None
     birth_year: int | None = None
 
+
+
 class DisplayNameIn(BaseModel):
     display_name: str = Field(min_length=1, max_length=80)
+
 
 class ChangeEmailIn(BaseModel):
     new_email: EmailStr
 
+
 class ChangeEmailOut(BaseModel):
     pending_verification: bool = True
 
+
 class VerifyEmailOut(BaseModel):
     sent: bool = True
+
 
 class ChangePasswordIn(BaseModel):
     current_password: str = Field(min_length=6)
     new_password: str = Field(min_length=8)
 
+
 class ChangePasswordOut(BaseModel):
     ok: bool = True
+
 
 class PasswordResetOut(BaseModel):
     sent: bool = True
 
+
 class AvatarOut(BaseModel):
     avatar_url: Optional[str] = None
 
+
 # ── Legal onboarding I/O ─────────────────────────────────────────
+
 
 class LegalStatusOut(BaseModel):
     legal_onboarding_complete: bool
@@ -82,6 +95,7 @@ class LegalStatusOut(BaseModel):
     over18_confirmed: bool | None = None
     birth_year: int | None = None
 
+
 class LegalAcceptIn(BaseModel):
     agreed_tos: bool
     agreed_privacy: bool
@@ -89,9 +103,11 @@ class LegalAcceptIn(BaseModel):
     is_adult: bool | None = None
     birth_year: int | None = None
 
+
 class LegalAcceptOut(BaseModel):
     ok: bool = True
     legal_onboarding_complete: bool = True
+
 
 # ==================== Upload helpers ====================
 _AVATAR_MAX_MB = float(os.getenv("AVATAR_MAX_MB", "15"))
@@ -100,6 +116,7 @@ _AVATAR_MAX_BYTES = int(_AVATAR_MAX_MB * 1024 * 1024)
 _HEIC_CTS = {"image/heic", "image/heif", "image/avif"}
 _BASIC_EXTS = (".png", ".jpg", ".jpeg", ".webp")
 _HEIC_EXTS = (".heic", ".heif", ".avif")
+
 
 def _register_heif_plugins() -> bool:
     try:
@@ -121,6 +138,7 @@ def _register_heif_plugins() -> bool:
         log.warning("pillow-heif present but no registration function succeeded")
     return registered
 
+
 def _lazy_pillow():
     try:
         from PIL import Image as PILImage  # type: ignore
@@ -129,6 +147,7 @@ def _lazy_pillow():
         return None
     _register_heif_plugins()
     return PILImage
+
 
 def _normalize_orientation_pil(im):
     try:
@@ -144,6 +163,7 @@ def _normalize_orientation_pil(im):
         pass
     return im
 
+
 def _to_webp_bytes_pil(PILImage, im) -> bytes:
     im = _normalize_orientation_pil(im)
     if im.mode not in ("RGB", "RGBA"):
@@ -152,20 +172,23 @@ def _to_webp_bytes_pil(PILImage, im) -> bytes:
     im.save(buf, "WEBP", quality=85, method=6)
     return buf.getvalue()
 
+
 def _guess_ext_from_ct_or_name(content_type: Optional[str], filename: Optional[str]) -> str:
     ct = (content_type or "").lower()
     fn = (filename or "").lower()
     if "png" in ct or fn.endswith(".png"):
-      return ".png"
+        return ".png"
     if "webp" in ct or fn.endswith(".webp"):
-      return ".webp"
-    if "jpeg" in ct or "jpg" in ct or fn.endswith((".jpg",".jpeg")):
-      return ".jpg"
+        return ".webp"
+    if "jpeg" in ct or "jpg" in ct or fn.endswith((".jpg", ".jpeg")):
+        return ".jpg"
     if fn.endswith(_HEIC_EXTS):
-      return ".heic"
+        return ".heic"
     return ".jpg"
 
+
 # ==================== Routes ====================
+
 
 @router.get("", response_model=MeAccount)
 def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
@@ -175,7 +198,10 @@ def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(s
     acc["avatar_url"] = abs_media(acc.get("avatar_url"))
 
     # surface legal flags (safe defaults)
-    acc.setdefault("legal_onboarding_complete", bool(acc.get("legal_onboarding_complete") or False))
+    acc.setdefault(
+        "legal_onboarding_complete",
+        bool(acc.get("legal_onboarding_complete") or False),
+    )
     acc.setdefault("tos_version", acc.get("tos_version"))
     acc.setdefault("tos_accepted_at", acc.get("tos_accepted_at"))
     acc.setdefault("privacy_accepted_at", acc.get("privacy_accepted_at"))
@@ -183,6 +209,7 @@ def r_get_me_account(uid: str = Depends(current_user_id), s: Session = Depends(s
     acc.setdefault("birth_year", acc.get("birth_year"))
 
     return acc
+
 
 @router.get("/legal-status", response_model=LegalStatusOut)
 def r_get_legal_status(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
@@ -210,6 +237,7 @@ def r_get_legal_status(uid: str = Depends(current_user_id), s: Session = Depends
         "birth_year": row["birth_year"],
     }
 
+
 @router.post("/legal-accept", response_model=LegalAcceptOut)
 def r_post_legal_accept(
     p: LegalAcceptIn,
@@ -217,7 +245,10 @@ def r_post_legal_accept(
     s: Session = Depends(session_dep),
 ):
     if not (p.agreed_tos and p.agreed_privacy):
-        raise HTTPException(status_code=400, detail="You must agree to Terms and Privacy Policy.")
+        raise HTTPException(
+            status_code=400,
+            detail="You must agree to Terms and Privacy Policy.",
+        )
 
     # accept timestamps and version
     now_iso = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -251,6 +282,7 @@ def r_post_legal_accept(
 
     return LegalAcceptOut(ok=True, legal_onboarding_complete=True)
 
+
 @router.patch("/display-name", response_model=dict)
 def r_update_display_name(
     p: DisplayNameIn,
@@ -259,6 +291,7 @@ def r_update_display_name(
 ):
     update_display_name(s, uid, p.display_name.strip())
     return {"ok": True}
+
 
 @router.post("/change-email", response_model=ChangeEmailOut)
 def r_change_email(
@@ -269,10 +302,12 @@ def r_change_email(
     begin_change_email(s, uid, p.new_email)
     return ChangeEmailOut(pending_verification=True)
 
+
 @router.post("/send-verify-email", response_model=VerifyEmailOut)
 def r_send_verify_email(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
     sent = trigger_verify_email(s, uid)
     return VerifyEmailOut(sent=sent)
+
 
 @router.post("/change-password", response_model=ChangePasswordOut)
 def r_change_password(
@@ -283,10 +318,12 @@ def r_change_password(
     svc_change_password(s, uid, p.current_password, p.new_password)
     return ChangePasswordOut(ok=True)
 
+
 @router.post("/send-password-reset", response_model=PasswordResetOut)
 def r_send_password_reset(uid: str = Depends(current_user_id), s: Session = Depends(session_dep)):
     sent = trigger_password_reset(s, uid)
     return PasswordResetOut(sent=sent)
+
 
 # -------- Avatar upload/remove (HEIC-safe, tolerant, lazy Pillow) --------
 @router.post("/avatar", response_model=AvatarOut)
@@ -298,12 +335,13 @@ def r_upload_avatar(
     ct = (f.content_type or "").lower()
     fn = (f.filename or "").lower()
     looks_like_image = (
-        ct.startswith("image/")
-        or fn.endswith(_BASIC_EXTS)
-        or fn.endswith(_HEIC_EXTS)
+        ct.startswith("image/") or fn.endswith(_BASIC_EXTS) or fn.endswith(_HEIC_EXTS)
     )
     if not looks_like_image:
-        raise HTTPException(status_code=400, detail="Please upload an image (PNG/JPG/WebP/HEIC/AVIF).")
+        raise HTTPException(
+            status_code=400,
+            detail="Please upload an image (PNG/JPG/WebP/HEIC/AVIF).",
+        )
 
     data = f.file.read()
     if not data:
@@ -327,12 +365,16 @@ def r_upload_avatar(
             if ext in (".heic",):
                 raise HTTPException(
                     status_code=415,
-                    detail="HEIC/AVIF not supported by the running server. Ensure pillow-heif is registered and libheif is available; then restart the server."
+                    detail=(
+                        "HEIC/AVIF not supported by the running server. Ensure pillow-heif "
+                        "is registered and libheif is available; then restart the server."
+                    ),
                 )
             raise HTTPException(status_code=415, detail=f"Unsupported image format: {e}")
 
         try:
             from PIL import Image as PIL  # type: ignore
+
             im = im.convert("RGB")
             buf = io.BytesIO()
             im.save(buf, "WEBP", quality=85, method=6)
@@ -346,14 +388,21 @@ def r_upload_avatar(
     if ct in _HEIC_CTS or fn.endswith(_HEIC_EXTS):
         raise HTTPException(
             status_code=415,
-            detail="HEIC/AVIF not supported on this server. Install Pillow and pillow-heif (plus libheif on Linux) and restart."
+            detail=(
+                "HEIC/AVIF not supported on this server. Install Pillow and pillow-heif "
+                "(plus libheif on Linux) and restart."
+            ),
         )
     ext = _guess_ext_from_ct_or_name(ct, f.filename)
     if ext not in (".jpg", ".png", ".webp"):
-        raise HTTPException(status_code=415, detail=f"Unsupported image type: {ct or f.filename or 'unknown'}")
+        raise HTTPException(
+            status_code=415,
+            detail=f"Unsupported image type: {ct or f.filename or 'unknown'}",
+        )
 
     rel = set_user_avatar_from_bytes(s, uid, data, ext)
     return AvatarOut(avatar_url=abs_media(rel))
+
 
 @router.delete("/avatar", response_model=AvatarOut)
 def r_delete_avatar(

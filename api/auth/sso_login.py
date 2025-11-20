@@ -1,7 +1,9 @@
 # site_backend/api/auth/sso_login.py
 from __future__ import annotations
 from typing import Any
-import json, os, time
+import json
+import os
+import time
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from pydantic import BaseModel, EmailStr
@@ -9,23 +11,33 @@ from neo4j import Session
 from jose import jwt
 
 from site_backend.core.neo_driver import session_dep
-from site_backend.core.admin_guard import ADMIN_EMAIL, JWT_SECRET as ADMIN_JWT_SECRET, JWT_ALGO as ADMIN_JWT_ALGO
-from site_backend.core.cookies import set_scoped_cookie, REFRESH_COOKIE_NAME, ACCESS_COOKIE_NAME
+from site_backend.core.admin_guard import (
+    ADMIN_EMAIL,
+    JWT_SECRET as ADMIN_JWT_SECRET,
+    JWT_ALGO as ADMIN_JWT_ALGO,
+)
+from site_backend.core.cookies import (
+    set_scoped_cookie,
+    REFRESH_COOKIE_NAME,
+    ACCESS_COOKIE_NAME,
+)
 
 router = APIRouter(tags=["auth"])
 
 ACCESS_JWT_SECRET = os.getenv("ACCESS_JWT_SECRET", os.getenv("JWT_SECRET", "dev-secret-change-me"))
-ACCESS_JWT_ALGO   = os.getenv("ACCESS_JWT_ALGO", "HS256")
-ACCESS_JWT_TTL_S  = int(os.getenv("ACCESS_JWT_TTL_S", "900"))
-ACCESS_JWT_ISS    = os.getenv("ACCESS_JWT_ISS")
-ACCESS_JWT_AUD    = os.getenv("ACCESS_JWT_AUD")
+ACCESS_JWT_ALGO = os.getenv("ACCESS_JWT_ALGO", "HS256")
+ACCESS_JWT_TTL_S = int(os.getenv("ACCESS_JWT_TTL_S", "900"))
+ACCESS_JWT_ISS = os.getenv("ACCESS_JWT_ISS")
+ACCESS_JWT_AUD = os.getenv("ACCESS_JWT_AUD")
 
 REFRESH_JWT_SECRET = os.getenv("REFRESH_JWT_SECRET", os.getenv("JWT_SECRET", "dev-secret-change-me"))
-REFRESH_JWT_ALGO   = os.getenv("REFRESH_JWT_ALGO", "HS256")
-REFRESH_TTL_DAYS   = int(os.getenv("REFRESH_TTL_DAYS", "90"))
+REFRESH_JWT_ALGO = os.getenv("REFRESH_JWT_ALGO", "HS256")
+REFRESH_TTL_DAYS = int(os.getenv("REFRESH_TTL_DAYS", "90"))
+
 
 def _now_s() -> int:
     return int(time.time())
+
 
 def _mint_access(uid: str, email: str | None = None) -> tuple[str, int]:
     now = _now_s()
@@ -39,11 +51,13 @@ def _mint_access(uid: str, email: str | None = None) -> tuple[str, int]:
         payload["aud"] = ACCESS_JWT_AUD
     return jwt.encode(payload, ACCESS_JWT_SECRET, algorithm=ACCESS_JWT_ALGO), exp
 
+
 def _mint_refresh(uid: str) -> str:
     now = _now_s()
     exp = now + REFRESH_TTL_DAYS * 24 * 3600
     payload = {"sub": uid, "iat": now, "exp": exp, "typ": "refresh"}
     return jwt.encode(payload, REFRESH_JWT_SECRET, algorithm=REFRESH_JWT_ALGO)
+
 
 def _mint_admin_token(email: str) -> str:
     now = _now_s()
@@ -51,8 +65,10 @@ def _mint_admin_token(email: str) -> str:
     payload = {"sub": email, "scope": "admin", "iat": now, "exp": exp, "aud": "admin"}
     return jwt.encode(payload, ADMIN_JWT_SECRET, algorithm=ADMIN_JWT_ALGO)
 
+
 class SsoLoginIn(BaseModel):
     email: EmailStr
+
 
 ROLE_DEFAULT_CAPS: dict[str, dict[str, int]] = {
     "youth": {"max_redemptions_per_week": 5},
@@ -62,6 +78,7 @@ ROLE_DEFAULT_CAPS: dict[str, dict[str, int]] = {
     "public": {},
 }
 
+
 def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
     try:
         caps = json.loads(caps_raw) if isinstance(caps_raw, str) else (caps_raw or {})
@@ -70,6 +87,32 @@ def _safe_caps(caps_raw: Any, role: str) -> dict[str, Any]:
     if not caps:
         caps = ROLE_DEFAULT_CAPS.get(role, {})
     return caps
+
+
+def _email_local(email: str | None) -> str:
+    return (email or "").split("@")[0] if email else ""
+
+
+def _compute_display_name(u: dict) -> str:
+    # Prefer saved display_name; else given/family; else any name; else email local; else "friend"
+    dn = (u.get("display_name") or u.get("name") or "").strip()
+    if not dn:
+        gn = (u.get("given_name") or "").strip()
+        fn = (u.get("family_name") or "").strip()
+        dn = f"{gn} {fn}".strip()
+    if not dn:
+        dn = _email_local(u.get("email")) or "friend"
+    return dn
+
+
+def _compute_initials(display_name: str) -> str:
+    parts = [p for p in display_name.strip().split() if p]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0][:2].upper()
+    return (parts[0][0] + parts[-1][0]).upper()
+
 
 def _determine_role(rec: dict, email: str, current_role: str) -> str:
     # precedence: admin → business → youth → creative → partner → public
@@ -89,7 +132,7 @@ def _determine_role(rec: dict, email: str, current_role: str) -> str:
     if has_pp:
         return "partner"
     return current_role or "public"
-# site_backend/api/auth/sso_login.py  (only the changed/added bits shown as full function bodies)
+
 
 def _issue_tokens_and_build_response(
     u: dict,
@@ -100,25 +143,44 @@ def _issue_tokens_and_build_response(
 ) -> dict[str, Any]:
     access, exp = _mint_access(u["id"], u.get("email"))
     refresh = _mint_refresh(u["id"])
+    set_scoped_cookie(
+        response,
+        name=REFRESH_COOKIE_NAME,
+        value=refresh,
+        max_age=REFRESH_TTL_DAYS * 24 * 3600,
+        request=request,
+    )
+    set_scoped_cookie(
+        response,
+        name=ACCESS_COOKIE_NAME,
+        value=access,
+        max_age=ACCESS_JWT_TTL_S,
+        request=request,
+    )
 
-    set_scoped_cookie(response, name=REFRESH_COOKIE_NAME, value=refresh, max_age=REFRESH_TTL_DAYS * 24 * 3600, request=request)
-    set_scoped_cookie(response, name=ACCESS_COOKIE_NAME,  value=access,  max_age=ACCESS_JWT_TTL_S, request=request)
-
-    legal_complete = bool(u.get("legal_onboarding_complete") or False)
+    display_name = _compute_display_name(u)
+    initials = _compute_initials(display_name)
+    avatar_url = u.get("avatar_url")  # /me route can abs_media this later
 
     out: dict[str, Any] = {
         "id": u["id"],
         "email": u["email"],
         "role": role,
         "caps": caps,
-        "profile": {},
+        "profile": {
+            "display_name": display_name,
+            "given_name": (u.get("given_name") or "").strip(),
+            "family_name": (u.get("family_name") or "").strip(),
+            "nickname": (u.get("nickname") or "").strip(),
+            "avatar_url": avatar_url or "",
+            "initials": initials,
+        },
         "user_token": u["id"],
         "token": access,
         "exp": exp,
-
-        # surface legal flags for FE gating
-        "legal_onboarding_complete": legal_complete,
-        "needs_legal": (not legal_complete),
+        # Legal flags mirrored so FE can short-circuit legal flow if already done
+        "legal_onboarding_complete": bool(u.get("legal_onboarding_complete") or False),
+        "needs_legal": not bool(u.get("legal_onboarding_complete") or False),
         "tos_version": u.get("tos_version"),
         "tos_accepted_at": u.get("tos_accepted_at"),
         "privacy_accepted_at": u.get("privacy_accepted_at"),
@@ -163,10 +225,15 @@ def _upsert_and_login(email: str, request: Request, response: Response, s: Sessi
     final_role = _determine_role(rec, email, current_role)
 
     if final_role != current_role:
-        s.run("MATCH (u:User {id:$id}) SET u.role=$role", id=u["id"], role=final_role)
+        s.run(
+            "MATCH (u:User {id:$id}) SET u.role=$role",
+            id=u["id"],
+            role=final_role,
+        )
 
     caps = _safe_caps(u.get("caps_json") or "{}", final_role)
     return _issue_tokens_and_build_response(u, final_role, caps, request, response)
+
 
 @router.post("/sso-login")
 def sso_login(
@@ -178,6 +245,7 @@ def sso_login(
     email = p.email.lower()
     # Upsert + login (always 200 on success)
     return _upsert_and_login(email, request, response, s)
+
 
 # Optional alias: some FE builds still try /auth/sso-register on 404 from old flows.
 @router.post("/sso-register")
