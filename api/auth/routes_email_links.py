@@ -11,7 +11,7 @@ from argon2 import PasswordHasher
 
 from site_backend.core.neo_driver import session_dep
 
-router = APIRouter(prefix="/auth", tags=["auth-email-links"])
+router = APIRouter(tags=["auth-email-links"])
 
 # Local helpers (duplicated small bits on purpose – keeps it self-contained)
 def _now_s() -> int:
