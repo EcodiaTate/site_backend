@@ -9,36 +9,49 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from pydantic import BaseModel
 import os
 import shutil
-import json
+import json  # still here in case you reintroduce templates/criteria later
 
 from site_backend.core.neo_driver import session_dep   # yields a neo4j.Session
 from site_backend.core.user_guard import current_user_id  # validates Bearer or legacy cookie
 from neo4j import Session
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Pydantic models (mirror the FE types you’re using)
+# Offer models – aligned with new offers setup (eco_price, fiat, stock, status)
 # ─────────────────────────────────────────────────────────────────────────────
+
+OfferStatus = Literal["active", "paused", "hidden"]
+
 
 class OfferOut(BaseModel):
     id: str
     title: str
     blurb: Optional[str] = None
-    visible: bool = True
+    status: OfferStatus = "active"
+    eco_price: int = 0
+    fiat_cost_cents: int = 0
+    stock: Optional[int] = None
     url: Optional[str] = None
+    # stored as string date (YYYY-MM-DD or ISO) from graph
     valid_until: Optional[str] = None
-    type: Optional[Literal["discount", "perk", "info"]] = "perk"
-    tags: Optional[List[str]] = None
+    tags: List[str] = []
+
 
 class OfferIn(BaseModel):
     title: str
     blurb: str
-    type: Literal["discount", "perk", "info"] = "perk"
-    visible: bool = True
+    status: OfferStatus = "active"
+    eco_price: int = 0
+    fiat_cost_cents: int = 0
+    stock: Optional[int] = None
     url: Optional[str] = None
+    # FE sends a plain date string; we just persist it as-is
     valid_until: Optional[str] = None
-    tags: Optional[List[str]] = None
-    template_id: Optional[str] = None
-    criteria: Optional[dict] = None  # kept generic; stored as JSON string
+    tags: List[str] = []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Business + metrics models (unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
 
 class BusinessMine(BaseModel):
     id: str
@@ -63,11 +76,13 @@ class BusinessMine(BaseModel):
     rules_daily_cap_per_user: Optional[int] = None
     rules_geofence_radius_m: Optional[int] = None
 
+
 class Metrics(BaseModel):
     minted_eco: float = 0
     eco_contributed_total: float = 0
     eco_given_total: float = 0
     eco_velocity_30d: float = 0
+
 
 class ActivityRow(BaseModel):
     id: str
@@ -76,6 +91,7 @@ class ActivityRow(BaseModel):
     kind: str
     amount: float
     offer_id: Optional[str] = None
+
 
 class PatchProfile(BaseModel):
     # Existing editable fields
@@ -100,6 +116,7 @@ class PatchProfile(BaseModel):
     # FE may send "" to disable; normalize in handler
     rules_geofence_radius_m: Optional[int] = None
 
+
 router = APIRouter(prefix="/eco-local/owner", tags=["eco_local.owner"])
 assets_router = APIRouter(prefix="/eco-local/assets", tags=["eco_local.assets"])
 
@@ -113,6 +130,7 @@ UPLOAD_DIR = os.getenv("ECO_LOCAL_UPLOAD_DIR", "uploads/hero")
 def _one(s: Session, cypher: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     rec = s.run(cypher, **params).single()
     return rec.data() if rec else None
+
 
 def _all(s: Session, cypher: str, params: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [r.data() for r in s.run(cypher, **params)]
@@ -138,6 +156,7 @@ def _ensure_owner_business(s: Session, user_id: str) -> str:
     """
     rec = _one(s, cy, {"uid": user_id})
     return rec["id"]
+
 
 def _get_business(s: Session, user_id: str) -> Optional[BusinessMine]:
     cy = """
@@ -176,16 +195,37 @@ def _get_business(s: Session, user_id: str) -> Optional[BusinessMine]:
         rules_geofence_radius_m=b.get("rules_geofence_radius_m"),
     )
 
+
 def _offer_record_to_out(rec: Dict[str, Any]) -> OfferOut:
+    """
+    Normalise graph Offer → API shape.
+    - Map legacy `visible` → `status` when `status` missing.
+    - Map legacy `redeem_eco` → `eco_price` when needed.
+    """
     o = rec["o"]
+
+    status = o.get("status")
+    visible = o.get("visible")
+    if not status:
+        # Legacy mapping: visible True -> active, False -> hidden
+        status = "active" if (visible is None or visible is True) else "hidden"
+
+    eco_price = o.get("eco_price")
+    if eco_price is None and o.get("redeem_eco") is not None:
+        eco_price = int(o["redeem_eco"])
+
+    fiat_cost = o.get("fiat_cost_cents") or 0
+
     return OfferOut(
         id=o.get("id"),
         title=o.get("title") or "",
         blurb=o.get("blurb"),
-        visible=o.get("visible", True),
+        status=status,  # type: ignore[arg-type]
+        eco_price=int(eco_price or 0),
+        fiat_cost_cents=int(fiat_cost),
+        stock=o.get("stock"),
         url=o.get("url"),
         valid_until=o.get("valid_until"),
-        type=o.get("type") or "perk",
         tags=o.get("tags") or [],
     )
 
@@ -194,8 +234,10 @@ def _offer_record_to_out(rec: Dict[str, Any]) -> OfferOut:
 # ─────────────────────────────────────────────────────────────────────────────
 
 @router.get("/mine")
-def owner_mine(uid: str = Depends(current_user_id),
-               s: Session = Depends(session_dep)):
+def owner_mine(
+    uid: str = Depends(current_user_id),
+    s: Session = Depends(session_dep),
+):
     cy = """
     MATCH (b:BusinessProfile {user_id: $uid})
     OPTIONAL MATCH (q:QR)-[:OF]->(b)
@@ -225,6 +267,7 @@ def owner_mine(uid: str = Depends(current_user_id),
     if not rec:
         return {"result": None}
     return rec["result"]
+
 
 @router.get("/metrics", response_model=Dict[str, Any])
 def get_metrics(
@@ -258,9 +301,11 @@ def get_metrics(
          reduce(acc=[], r IN scans30 |
             CASE WHEN r.uid IS NULL OR r.uid IN acc THEN acc ELSE acc + r.uid END
          ) AS uniqs
-    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d,
-         CASE WHEN last_ms_raw < 0 THEN NULL ELSE last_ms_raw END AS last_ms,
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d, last_ms_raw,
          size(uniqs) AS unique_claimants_30d
+    WITH b, cutoff_ms, eco_triggered_total, claims_30d, eco_triggered_30d,
+         unique_claimants_30d,
+         CASE WHEN last_ms_raw < 0 THEN NULL ELSE last_ms_raw END AS last_ms
 
     // -------- inbound contributions to the business --------
     OPTIONAL MATCH (b)-[:COLLECTED|EARNED]->(tin:EcoTx {status:'settled'})
@@ -349,11 +394,21 @@ def get_metrics(
         from fastapi import HTTPException
         raise HTTPException(status_code=500, detail=f"/owner/metrics failed: {e}")
 
+
 @router.get("/offers", response_model=List[OfferOut])
 def list_offers(
     user_id: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
+    """
+    Business-owner view of their offers.
+
+    Pulls offers attached via either:
+    - (b)-[:HAS_OFFER]->(o)
+    - (o)-[:OF]->(b)
+
+    and normalises legacy fields into the new eco_price / status shape.
+    """
     _ensure_owner_business(s, user_id)
     cy = """
     MATCH (b:BusinessProfile {user_id: $uid})
@@ -365,12 +420,23 @@ def list_offers(
     UNWIND os AS o
     ORDER BY coalesce(o.valid_until, '') DESC, o.title
     RETURN o {
-      .id, .title, .blurb, .visible, .url, .valid_until, .type, .tags,
-      .criteria_json
+      .id,
+      .title,
+      .blurb,
+      .status,
+      .eco_price,
+      .fiat_cost_cents,
+      .stock,
+      .url,
+      .valid_until,
+      .tags,
+      .visible,        // for legacy mapping to status
+      .redeem_eco      // for legacy mapping to eco_price
     } AS o
     """
     rows = _all(s, cy, {"uid": user_id})
     return [_offer_record_to_out(r) for r in rows]
+
 
 @router.post("/offers", response_model=OfferOut, status_code=status.HTTP_201_CREATED)
 def create_offer(
@@ -378,35 +444,67 @@ def create_offer(
     user_id: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
+    """
+    Create a new business offer with the upgraded schema:
+    - status (active/paused/hidden)
+    - eco_price (required by redeem logic)
+    - fiat_cost_cents (for sponsor payouts)
+    - stock, url, valid_until, tags
+    """
     _ensure_owner_business(s, user_id)
     oid = str(uuid4())
     cy = """
     MATCH (b:BusinessProfile {user_id: $uid})
     CREATE (o:Offer {
-      id:$oid, title:$title, blurb:$blurb, visible:$visible, url:$url,
-      valid_until:$vu, type:$type, tags:$tags, template_id:$tid, criteria_json:$crit_json,
-      created_at: datetime()
+      id: $oid,
+      title: $title,
+      blurb: $blurb,
+      status: $status,
+      eco_price: $eco_price,
+      fiat_cost_cents: $fiat_cost_cents,
+      stock: $stock,
+      url: $url,
+      valid_until: $vu,
+      tags: $tags,
+      claims: coalesce($claims, 0),
+      created_at: datetime(),
+      updated_at: datetime()
     })
     MERGE (b)-[:HAS_OFFER]->(o)
     MERGE (o)-[:OF]->(b)        // keep both directions for compatibility
     RETURN o {
-      .id, .title, .blurb, .visible, .url, .valid_until, .type, .tags
+      .id,
+      .title,
+      .blurb,
+      .status,
+      .eco_price,
+      .fiat_cost_cents,
+      .stock,
+      .url,
+      .valid_until,
+      .tags
     } AS o
     """
-    rec = _one(s, cy, {
-        "uid": user_id,
-        "oid": oid,
-        "title": payload.title.strip(),
-        "blurb": payload.blurb.strip() if payload.blurb else None,
-        "visible": bool(payload.visible),
-        "url": payload.url,
-        "vu": payload.valid_until,
-        "type": payload.type,
-        "tags": payload.tags or [],
-        "tid": payload.template_id,
-        "crit_json": json.dumps(payload.criteria) if payload.criteria is not None else None,
-    })
+    rec = _one(
+        s,
+        cy,
+        {
+            "uid": user_id,
+            "oid": oid,
+            "title": payload.title.strip(),
+            "blurb": payload.blurb.strip() if payload.blurb else None,
+            "status": payload.status,
+            "eco_price": int(payload.eco_price or 0),
+            "fiat_cost_cents": int(payload.fiat_cost_cents or 0),
+            "stock": payload.stock,
+            "url": payload.url,
+            "vu": payload.valid_until,
+            "tags": payload.tags or [],
+            "claims": 0,
+        },
+    )
     return _offer_record_to_out(rec)
+
 
 @router.patch("/offers/{offer_id}", response_model=OfferOut)
 def patch_offer(
@@ -415,6 +513,9 @@ def patch_offer(
     user_id: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
+    """
+    Full update of an offer (FE sends the complete offer payload).
+    """
     _ensure_owner_business(s, user_id)
     cy = """
     MATCH (b:BusinessProfile {user_id: $uid})
@@ -422,35 +523,50 @@ def patch_offer(
     OPTIONAL MATCH (o2:Offer {id:$oid})-[:OF]->(b)
     WITH coalesce(o1, o2) AS o
     WHERE o IS NOT NULL
-    SET o.title         = $title,
-        o.blurb         = $blurb,
-        o.visible       = $visible,
-        o.url           = $url,
-        o.valid_until   = $vu,
-        o.type          = $type,
-        o.tags          = $tags,
-        o.template_id   = $tid,
-        o.criteria_json = $crit_json
+    SET o.title           = $title,
+        o.blurb           = $blurb,
+        o.status          = $status,
+        o.eco_price       = $eco_price,
+        o.fiat_cost_cents = $fiat_cost_cents,
+        o.stock           = $stock,
+        o.url             = $url,
+        o.valid_until     = $vu,
+        o.tags            = $tags,
+        o.updated_at      = datetime()
     RETURN o {
-      .id, .title, .blurb, .visible, .url, .valid_until, .type, .tags
+      .id,
+      .title,
+      .blurb,
+      .status,
+      .eco_price,
+      .fiat_cost_cents,
+      .stock,
+      .url,
+      .valid_until,
+      .tags
     } AS o
     """
-    rec = _one(s, cy, {
-        "uid": user_id,
-        "oid": offer_id,
-        "title": payload.title.strip(),
-        "blurb": payload.blurb.strip() if payload.blurb else None,
-        "visible": bool(payload.visible),
-        "url": payload.url,
-        "vu": payload.valid_until,
-        "type": payload.type,
-        "tags": payload.tags or [],
-        "tid": payload.template_id,
-        "crit_json": json.dumps(payload.criteria) if payload.criteria is not None else None,
-    })
+    rec = _one(
+        s,
+        cy,
+        {
+            "uid": user_id,
+            "oid": offer_id,
+            "title": payload.title.strip(),
+            "blurb": payload.blurb.strip() if payload.blurb else None,
+            "status": payload.status,
+            "eco_price": int(payload.eco_price or 0),
+            "fiat_cost_cents": int(payload.fiat_cost_cents or 0),
+            "stock": payload.stock,
+            "url": payload.url,
+            "vu": payload.valid_until,
+            "tags": payload.tags or [],
+        },
+    )
     if not rec:
         raise HTTPException(status_code=404, detail="Offer not found")
     return _offer_record_to_out(rec)
+
 
 @router.delete("/offers/{offer_id}", response_model=dict)
 def delete_offer(
@@ -458,24 +574,28 @@ def delete_offer(
     user_id: str = Depends(current_user_id),
     s: Session = Depends(session_dep),
 ):
+    """
+    Delete an offer owned by this business using a pure-Cypher FOREACH pattern
+    (no APOC), to avoid the `Variable o not defined` errors.
+    """
     _ensure_owner_business(s, user_id)
     cy = """
     MATCH (b:BusinessProfile {user_id:$uid})
     OPTIONAL MATCH (b)-[:HAS_OFFER]->(o1:Offer {id:$oid})
     OPTIONAL MATCH (o2:Offer {id:$oid})-[:OF]->(b)
     WITH coalesce(o1, o2) AS o
-    WITH o
-    CALL apoc.do.when(o IS NULL,
-      'RETURN 0 AS deleted',
-      'DETACH DELETE o RETURN 1 AS deleted',
-      {}
-    ) YIELD value
-    RETURN value.deleted AS deleted
+    WITH o,
+         CASE WHEN o IS NULL THEN 0 ELSE 1 END AS deleted
+    FOREACH (_ IN CASE WHEN o IS NULL THEN [] ELSE [1] END |
+      DETACH DELETE o
+    )
+    RETURN deleted AS deleted
     """
     rec = _one(s, cy, {"uid": user_id, "oid": offer_id})
     if not rec or int(rec.get("deleted") or 0) == 0:
         raise HTTPException(status_code=404, detail="Offer not found")
     return {"ok": True}
+
 
 @router.get("/activity", response_model=List[ActivityRow])
 def business_recent_activity(
@@ -522,16 +642,19 @@ def business_recent_activity(
 
     out: list[ActivityRow] = []
     for r in rows:
-        out.append(ActivityRow(
-            id=r.get("id") or str(uuid4()),
-            createdAt=r.get("createdAt") or datetime.now(timezone.utc).isoformat(),
-            user_id=r.get("user_id"),
-            kind=r.get("kind") or "event",
-            amount=float(r.get("amount") or 0.0),
-            offer_id=r.get("offer_id"),
-        ))
+        out.append(
+            ActivityRow(
+                id=r.get("id") or str(uuid4()),
+                createdAt=r.get("createdAt") or datetime.now(timezone.utc).isoformat(),
+                user_id=r.get("user_id"),
+                kind=r.get("kind") or "event",
+                amount=float(r.get("amount") or 0.0),
+                offer_id=r.get("offer_id"),
+            )
+        )
 
     return out
+
 
 @router.patch("/profile", response_model=BusinessMine)
 def patch_profile(
@@ -644,17 +767,21 @@ class DayPoint(BaseModel):
     retired: int
     net: int
 
+
 class DailySeriesOut(BaseModel):
     points: list[DayPoint]
+
 
 class BusyBucket(BaseModel):
     label: str
     claims: int
     eco: int
 
+
 class BusyOut(BaseModel):
     by_hour: list[BusyBucket]
     by_weekday: list[BusyBucket]
+
 
 class VisitorRow(BaseModel):
     id: str
@@ -663,15 +790,19 @@ class VisitorRow(BaseModel):
     claims: int
     minted_eco: int
 
+
 class VisitorsOut(BaseModel):
     items: list[VisitorRow]
+
 
 class AbuseOut(BaseModel):
     cooldown_hits: int
     daily_cap_hits: int
 
+
 def _utc_day(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).date().isoformat()
+
 
 @router.get("/analytics/daily", response_model=DailySeriesOut)
 def analytics_daily(
@@ -714,6 +845,7 @@ def analytics_daily(
         points.append({"day": day, "minted": minted, "retired": retired, "net": minted - retired})
     return {"points": points}
 
+
 @router.get("/analytics/busy", response_model=BusyOut)
 def analytics_busy(
     days: int = 90,
@@ -746,21 +878,28 @@ def analytics_busy(
     rows = _all(s, cy, {"uid": user_id, "days": int(days)})
 
     hour = {i: {"claims": 0, "eco": 0} for i in range(24)}
-    dow  = {i: {"claims": 0, "eco": 0} for i in range(7)}
+    dow = {i: {"claims": 0, "eco": 0} for i in range(7)}
 
     for r in rows:
         hr = int(r["hr"] or 0)
         wd = int(r["wd"] or 0)
-        hour[hr]["claims"]  += int(r["claims"] or 0)
-        hour[hr]["eco"]     += int(r["eco"] or 0)
-        dow[wd]["claims"]   += int(r["claims"] or 0)
-        dow[wd]["eco"]      += int(r["eco"] or 0)
+        hour[hr]["claims"] += int(r["claims"] or 0)
+        hour[hr]["eco"] += int(r["eco"] or 0)
+        dow[wd]["claims"] += int(r["claims"] or 0)
+        dow[wd]["eco"] += int(r["eco"] or 0)
 
-    names = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
+    names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
     return {
-        "by_hour": [{"label": f"{h:02d}:00", "claims": hour[h]["claims"], "eco": hour[h]["eco"]} for h in range(24)],
-        "by_weekday": [{"label": names[d], "claims": dow[d]["claims"], "eco": dow[d]["eco"]} for d in range(7)],
+        "by_hour": [
+            {"label": f"{h:02d}:00", "claims": hour[h]["claims"], "eco": hour[h]["eco"]}
+            for h in range(24)
+        ],
+        "by_weekday": [
+            {"label": names[d], "claims": dow[d]["claims"], "eco": dow[d]["eco"]}
+            for d in range(7)
+        ],
     }
+
 
 @router.get("/analytics/visitors", response_model=VisitorsOut)
 def analytics_visitors(
@@ -790,15 +929,19 @@ def analytics_visitors(
     LIMIT $limit
     """
     rows = _all(s, cy, {"uid": user_id, "days": int(days), "limit": int(limit)})
-    return {"items": [
-        {
-            "id": r["id"],
-            "first_at": int(r["first_at"] or 0),
-            "last_at": int(r["last_at"] or 0),
-            "claims": int(r["claims"] or 0),
-            "minted_eco": int(r["minted_eco"] or 0),
-        } for r in rows
-    ]}
+    return {
+        "items": [
+            {
+                "id": r["id"],
+                "first_at": int(r["first_at"] or 0),
+                "last_at": int(r["last_at"] or 0),
+                "claims": int(r["claims"] or 0),
+                "minted_eco": int(r["minted_eco"] or 0),
+            }
+            for r in rows
+        ]
+    }
+
 
 @router.get("/analytics/abuse", response_model=AbuseOut)
 def analytics_abuse(

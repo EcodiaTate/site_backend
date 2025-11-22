@@ -168,8 +168,8 @@ def get_me_account(s: Session, uid: str) -> Optional[Dict[str, Any]]:
            // legal flags
            coalesce(u.legal_onboarding_complete,false) AS legal_onboarding_complete,
            coalesce(u.tos_version, NULL)               AS tos_version,
-           coalesce(u.tos_accepted_at, NULL)           AS tos_accepted_at,
-           coalesce(u.privacy_accepted_at, NULL)       AS privacy_accepted_at,
+           toString(u.tos_accepted_at)                 AS tos_accepted_at,
+           toString(u.privacy_accepted_at)             AS privacy_accepted_at,
            coalesce(u.over18_confirmed, NULL)          AS over18_confirmed,
            coalesce(u.birth_year, NULL)                AS birth_year,
 

@@ -304,8 +304,8 @@ def r_get_legal_status(
         MATCH (u:User {id:$uid})
         RETURN coalesce(u.legal_onboarding_complete,false) AS complete,
                coalesce(u.tos_version, NULL)              AS tos_version,
-               coalesce(u.tos_accepted_at, NULL)          AS tos_at,
-               coalesce(u.privacy_accepted_at, NULL)      AS priv_at,
+               toString(u.tos_accepted_at)                AS tos_at,
+               toString(u.privacy_accepted_at)            AS priv_at,
                coalesce(u.over18_confirmed, NULL)         AS over18,
                coalesce(u.birth_year, NULL)               AS birth_year
         """,
