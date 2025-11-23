@@ -20,6 +20,7 @@ router = APIRouter(
 # Models
 # ============================================================
 
+
 class UpcyclingStorePayoutSettingsIn(BaseModel):
     # Billing address
     billing_name: Optional[str] = None
@@ -51,6 +52,7 @@ class UpcyclingStorePayoutSettingsOut(UpcyclingStorePayoutSettingsIn):
 # ============================================================
 # Routes
 # ============================================================
+
 
 @router.get(
     "/me/settings",

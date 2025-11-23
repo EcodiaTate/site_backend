@@ -134,6 +134,19 @@ class ItemStatus(str, Enum):
     sold_out = "sold_out"
 
 
+from enum import Enum
+
+class StoreThemeVariant(str, Enum):
+    archive = "archive"
+    boutique = "boutique"
+    studio = "studio"
+    tide = "tide"
+    poster = "poster"
+    neon = "neon"
+    grove = "grove"
+    grunge = "grunge"
+
+
 class UpcyclingItemOut(BaseModel):
     id: str
     store_id: str
@@ -155,8 +168,17 @@ class UpcyclingStoreProfileOut(BaseModel):
     handle: str
     display_name: str
     bio: Optional[str] = None
+
+    # Visual identity
     hero_image_url: Optional[str] = None
+    logo_url: Optional[str] = None
+
     style_tags: List[str]
+
+    # Storefront design + currency
+    theme_variant: Optional[StoreThemeVariant] = None
+    default_currency: Optional[str] = None
+
     created_at: str
     updated_at: Optional[str] = None
 
@@ -168,8 +190,12 @@ class UpcyclingStoreDetailOut(BaseModel):
 
 class UpcyclingOrderStatus(str, Enum):
     pending = "pending"
+    # Payment / payout related
+    succeeded = "succeeded"
     paid = "paid"
-    preparing = "preparing"  # matches frontend 'preparing'
+    # Fulfilment pipeline
+    preparing = "preparing"
+    packed = "packed"
     shipped = "shipped"
     delivered = "delivered"
     cancelled = "cancelled"
@@ -205,6 +231,9 @@ class UpcyclingOrderOut(BaseModel):
     paid_at: Optional[str] = None
     last_status_update_at: Optional[str] = None
 
+    # extra seller-facing field
+    seller_note: Optional[str] = None
+
 
 class UpcyclingOrderUpdateIn(BaseModel):
     """
@@ -216,7 +245,7 @@ class UpcyclingOrderUpdateIn(BaseModel):
     tracking_number: Optional[str] = None
     tracking_carrier: Optional[str] = None
     tracking_url: Optional[str] = None
-    # Optional internal note for emails / your own reference (not in TS type but harmless)
+    # Optional internal note for emails / your own reference
     seller_note: Optional[str] = None
 
 
@@ -226,6 +255,9 @@ class UpcyclingOrderUpdateIn(BaseModel):
 
 # Store hero images: <UPLOAD_ROOT>/upcycling_store_hero
 STORE_HERO_DIR = UPLOAD_ROOT / "upcycling_store_hero"
+
+# Store logos: <UPLOAD_ROOT>/upcycling_store_logo
+STORE_LOGO_DIR = UPLOAD_ROOT / "upcycling_store_logo"
 
 # Item images: <UPLOAD_ROOT>/upcycling_items
 ITEM_IMAGE_DIR = UPLOAD_ROOT / "upcycling_items"
@@ -250,6 +282,26 @@ async def save_store_hero(photo: UploadFile) -> str:
 
     # Browsers fetch this at /uploads/...
     return f"/uploads/upcycling_store_hero/{filename}"
+
+
+async def save_store_logo(photo: UploadFile) -> str:
+    """
+    Save a store logo image under <UPLOAD_ROOT>/upcycling_store_logo
+    and return a path served from /uploads.
+    """
+    STORE_LOGO_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = Path(photo.filename or "image").suffix or ".jpg"
+
+    import uuid
+
+    file_id = uuid.uuid4().hex
+    filename = f"{file_id}{suffix}"
+    dest = STORE_LOGO_DIR / filename
+
+    content = await photo.read()
+    dest.write_bytes(content)
+
+    return f"/uploads/upcycling_store_logo/{filename}"
 
 
 async def save_item_image(photo: UploadFile) -> str:
@@ -279,6 +331,18 @@ async def save_item_image(photo: UploadFile) -> str:
 
 def map_store_record(store: dict) -> UpcyclingStoreProfileOut:
     hero = store.get("hero_image_url")
+    # Allow either `logo_url` or `logo_image_url` from Cypher
+    logo = store.get("logo_url") or store.get("logo_image_url")
+    theme_raw = store.get("theme_variant")
+    default_currency = store.get("default_currency")
+
+    # Normalise theme into Enum if possible
+    theme_variant: Optional[StoreThemeVariant]
+    try:
+        theme_variant = StoreThemeVariant(theme_raw) if theme_raw else None
+    except ValueError:
+        theme_variant = None
+
     return UpcyclingStoreProfileOut(
         id=store["id"],
         user_id=store["user_id"],
@@ -286,7 +350,10 @@ def map_store_record(store: dict) -> UpcyclingStoreProfileOut:
         display_name=store["display_name"],
         bio=store.get("bio"),
         hero_image_url=abs_media(hero) if hero else None,
+        logo_url=abs_media(logo) if logo else None,
         style_tags=store.get("style_tags") or [],
+        theme_variant=theme_variant,
+        default_currency=(default_currency or None),
         created_at=store["created_at"],
         updated_at=store.get("updated_at"),
     )
@@ -337,7 +404,10 @@ async def get_my_store(
         display_name: s.display_name,
         bio: s.bio,
         hero_image_url: s.hero_image_url,
+        logo_image_url: s.logo_image_url,
         style_tags: coalesce(s.style_tags, []),
+        theme_variant: s.theme_variant,
+        default_currency: coalesce(s.default_currency, 'AUD'),
         created_at: toString(s.created_at),
         updated_at: CASE WHEN s.updated_at IS NULL THEN NULL ELSE toString(s.updated_at) END
     } AS store,
@@ -347,7 +417,7 @@ async def get_my_store(
         title: i.title,
         description: i.description,
         price: i.price,
-        currency: coalesce(i.currency, 'AUD'),
+        currency: coalesce(i.currency, coalesce(s.default_currency, 'AUD')),
         size: i.size,
         status: coalesce(i.status, 'active'),
         tags: coalesce(i.tags, []),
@@ -382,27 +452,53 @@ async def update_my_store(
     bio: Optional[str] = Form(None),
     style_tags: Optional[str] = Form(None),  # comma-separated
     hero_image: Optional[UploadFile] = File(None),
+    logo_image: Optional[UploadFile] = File(None),
+    theme_variant: Optional[StoreThemeVariant] = Form(None),
+    default_currency: Optional[str] = Form(None),
     session: Session = Depends(session_dep),
     user_id: str = Depends(current_user_id),
 ):
     """
-    Update store profile for the current user.
+    Update store profile for the current user:
+    - display_name, bio, style tags
+    - hero image + logo image
+    - chosen storefront theme variant
+    - default currency (e.g. AUD, USD)
     """
+    # Treat empty file inputs as "no change"
     hero_image_url: Optional[str] = None
-    if hero_image is not None:
+    if hero_image is not None and hero_image.filename:
         hero_image_url = await save_store_hero(hero_image)
 
-    tags_list: List[str] = []
-    if style_tags:
+    logo_image_url: Optional[str] = None
+    if logo_image is not None and logo_image.filename:
+        logo_image_url = await save_store_logo(logo_image)
+
+    # style_tags: None => no change, "" => clear to []
+    tags_list: Optional[List[str]] = None
+    if style_tags is not None:
         tags_list = [t.strip() for t in style_tags.split(",") if t.strip()]
+
+    theme_value: Optional[str] = theme_variant.value if theme_variant else None
+
+    default_currency_norm: Optional[str] = None
+    if default_currency:
+        dc = default_currency.strip().upper()
+        default_currency_norm = dc or None
 
     query = """
     MATCH (u:User {id: $user_id})-[:OWNS_UPCYCLING_STORE]->(s:UpcyclingStore)
     SET
       s.display_name = coalesce($display_name, s.display_name),
-      s.bio = $bio,
-      s.style_tags = $style_tags,
+      s.bio = CASE WHEN $bio IS NULL THEN s.bio ELSE $bio END,
+      s.style_tags = CASE
+        WHEN $style_tags IS NULL THEN s.style_tags
+        ELSE $style_tags
+      END,
       s.hero_image_url = coalesce($hero_image_url, s.hero_image_url),
+      s.logo_image_url = coalesce($logo_image_url, s.logo_image_url),
+      s.theme_variant = coalesce($theme_variant, s.theme_variant),
+      s.default_currency = coalesce($default_currency, s.default_currency),
       s.updated_at = datetime()
     RETURN {
         id: s.id,
@@ -411,9 +507,12 @@ async def update_my_store(
         display_name: s.display_name,
         bio: s.bio,
         hero_image_url: s.hero_image_url,
+        logo_image_url: s.logo_image_url,
         style_tags: coalesce(s.style_tags, []),
+        theme_variant: s.theme_variant,
+        default_currency: coalesce(s.default_currency, 'AUD'),
         created_at: toString(s.created_at),
-        updated_at: toString(s.updated_at)
+        updated_at: CASE WHEN s.updated_at IS NULL THEN NULL ELSE toString(s.updated_at) END
     } AS store
     """
 
@@ -425,6 +524,9 @@ async def update_my_store(
             "bio": bio,
             "style_tags": tags_list,
             "hero_image_url": hero_image_url,
+            "logo_image_url": logo_image_url,
+            "theme_variant": theme_value,
+            "default_currency": default_currency_norm,
         },
     )
     record = result.single()
@@ -456,9 +558,10 @@ async def create_item(
 ):
     """
     Create a new UpcyclingItem under the current user's store.
+    Uses the store's default_currency if set, otherwise AUD.
     """
     image_url: Optional[str] = None
-    if image is not None:
+    if image is not None and image.filename:
         image_url = await save_item_image(image)
 
     tags_list: List[str] = []
@@ -474,7 +577,7 @@ async def create_item(
         title: $title,
         description: $description,
         price: $price,
-        currency: 'AUD',
+        currency: coalesce(s.default_currency, 'AUD'),
         size: $size,
         status: $status,
         tags: $tags,
@@ -489,7 +592,7 @@ async def create_item(
         title: item.title,
         description: item.description,
         price: item.price,
-        currency: coalesce(item.currency, 'AUD'),
+        currency: coalesce(item.currency, coalesce(s.default_currency, 'AUD')),
         size: item.size,
         status: item.status,
         tags: coalesce(item.tags, []),
@@ -543,7 +646,7 @@ async def update_item(
     Update an existing item owned by the current user's store.
     """
     image_url: Optional[str] = None
-    if image is not None:
+    if image is not None and image.filename:
         image_url = await save_item_image(image)
 
     tags_list: Optional[List[str]] = None
@@ -567,7 +670,7 @@ async def update_item(
         title: item.title,
         description: item.description,
         price: item.price,
-        currency: coalesce(item.currency, 'AUD'),
+        currency: coalesce(item.currency, coalesce(s.default_currency, 'AUD')),
         size: item.size,
         status: item.status,
         tags: coalesce(item.tags, []),
@@ -668,7 +771,10 @@ async def get_store_public(
         display_name: s.display_name,
         bio: s.bio,
         hero_image_url: s.hero_image_url,
+        logo_image_url: s.logo_image_url,
         style_tags: coalesce(s.style_tags, []),
+        theme_variant: s.theme_variant,
+        default_currency: coalesce(s.default_currency, 'AUD'),
         created_at: toString(s.created_at),
         updated_at: CASE WHEN s.updated_at IS NULL THEN NULL ELSE toString(s.updated_at) END
     } AS store,
@@ -678,7 +784,7 @@ async def get_store_public(
         title: i.title,
         description: i.description,
         price: i.price,
-        currency: coalesce(i.currency, 'AUD'),
+        currency: coalesce(i.currency, coalesce(s.default_currency, 'AUD')),
         size: i.size,
         status: coalesce(i.status, 'active'),
         tags: coalesce(i.tags, []),
@@ -745,6 +851,7 @@ async def get_my_store_orders(
         tracking_number: o.tracking_number,
         tracking_carrier: o.tracking_carrier,
         tracking_url: o.tracking_url,
+        seller_note: o.seller_note,
         group_id: coalesce(o.group_id, coalesce(o.buyer_email, o.buyer_id)),
         created_at: toString(o.created_at),
         paid_at: CASE WHEN o.paid_at IS NULL THEN NULL ELSE toString(o.paid_at) END,
@@ -796,13 +903,14 @@ async def update_my_store_order(
          o.tracking_carrier AS old_tracking_carrier,
          o.tracking_url AS old_tracking_url
     SET
-      o.status = coalesce($status, o.status),
-      o.tracking_number = $tracking_number,
-      o.tracking_carrier = $tracking_carrier,
-      o.tracking_url = $tracking_url,
-      o.seller_note = $seller_note,
-      o.last_status_update_at = datetime(),
-      o.updated_at = datetime()
+        o.status = coalesce($status, o.status),
+        o.tracking_number = coalesce($tracking_number, o.tracking_number),
+        o.tracking_carrier = coalesce($tracking_carrier, o.tracking_carrier),
+        o.tracking_url = coalesce($tracking_url, o.tracking_url),
+        o.seller_note = coalesce($seller_note, o.seller_note),
+        o.last_status_update_at = datetime(),
+        o.updated_at = datetime()
+
     WITH o, s, owner, item, buyer,
          old_status,
          old_tracking_number,
@@ -823,6 +931,7 @@ async def update_my_store_order(
         tracking_number: o.tracking_number,
         tracking_carrier: o.tracking_carrier,
         tracking_url: o.tracking_url,
+        seller_note: o.seller_note,
         group_id: o.group_id,
         created_at: toString(o.created_at),
         paid_at: CASE
