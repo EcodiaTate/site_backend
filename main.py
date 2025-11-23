@@ -41,6 +41,7 @@ from site_backend.api.leaderboards import leaderboards
 from site_backend.api.recruiter_unsub import router as unsub_router
 from site_backend.api.tournaments.router_public import router as tournament_router
 from site_backend.api.Identity import router as identity_router
+from site_backend.api.market import router as market_router
 from site_backend.api.teams.router_public import router as teams_router
 from site_backend.api import launchpad
 from site_backend.api import sidequests
@@ -133,6 +134,7 @@ def create_app() -> FastAPI:
     app.include_router(teams_router)
     app.include_router(admin_cookie.router)
     app.include_router(admin.router)
+    app.include_router(market_router)
     app.include_router(identity_router)
     app.include_router(launchpad.router)
     app.include_router(social_router)

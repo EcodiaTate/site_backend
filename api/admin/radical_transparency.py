@@ -17,23 +17,63 @@ router = APIRouter(prefix="/transparency", tags=["transparency"])
 
 
 # ---------------------- admin email source of truth ----------------------
-
-
 def _admin_emails_from_env() -> Set[str]:
     """
-    Shared source of truth for 'who counts as admin' by email.
+    Robust loader for admin emails.
 
-    - Prefer ADMIN_EMAILS (comma-separated list)
-    - Fallback to legacy ADMIN_EMAIL (single email)
+    Priorities:
+      1) ADMIN_EMAILS_JSON = '["a@x","b@y"]'
+      2) ADMIN_EMAILS_FILE = /path/to/file (one per line)
+      3) ADMIN_EMAILS (comma/semicolon/space/newline separated)
+      4) ADMIN_EMAIL (single legacy)
+    Normalizes: strip + lowercase, drops blanks/dupes.
     """
+    out: Set[str] = set()
+
+    # 1) JSON array (optional)
+    import json
+    raw_json = os.getenv("ADMIN_EMAILS_JSON")
+    if raw_json:
+        try:
+            arr = json.loads(raw_json)
+            if isinstance(arr, list):
+                for v in arr:
+                    if isinstance(v, str) and v.strip():
+                        out.add(v.strip().lower())
+        except Exception:
+            pass  # ignore malformed JSON, fall through
+
+    # 2) File (optional)
+    path = os.getenv("ADMIN_EMAILS_FILE")
+    if path and os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    v = line.strip().lower()
+                    if v:
+                        out.add(v)
+        except Exception:
+            pass  # ignore file errors, fall through
+
+    # 3) String list
     raw = os.getenv("ADMIN_EMAILS")
     if raw:
-        parts = [p.strip().lower() for p in raw.split(",")]
-        return {p for p in parts if p}
+        # split on commas, semicolons, whitespace (incl. newlines/tabs)
+        import re
+        for p in re.split(r"[,\s;]+", raw):
+            p = p.strip().lower()
+            if p:
+                out.add(p)
+
+    # 4) Legacy single
     legacy = os.getenv("ADMIN_EMAIL")
     if legacy:
-        return {legacy.strip().lower()}
-    return set()
+        v = legacy.strip().lower()
+        if v:
+            out.add(v)
+
+    return out
+
 
 
 # ---------------------- response models ----------------------
@@ -131,6 +171,7 @@ def get_admin_eco_log(
     This is exactly the same primitive your wallets use. Vouchers themselves
     do not change balances; the BURN_REWARD EcoTx does, and that is what we log.
     """
+    log.warning("AdminEcoLog: resolved ADMIN_EMAILS=%s", ", ".join(sorted(_admin_emails_from_env())) or "(none)")
     admin_emails = _admin_emails_from_env()
     if not admin_emails:
         log.warning("AdminEcoLog: no admin emails configured; returning empty log")

@@ -1,7 +1,6 @@
-# site_backend/core/admin_guard.py
 from __future__ import annotations
 
-from typing import Optional, Any
+from typing import Optional, Any, Iterable
 import os
 import hashlib
 import logging
@@ -11,14 +10,22 @@ from jose import jwt, JWTError
 
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
 JWT_ALGO = os.getenv("JWT_ALGO", "HS256")  # keep in sync with api.auth
-ADMIN_EMAIL = (os.getenv("ADMIN_EMAIL") or "tate@ecodia.au").lower()
+
+# --- Admin email(s): prefer ADMIN_EMAILS, fallback to legacy ADMIN_EMAIL ---
+_legacy = (os.getenv("ADMIN_EMAIL") or "").strip().lower()
+_list = [
+    e.strip().lower()
+    for e in os.getenv("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+]
+ADMIN_EMAILS = sorted({*(_list or []), *([_legacy] if _legacy else [])})
 
 logging.warning(
-    "ADMIN_GUARD JWT_SECRET length=%d sha256=%s algo=%s admin_email=%s",
+    "ADMIN_GUARD JWT_SECRET length=%d sha256=%s algo=%s admin_emails=%s",
     len(JWT_SECRET),
     hashlib.sha256(JWT_SECRET.encode("utf-8")).hexdigest(),
     JWT_ALGO,
-    ADMIN_EMAIL,
+    ",".join(ADMIN_EMAILS) or "(none)",
 )
 
 
@@ -75,6 +82,13 @@ def _has_admin_scope(scope: Any) -> bool:
     return False
 
 
+def _email_in_list(candidate: Optional[str], emails: Iterable[str]) -> bool:
+    if not candidate:
+        return False
+    c = str(candidate).strip().lower()
+    return c in set(e.strip().lower() for e in emails)
+
+
 async def require_admin(
     x_auth_token: Optional[str] = Header(default=None, alias="X-Auth-Token"),
     authorization: Optional[str] = Header(default=None),
@@ -87,10 +101,12 @@ async def require_admin(
 
     A token is considered admin if EITHER:
       - its scope contains "admin" (flexible string/list handling), OR
-      - its email/sub resolves to ADMIN_EMAIL (allows your current access token to work)
+      - its email/sub is in ADMIN_EMAILS (allows current access tokens to work)
 
-    This keeps the gate strict to your admin email while being lenient
-    about whether the token is an "access" or "admin" token.
+    Audience:
+      - Accept aud=None (legacy) or aud="admin" (current). Reject anything else.
+
+    Returns a canonical admin identity (email if available, else sub).
     """
     token = x_auth_token
     if not token and authorization:
@@ -130,13 +146,13 @@ async def require_admin(
 
     # Flexible admin detection:
     is_admin_by_scope = _has_admin_scope(scope)
-    # accept either sub or email claim matching ADMIN_EMAIL
-    is_admin_by_email = (sub == ADMIN_EMAIL) or (email == ADMIN_EMAIL)
+    # accept either sub or email claim being in ADMIN_EMAILS
+    is_admin_by_email = _email_in_list(sub, ADMIN_EMAILS) or _email_in_list(email, ADMIN_EMAILS)
 
     if not (is_admin_by_scope or is_admin_by_email):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not an admin token (scope mismatch)",
+            detail="Not an admin token (scope/email mismatch)",
         )
 
     # Accept aud=None (legacy) or "admin" (current). Reject anything else.

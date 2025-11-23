@@ -33,7 +33,6 @@ ALLOWED_ROLES: set[str] = {"youth", "business", "creative", "partner", "public"}
 
 # ==================== Schemas ====================
 
-
 class MeAccount(BaseModel):
     id: str
     email: EmailStr
@@ -55,6 +54,10 @@ class MeAccount(BaseModel):
     privacy_accepted_at: str | None = None
     over18_confirmed: bool | None = None
     birth_year: int | None = None
+
+    # Upcycling / Market flags
+    has_upcycling_store: bool = False  # NEW
+
 
 
 class DisplayNameIn(BaseModel):
@@ -264,8 +267,6 @@ def _persist_legal(
 
 
 # ==================== Routes ====================
-
-
 @router.get("", response_model=MeAccount)
 def r_get_me_account(
     uid: str = Depends(current_user_id),
@@ -290,6 +291,18 @@ def r_get_me_account(
     acc.setdefault("privacy_accepted_at", acc.get("privacy_accepted_at"))
     acc.setdefault("over18_confirmed", acc.get("over18_confirmed"))
     acc.setdefault("birth_year", acc.get("birth_year"))
+
+    # ── Upcycling / Market flag ───────────────────────────────────
+    row = s.run(
+        """
+        MATCH (u:User {id:$uid})
+        OPTIONAL MATCH (u)-[:OWNS_UPCYCLING_STORE]->(store:UpcyclingStore)
+        RETURN count(store) > 0 AS has_store
+        """,
+        uid=uid,
+    ).single()
+
+    acc["has_upcycling_store"] = bool(row["has_store"]) if row else False
 
     return acc
 

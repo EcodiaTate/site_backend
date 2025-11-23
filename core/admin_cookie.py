@@ -1,4 +1,3 @@
-# site_backend/api/auth/admin_cookie.py
 from __future__ import annotations
 from datetime import datetime, timedelta
 
@@ -8,7 +7,7 @@ from neo4j import Session
 
 from site_backend.core.user_guard import current_user_id
 from site_backend.core.neo_driver import session_dep
-from site_backend.core.admin_guard import JWT_SECRET, JWT_ALGO, ADMIN_EMAIL
+from site_backend.core.admin_guard import JWT_SECRET, JWT_ALGO, ADMIN_EMAILS
 from site_backend.core.cookies import (
     set_scoped_cookie,
     delete_scoped_cookie,
@@ -23,7 +22,7 @@ def _mint_admin_token(email: str) -> str:
     payload = {
         "sub": email,
         "scope": "admin",
-        "aud": "admin",  # 🔑 matches admin_guard expectation (or is allowed as None)
+        "aud": "admin",  # 🔑 matches admin_guard expectation (or is allowed as None in legacy mode)
         "iat": int(now.timestamp()),
         "exp": int((now + timedelta(days=7)).timestamp()),
     }
@@ -44,8 +43,8 @@ def r_admin_cookie(
     ).single()
     email = (rec["email"] or "").lower() if rec else ""
 
-    # Only the configured ADMIN_EMAIL can get an admin token
-    if email != ADMIN_EMAIL:
+    # Only configured ADMIN_EMAILS can get an admin token
+    if email not in ADMIN_EMAILS:
         delete_scoped_cookie(response, name=ADMIN_COOKIE_NAME, request=request)
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -64,5 +63,5 @@ def r_admin_cookie(
         request=request,
     )
 
-    # 🔑 IMPORTANT: return the token so ensureAdminCookie() can stash it in localStorage
+    # 🔑 Return token so ensureAdminCookie() can stash it in localStorage if needed
     return {"ok": True, "admin_token": token}
